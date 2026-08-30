@@ -528,6 +528,39 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
                 self.assertEqual(len(forward), 1)
                 self.assertEqual(forward[0]["serverId"], 42)
                 self.assertEqual(forward[0]["content"], "left-body")
+
+                for connection, local_id in ((left, 102), (right, 203)):
+                    connection.execute(
+                        f"INSERT INTO {table} VALUES(?, 1, 99, 1, 250, "
+                        "'other-body', '', '', '', 25, 4, '')",
+                        (local_id,),
+                    )
+                    connection.commit()
+                exact_queries: list[str] = []
+                left.set_trace_callback(
+                    lambda sql: exact_queries.append(sql)
+                    if "WHERE server_id IN" in sql
+                    else None
+                )
+                right.set_trace_callback(
+                    lambda sql: exact_queries.append(sql)
+                    if "WHERE server_id IN" in sql
+                    else None
+                )
+                connection_calls = 0
+
+                def counted_connections(_table=None):
+                    nonlocal connection_calls
+                    connection_calls += 1
+                    return [(left_source, left), (right_source, right)]
+
+                reader._message_connections = counted_connections
+                batched = reader.fetch_messages(
+                    session_id, since_s=0, end_s=400, limit=2
+                )["messages"]
+                self.assertEqual(len(batched), 2)
+                self.assertEqual(connection_calls, 1)
+                self.assertEqual(len(exact_queries), 2)
             finally:
                 left.close()
                 right.close()

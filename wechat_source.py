@@ -4293,6 +4293,88 @@ class DirectWeChatReader:
             },
         }
 
+    def _private_messages_by_server_ids(
+        self,
+        *,
+        session_native_id: str,
+        message_table: str,
+        message_connections: Sequence[tuple[Path, sqlite3.Connection]],
+        server_ids: Iterable[str],
+        exact_media_lookup: bool,
+    ) -> dict[str, dict[str, Any]]:
+        wanted = sorted({str(value).strip() for value in server_ids if str(value).strip()})
+        if not wanted:
+            return {}
+        quoted_table = _quote_identifier(message_table)
+        table_sources: list[
+            tuple[Path, sqlite3.Connection, str, str, str | None]
+        ] = []
+        for source, connection in message_connections:
+            exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (message_table,),
+            ).fetchone()
+            if exists is None:
+                continue
+            columns = {
+                str(column[1])
+                for column in connection.execute(f"PRAGMA table_info({quoted_table})")
+            }
+            table_sources.append(
+                (
+                    source,
+                    connection,
+                    "status" if "status" in columns else "NULL",
+                    "origin_source" if "origin_source" in columns else "NULL",
+                    self._index_with_leading_columns(
+                        connection, message_table, ("server_id",)
+                    ),
+                )
+            )
+        if not table_sources:
+            raise SessionMessageDatabaseMissingError(
+                "session message database is missing"
+            )
+        if len(table_sources) > 1 and any(item[4] is None for item in table_sources):
+            raise DirectSchemaError("message_identity_lookup_index_unavailable")
+
+        candidates: dict[
+            str, list[tuple[Path, sqlite3.Connection, sqlite3.Row]]
+        ] = {}
+        for source, connection, status_expr, origin_expr, server_index in table_sources:
+            indexed_by = (
+                " INDEXED BY " + _quote_identifier(server_index)
+                if server_index is not None
+                else ""
+            )
+            for offset in range(0, len(wanted), 500):
+                batch = wanted[offset : offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                rows = connection.execute(
+                    "SELECT rowid AS _rowid, local_id, local_type, server_id, "
+                    "real_sender_id, create_time, message_content, source, "
+                    "packed_info_data, compress_content, sort_seq, "
+                    f"{status_expr} AS status, {origin_expr} AS origin_source "
+                    f"FROM {quoted_table}{indexed_by} "
+                    f"WHERE server_id IN ({placeholders})",
+                    batch,
+                )
+                for row in rows:
+                    identity = self._message_row_identity(row)
+                    if identity is not None and identity[0] == "server":
+                        candidates.setdefault(identity[1], []).append(
+                            (source, connection, row)
+                        )
+        return {
+            server_id: self._project_private_message_candidates(
+                records,
+                session_native_id=session_native_id,
+                message_table=message_table,
+                exact_media_lookup=exact_media_lookup,
+            )
+            for server_id, records in candidates.items()
+        }
+
     def fetch_message_by_server_id(
         self,
         session_native_id: str,
@@ -4312,65 +4394,17 @@ class DirectWeChatReader:
         normalized_id = str(server_id).strip()
         if not normalized_id:
             raise ValueError("message_server_id_invalid")
-        native_value: str | int = (
-            int(normalized_id) if normalized_id.isdecimal() else normalized_id
-        )
         table = "Msg_" + hashlib.md5(
             session_native_id.encode("utf-8"), usedforsecurity=False
         ).hexdigest()
-        quoted_table = _quote_identifier(table)
-        candidates: list[tuple[Path, sqlite3.Connection, sqlite3.Row]] = []
-        table_sources: list[
-            tuple[Path, sqlite3.Connection, str, str, str | None]
-        ] = []
-        for source, connection in self._message_connections(table):
-            exists = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-            ).fetchone()
-            if exists is None:
-                continue
-            columns = {
-                str(column[1])
-                for column in connection.execute(f"PRAGMA table_info({quoted_table})")
-            }
-            status_expr = "status" if "status" in columns else "NULL"
-            origin_expr = "origin_source" if "origin_source" in columns else "NULL"
-            server_index = self._index_with_leading_columns(
-                connection, table, ("server_id",)
-            )
-            table_sources.append(
-                (source, connection, status_expr, origin_expr, server_index)
-            )
-        if not table_sources:
-            raise SessionMessageDatabaseMissingError(
-                "session message database is missing"
-            )
-        for source, connection, status_expr, origin_expr, server_index in table_sources:
-            if server_index is None and len(table_sources) > 1:
-                raise DirectSchemaError("message_identity_lookup_index_unavailable")
-            indexed_by = (
-                " INDEXED BY " + _quote_identifier(server_index)
-                if server_index is not None
-                else ""
-            )
-            rows = connection.execute(
-                "SELECT rowid AS _rowid, local_id, local_type, server_id, "
-                "real_sender_id, create_time, "
-                "message_content, source, packed_info_data, compress_content, sort_seq, "
-                f"{status_expr} AS status, {origin_expr} AS origin_source "
-                f"FROM {quoted_table}{indexed_by} "
-                "WHERE server_id=? LIMIT 2",
-                (native_value,),
-            ).fetchall()
-            candidates.extend((source, connection, row) for row in rows)
-        if not candidates:
-            return None
-        return self._project_private_message_candidates(
-            candidates,
+        messages = self._private_messages_by_server_ids(
             session_native_id=session_native_id,
             message_table=table,
+            message_connections=self._message_connections(table),
+            server_ids=[normalized_id],
             exact_media_lookup=exact_media_lookup,
         )
+        return messages.get(normalized_id)
 
     def fetch_messages(
         self,
@@ -4594,13 +4628,20 @@ class DirectWeChatReader:
                 (message_source, connection_by_source[message_source], row)
             )
         messages: dict[tuple[str, str], dict[str, Any]] = {}
+        exact_messages = (
+            self._private_messages_by_server_ids(
+                session_native_id=session_native_id,
+                message_table=table,
+                message_connections=message_connections,
+                server_ids=[identity[1] for identity in grouped if identity[0] == "server"],
+                exact_media_lookup=exact_media_lookup,
+            )
+            if limit is not None
+            else {}
+        )
         for identity, candidates in grouped.items():
             if limit is not None and identity[0] == "server":
-                exact = self.fetch_message_by_server_id(
-                    session_native_id,
-                    identity[1],
-                    exact_media_lookup=exact_media_lookup,
-                )
+                exact = exact_messages.get(identity[1])
                 if exact is None:
                     raise DirectSchemaError("selected message identity disappeared")
                 messages[identity] = exact

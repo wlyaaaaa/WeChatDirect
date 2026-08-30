@@ -155,9 +155,7 @@ def load_direct_source_identity(
     db_path = Path(_decode_safe_value(config.get("dbPath"), safe_key))
     master_hex = _decode_safe_value(config.get("decryptKey"), safe_key).strip()
     identity = _decode_safe_value(config.get("myWxid"), safe_key).strip()
-    if len(master_hex) != 64 or any(
-        ch not in "0123456789abcdefABCDEF" for ch in master_hex
-    ):
+    if len(master_hex) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in master_hex):
         raise DirectCredentialError("local source database key is invalid")
     if not identity:
         raise DirectCredentialError("local source account identity is missing")
@@ -170,20 +168,14 @@ def load_direct_source_identity(
             if child.is_dir() and (child / "db_storage").is_dir():
                 candidates.append(child)
     unique = {candidate.resolve() for candidate in candidates}
-    matching = [
-        candidate
-        for candidate in unique
-        if candidate.name == identity or candidate.name.startswith(identity + "_")
-    ]
+    matching = [candidate for candidate in unique if candidate.name == identity or candidate.name.startswith(identity + "_")]
     if len(matching) != 1:
         raise DirectCredentialError("local source account directory is ambiguous")
     account_root = matching[0]
     return account_root, master_hex.lower(), identity
 
 
-def _as_bytes(
-    value: bytes | bytearray | memoryview | str, *, hex_text: bool = False
-) -> bytes:
+def _as_bytes(value: bytes | bytearray | memoryview | str, *, hex_text: bool = False) -> bytes:
     if isinstance(value, str):
         text = value.strip()
         if hex_text:
@@ -343,9 +335,7 @@ class EncryptedPageCodec:
                 preserve_header = len(self.key) == 48
             else:
                 preserve_header = self.plaintext_header
-            header = (
-                page[:AES_BLOCK_SIZE] if preserve_header else b"SQLite format 3\x00"
-            )
+            header = page[:AES_BLOCK_SIZE] if preserve_header else b"SQLite format 3\x00"
             return header + plaintext + (b"\x00" * self.reserve_size)
         return plaintext + (b"\x00" * self.reserve_size)
 
@@ -367,11 +357,7 @@ class EncryptedPageCodec:
                 raise ValueError("SQLCipher HMAC requires the database salt")
             mac_salt = bytes(value ^ 0x3A for value in salt)
             mac_key = hashlib.pbkdf2_hmac("sha512", key, mac_salt, 2, 32)
-            hmac_data = (
-                page[16 : payload_size + 16]
-                if page_number == 1
-                else page[: payload_size + 16]
-            )
+            hmac_data = page[16:payload_size + 16] if page_number == 1 else page[:payload_size + 16]
             expected = hmac.new(
                 mac_key,
                 hmac_data + struct.pack("<I", page_number),
@@ -501,19 +487,14 @@ class EncryptedPageCodec:
                         raise SnapshotCopyError("WAL commit contains an invalid page")
                     plaintext = self.decrypt_page(page_number, encrypted_page)
                     if page_number == 1 and plaintext[:16] != b"SQLite format 3\x00":
-                        raise SnapshotCopyError(
-                            "WAL page one is not a SQLite database page"
-                        )
+                        raise SnapshotCopyError("WAL page one is not a SQLite database page")
                     output.seek((page_number - 1) * self.page_size)
                     output.write(plaintext)
 
                 output.truncate(committed_pages * self.page_size)
                 output.seek(0)
                 page_one = output.read(self.page_size)
-                if (
-                    len(page_one) != self.page_size
-                    or page_one[:16] != b"SQLite format 3\x00"
-                ):
+                if len(page_one) != self.page_size or page_one[:16] != b"SQLite format 3\x00":
                     raise SnapshotCopyError("merged WAL has no valid SQLite page one")
                 output.seek(28)
                 output.write(struct.pack(">I", committed_pages))
@@ -571,7 +552,9 @@ def _sqlite_schema_record_identity(
             try:
                 values.append(payload[data_position:end].decode(text_encoding))
             except UnicodeDecodeError as exc:
-                raise SnapshotCopyError("SQLite schema record text is invalid") from exc
+                raise SnapshotCopyError(
+                    "SQLite schema record text is invalid"
+                ) from exc
         else:
             values.append(None)
         data_position = end
@@ -672,18 +655,13 @@ def _sqlite_schema_message_tables_once(
         wal_stream = wal.open("rb") if wal_offsets else None
         pages: dict[int, bytes] = {}
         try:
-
             def read_page(page_number: int) -> bytes:
                 if page_number in pages:
                     return pages[page_number]
                 if len(pages) == MAX_MESSAGE_SCHEMA_PROBE_PAGES_PER_SHARD:
                     raise SnapshotCopyError("message shard schema probe limit exceeded")
-                if page_number <= 0 or page_number > (
-                    committed_pages or base_page_count
-                ):
-                    raise SnapshotCopyError(
-                        "SQLite schema page is outside the database"
-                    )
+                if page_number <= 0 or page_number > (committed_pages or base_page_count):
+                    raise SnapshotCopyError("SQLite schema page is outside the database")
                 if page_number in wal_offsets:
                     if wal_stream is None:  # pragma: no cover - defensive
                         raise SnapshotCopyError("WAL page stream is unavailable")
@@ -724,9 +702,7 @@ def _sqlite_schema_message_tables_once(
                 page_type = page[header_offset]
                 if page_type not in {0x05, 0x0D}:
                     raise SnapshotCopyError("SQLite schema B-tree page type is invalid")
-                cell_count = struct.unpack(
-                    ">H", page[header_offset + 3 : header_offset + 5]
-                )[0]
+                cell_count = struct.unpack(">H", page[header_offset + 3 : header_offset + 5])[0]
                 header_size = 12 if page_type == 0x05 else 8
                 pointer_start = header_offset + header_size
                 pointer_end = pointer_start + cell_count * 2
@@ -740,9 +716,7 @@ def _sqlite_schema_message_tables_once(
                     children: list[int] = []
                     for cell_offset in cell_offsets:
                         if cell_offset <= 0 or cell_offset + 4 > usable_size:
-                            raise SnapshotCopyError(
-                                "SQLite schema interior cell is invalid"
-                            )
+                            raise SnapshotCopyError("SQLite schema interior cell is invalid")
                         children.append(
                             struct.unpack(">I", page[cell_offset : cell_offset + 4])[0]
                         )
@@ -885,7 +859,7 @@ _CALIBRATED_MESSAGE_STATUSES = {0, 3, 5}
 def _base_message_type(value: object) -> int | None:
     try:
         number = int(value)
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return None
     if number in _TYPE_NAMES:
         return number
@@ -912,7 +886,7 @@ def _message_sender_role(
         return "system", "system", False
     try:
         native_status = int(status)
-    except TypeError, ValueError, OverflowError:
+    except (TypeError, ValueError, OverflowError):
         return "unknown", "unknown", None
     if native_status == _OUTGOING_MESSAGE_STATUS:
         return "self", "outgoing", True
@@ -935,7 +909,7 @@ def _valid_sender_key(value: object) -> str | None:
         return None
     try:
         number = int(value)
-    except TypeError, ValueError, OverflowError:
+    except (TypeError, ValueError, OverflowError):
         return None
     return str(number) if number > 0 else None
 
@@ -978,9 +952,7 @@ def _text_from_message(value: object, message_type: int | None) -> str | None:
     if message_type == 49:
         fields = []
         for tag in ("title", "des", "url", "filename"):
-            match = re.search(
-                rf"<{tag}>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</{tag}>", text, re.S
-            )
+            match = re.search(fr"<{tag}>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</{tag}>", text, re.S)
             field = _safe_plain_text(match.group(1)) if match else None
             if field:
                 fields.append(field)
@@ -995,7 +967,8 @@ def _safe_plain_text(value: object) -> str | None:
         return None
     text = value.strip()
     if not text or any(
-        unicodedata.category(character) == "Cc" and character not in "\n\r\t"
+        unicodedata.category(character) == "Cc"
+        and character not in "\n\r\t"
         for character in text
     ):
         return None
@@ -1038,7 +1011,7 @@ def _decompress_message_text(value: object) -> tuple[str | None, str | None]:
         clear = decoder.decompress(
             raw[offset:], max_length=MAX_DECOMPRESSED_MESSAGE_BYTES + 1
         )
-    except MemoryError, zstd.ZstdError:
+    except (MemoryError, zstd.ZstdError):
         return None, "compressed_content_decode_failed"
     if len(clear) > MAX_DECOMPRESSED_MESSAGE_BYTES or not decoder.eof:
         return None, "compressed_content_exceeds_limit"
@@ -1177,9 +1150,7 @@ class DirectWeChatReader:
         self._temporary = tempfile.TemporaryDirectory(prefix="wechat-direct-")
         self._prepared: dict[Path, Path] = {}
         self._connections: dict[Path, sqlite3.Connection] = {}
-        self._message_connections_cache: (
-            list[tuple[Path, sqlite3.Connection]] | None
-        ) = None
+        self._message_connections_cache: list[tuple[Path, sqlite3.Connection]] | None = None
         self._message_table_sources_cache: dict[str, tuple[Path, ...]] = {}
         self._message_schema_probe_pages: dict[Path, int] = {}
         self._message_self_sender_cache: dict[tuple[Path, str | None], str | None] = {}
@@ -1231,15 +1202,11 @@ class DirectWeChatReader:
     def _database_files(self) -> list[Path]:
         result = []
         for root, directories, files in os.walk(self._storage):
-            directories[:] = [
-                name for name in directories if name.casefold() != "migrate"
-            ]
+            directories[:] = [name for name in directories if name.casefold() != "migrate"]
             for name in files:
                 if name.casefold().endswith(".db"):
                     result.append(Path(root) / name)
-        return sorted(
-            result, key=lambda item: item.relative_to(self._storage).as_posix()
-        )
+        return sorted(result, key=lambda item: item.relative_to(self._storage).as_posix())
 
     @staticmethod
     def _signature(path: Path) -> tuple[int, int] | None:
@@ -1255,9 +1222,7 @@ class DirectWeChatReader:
             return cached
         wal = source.with_name(source.name + "-wal")
         relative = source.relative_to(self._storage).as_posix()
-        destination = Path(self._temporary.name) / (
-            hashlib.sha256(relative.encode()).hexdigest() + ".sqlite3"
-        )
+        destination = Path(self._temporary.name) / (hashlib.sha256(relative.encode()).hexdigest() + ".sqlite3")
         for _attempt in range(3):
             before = (self._signature(source), self._signature(wal))
             try:
@@ -1278,29 +1243,18 @@ class DirectWeChatReader:
                     if wal.is_file() and wal.stat().st_size > 32:
                         codec.merge_wal(destination, wal)
             except (OSError, EncryptedPageError, sqlite3.DatabaseError) as exc:
-                raise SnapshotCopyError(
-                    "local database snapshot could not be prepared"
-                ) from exc
+                raise SnapshotCopyError("local database snapshot could not be prepared") from exc
             after = (self._signature(source), self._signature(wal))
             if before == after:
-                connection = sqlite3.connect(
-                    f"file:{quote(str(destination), safe='/:\\\\')}?mode=ro", uri=True
-                )
+                connection = sqlite3.connect(f"file:{quote(str(destination), safe='/:\\\\')}?mode=ro", uri=True)
                 try:
-                    if (
-                        str(connection.execute("PRAGMA quick_check").fetchone()[0])
-                        != "ok"
-                    ):
-                        raise SnapshotCopyError(
-                            "local database snapshot integrity failed"
-                        )
+                    if str(connection.execute("PRAGMA quick_check").fetchone()[0]) != "ok":
+                        raise SnapshotCopyError("local database snapshot integrity failed")
                 finally:
                     connection.close()
                 self._prepared[source] = destination
                 return destination
-        raise SnapshotCopyError(
-            "local database changed throughout bounded snapshot retries"
-        )
+        raise SnapshotCopyError("local database changed throughout bounded snapshot retries")
 
     def _open(self, source: Path) -> sqlite3.Connection:
         cached = self._connections.get(source)
@@ -1311,18 +1265,14 @@ class DirectWeChatReader:
             f"file:{quote(str(snapshot), safe='/:\\\\')}?mode=ro", uri=True, timeout=5.0
         )
         connection.row_factory = sqlite3.Row
-        connection.text_factory = lambda data: (
-            data.decode("utf-8") if _is_utf8(data) else data
-        )
+        connection.text_factory = lambda data: data.decode("utf-8") if _is_utf8(data) else data
         connection.execute("PRAGMA query_only = ON")
         self._connections[source] = connection
         return connection
 
     def _named_databases(self, name: str) -> list[Path]:
         folded = name.casefold()
-        return [
-            path for path in self._database_files() if path.name.casefold() == folded
-        ]
+        return [path for path in self._database_files() if path.name.casefold() == folded]
 
     def _message_database_sources(self) -> list[Path]:
         return [
@@ -1366,24 +1316,19 @@ class DirectWeChatReader:
 
         if not isinstance(session_native_id, str) or not session_native_id:
             raise ValueError("contact_source_identity_invalid")
-        table = (
-            "Msg_"
-            + hashlib.md5(
-                session_native_id.encode("utf-8"), usedforsecurity=False
-            ).hexdigest()
-        )
+        table = "Msg_" + hashlib.md5(
+            session_native_id.encode("utf-8"), usedforsecurity=False
+        ).hexdigest()
         message_sources = self._message_sources_for_table(table)
         source_catalog = [
-            source.relative_to(self._storage).as_posix() for source in message_sources
+            source.relative_to(self._storage).as_posix()
+            for source in message_sources
         ]
-        source_catalog_sha256 = (
-            "sha256:"
-            + hashlib.sha256(
-                json.dumps(
-                    source_catalog, ensure_ascii=True, separators=(",", ":")
-                ).encode("utf-8")
-            ).hexdigest()
-        )
+        source_catalog_sha256 = "sha256:" + hashlib.sha256(
+            json.dumps(
+                source_catalog, ensure_ascii=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
         sources: set[Path] = set(message_sources)
         for source in message_sources:
             resource = source.parent / "message_resource.db"
@@ -1576,7 +1521,9 @@ class DirectWeChatReader:
                 quoted_table = _quote_identifier(table)
                 columns = {
                     str(row[1])
-                    for row in connection.execute(f"PRAGMA table_info({quoted_table})")
+                    for row in connection.execute(
+                        f"PRAGMA table_info({quoted_table})"
+                    )
                 }
                 if not {"status", "real_sender_id", "local_type"} <= columns:
                     continue
@@ -1614,10 +1561,9 @@ class DirectWeChatReader:
 
     @staticmethod
     def _is_opaque_sha256_commitment(value: object) -> bool:
-        return (
-            isinstance(value, str)
-            and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
-        )
+        return isinstance(value, str) and re.fullmatch(
+            r"sha256:[0-9a-f]{64}", value
+        ) is not None
 
     def _group_self_sender_receipt(
         self,
@@ -1708,19 +1654,14 @@ class DirectWeChatReader:
         sessions: dict[str, dict[str, Any]] = {}
         for source in self._named_databases("session.db"):
             connection = self._open(source)
-            columns = {
-                str(row[1])
-                for row in connection.execute("PRAGMA table_info(SessionTable)")
-            }
+            columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(SessionTable)")}
             if "username" not in columns:
                 continue
             type_expr = "type" if "type" in columns else "NULL"
             last_expr = "last_timestamp" if "last_timestamp" in columns else "NULL"
             sort_expr = "sort_timestamp" if "sort_timestamp" in columns else "NULL"
             hidden_expr = "is_hidden" if "is_hidden" in columns else "0"
-            order = (
-                "ORDER BY sort_timestamp DESC" if "sort_timestamp" in columns else ""
-            )
+            order = "ORDER BY sort_timestamp DESC" if "sort_timestamp" in columns else ""
             for row in connection.execute(
                 f"SELECT username, {type_expr} AS session_type, "
                 f"{last_expr} AS last_timestamp, {sort_expr} AS sort_timestamp, "
@@ -1760,7 +1701,9 @@ class DirectWeChatReader:
         """
 
         sessions = {
-            str(item["id"]): item for item in self.list_sessions() if item.get("id")
+            str(item["id"]): item
+            for item in self.list_sessions()
+            if item.get("id")
         }
         contacts: dict[str, dict[str, Any]] = {}
         for source in self._named_databases("contact.db"):
@@ -1772,7 +1715,9 @@ class DirectWeChatReader:
                 for row in rows:
                     native_id = str(row["username"] or "")
                     session = sessions.get(native_id)
-                    if not native_id or (session is None and not include_unregistered):
+                    if not native_id or (
+                        session is None and not include_unregistered
+                    ):
                         continue
                     remark = str(row["remark"] or "").strip()
                     nickname = str(row["nick_name"] or "").strip()
@@ -1812,12 +1757,14 @@ class DirectWeChatReader:
             )
         return list(contacts.values())
 
-    def list_group_member_labels(self, session_native_id: str) -> list[dict[str, Any]]:
+    def list_group_member_labels(
+        self, session_native_id: str
+    ) -> list[dict[str, Any]]:
         """Read current labels only for one selected local chatroom."""
 
-        if not isinstance(
-            session_native_id, str
-        ) or not session_native_id.casefold().endswith("@chatroom"):
+        if not isinstance(session_native_id, str) or not session_native_id.casefold().endswith(
+            "@chatroom"
+        ):
             raise ValueError("group_member_labels_require_chatroom")
         candidates: dict[str, list[dict[str, Any]]] = {}
         for source in self._named_databases("contact.db"):
@@ -1855,7 +1802,8 @@ class DirectWeChatReader:
         result: list[dict[str, Any]] = []
         for native_id, labels in sorted(candidates.items()):
             shapes = {
-                (item["remark"], item["nickname"], item["alias"]) for item in labels
+                (item["remark"], item["nickname"], item["alias"])
+                for item in labels
             }
             if len(shapes) == 1:
                 remark, nickname, alias = next(iter(shapes))
@@ -1915,7 +1863,8 @@ class DirectWeChatReader:
             # selected author does not exist.
             if limit is None or username is not None:
                 rows = connection.execute(
-                    "SELECT tid, user_name, content FROM SnsTimeLine ORDER BY tid DESC"
+                    "SELECT tid, user_name, content FROM SnsTimeLine "
+                    "ORDER BY tid DESC"
                 )
             else:
                 scan_limit = min(max(limit * 8, 100), 500)
@@ -1929,7 +1878,7 @@ class DirectWeChatReader:
                 raw = str(row["content"] or "")
                 try:
                     root = ET.fromstring(raw)
-                except ET.ParseError, ValueError:
+                except (ET.ParseError, ValueError):
                     gaps.append(
                         {
                             "kind": "moment_xml_unreadable",
@@ -1968,11 +1917,7 @@ class DirectWeChatReader:
                 media_manifest: list[dict[str, Any]] = []
                 for media in timeline.findall("./ContentObject/mediaList/media"):
                     url_element = media.find("url")
-                    url = (
-                        str(url_element.text or "").strip()
-                        if url_element is not None
-                        else ""
-                    )
+                    url = str(url_element.text or "").strip() if url_element is not None else ""
                     size = media.find("size")
                     media_manifest.append(
                         {
@@ -1988,11 +1933,11 @@ class DirectWeChatReader:
                             "declaredMd5": (
                                 str(url_element.attrib.get("md5") or "")
                                 if url_element is not None
-                                else "" or None
+                                else ""
+                                or None
                             ),
                             "locatorSha256": (
-                                "sha256:"
-                                + hashlib.sha256(url.encode("utf-8")).hexdigest()
+                                "sha256:" + hashlib.sha256(url.encode("utf-8")).hexdigest()
                                 if url
                                 else None
                             ),
@@ -2110,7 +2055,11 @@ class DirectWeChatReader:
             rows = self._open(resource_source).execute(
                 "SELECT rowid, user_name FROM SenderName2Id"
             )
-            result = {int(rowid): str(username) for rowid, username in rows if username}
+            result = {
+                int(rowid): str(username)
+                for rowid, username in rows
+                if username
+            }
         except sqlite3.DatabaseError:
             # An optional or unreadable local sender dictionary cannot
             # establish direction for the paired message shard.
@@ -2184,14 +2133,7 @@ class DirectWeChatReader:
                     continue
                 connection = self._open(source)
                 try:
-                    for (
-                        rowid,
-                        chat_id,
-                        session_id,
-                        local_id,
-                        server_id,
-                        size,
-                    ) in connection.execute(
+                    for rowid, chat_id, session_id, local_id, server_id, size in connection.execute(
                         "SELECT v.rowid, v.chat_name_id, n.user_name, v.local_id, "
                         "v.svr_id, length(v.voice_data) FROM VoiceInfo v "
                         "JOIN Name2Id n ON n.rowid=v.chat_name_id "
@@ -2288,14 +2230,11 @@ class DirectWeChatReader:
                         "SELECT name FROM sqlite_master WHERE type='table'"
                     )
                 }
-                if (
-                    not {
-                        "ChatName2Id",
-                        "MessageResourceInfo",
-                        "MessageResourceDetail",
-                    }
-                    <= tables
-                ):
+                if not {
+                    "ChatName2Id",
+                    "MessageResourceInfo",
+                    "MessageResourceDetail",
+                } <= tables:
                     return [], False
                 info_index = self._index_with_leading_columns(
                     connection,
@@ -2362,9 +2301,7 @@ class DirectWeChatReader:
                     for detail in details:
                         result.append(
                             {
-                                "database": source.relative_to(
-                                    self._storage
-                                ).as_posix(),
+                                "database": source.relative_to(self._storage).as_posix(),
                                 "info_rowid": int(info[0]),
                                 "detail_rowid": (
                                     int(detail[0]) if detail[0] is not None else None
@@ -2504,15 +2441,12 @@ class DirectWeChatReader:
             {
                 "record": "message",
                 "kind": kind,
-                "message_database": message_source.relative_to(
-                    self._storage
-                ).as_posix(),
+                "message_database": message_source.relative_to(self._storage).as_posix(),
                 "message_table": message_table,
                 "local_id": local_id,
                 "server_id": server_id,
             }
         )
-
         def exact_lookup_unavailable(reason: str) -> list[dict[str, Any]]:
             # Do not turn a route that was not mechanically verified into a
             # ``not_openable`` fact.  The message event remains useful, but
@@ -2659,16 +2593,14 @@ class DirectWeChatReader:
     def _make_locator(self, payload: dict[str, Any]) -> str:
         body = dict(payload)
         body["version"] = 1
-        encoded = (
-            base64.urlsafe_b64encode(
-                json.dumps(
-                    body, ensure_ascii=True, sort_keys=True, separators=(",", ":")
-                ).encode("utf-8")
-            )
-            .decode("ascii")
-            .rstrip("=")
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(
+                body, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        return (
+            f"wechat-db://{self.account_identity_commitment}/v1/{encoded}"
         )
-        return f"wechat-db://{self.account_identity_commitment}/v1/{encoded}"
 
     def _decode_locator(self, locator: str) -> dict[str, Any]:
         prefix = f"wechat-db://{self.account_identity_commitment}/v1/"
@@ -2703,9 +2635,7 @@ class DirectWeChatReader:
         try:
             source.resolve().relative_to(self._storage.resolve())
         except (OSError, ValueError) as exc:
-            raise DirectSchemaError(
-                "media locator database is outside account scope"
-            ) from exc
+            raise DirectSchemaError("media locator database is outside account scope") from exc
         if not source.is_file():
             raise DirectSchemaError("media locator database is unavailable")
         return source
@@ -2773,9 +2703,7 @@ class DirectWeChatReader:
                         (info_rowid, int(detail_rowid), resource_session),
                     ).fetchone()
             except (KeyError, TypeError, ValueError, sqlite3.DatabaseError) as exc:
-                raise DirectSchemaError(
-                    "media resource locator cannot be resolved"
-                ) from exc
+                raise DirectSchemaError("media resource locator cannot be resolved") from exc
             if row is None:
                 raise DirectSchemaError("media resource locator no longer resolves")
             result: dict[str, Any] = {
@@ -2834,10 +2762,7 @@ class DirectWeChatReader:
         if record == "message":
             source = self._locator_source(payload.get("message_database"))
             table = payload.get("message_table")
-            if (
-                not isinstance(table, str)
-                or re.fullmatch(r"Msg_[0-9a-f]{32}", table) is None
-            ):
+            if not isinstance(table, str) or re.fullmatch(r"Msg_[0-9a-f]{32}", table) is None:
                 raise DirectSchemaError("message locator table is invalid")
             connection = self._open(source)
             quoted_table = _quote_identifier(table)
@@ -2902,9 +2827,7 @@ class DirectWeChatReader:
             ).fetchone()
         except (KeyError, TypeError, ValueError, sqlite3.DatabaseError) as exc:
             raise DirectSchemaError("voice locator cannot be opened") from exc
-        if row is None or not isinstance(
-            row["voice_data"], (bytes, bytearray, memoryview)
-        ):
+        if row is None or not isinstance(row["voice_data"], (bytes, bytearray, memoryview)):
             raise DirectSchemaError("voice locator no longer resolves to a BLOB")
         return bytes(row["voice_data"])
 
@@ -2922,7 +2845,8 @@ class DirectWeChatReader:
         kind = _TYPE_NAMES.get(base_type or -1)
         if kind == "app":
             if not any(
-                re.search(r"<type>\s*6\s*</type>", text) for text in payload_texts
+                re.search(r"<type>\s*6\s*</type>", text)
+                for text in payload_texts
             ):
                 return []
             kind = "file"
@@ -2950,7 +2874,9 @@ class DirectWeChatReader:
                 ("session_local", session_id, str(local_id)), []
             )
         voices = (
-            self._voice_index().get(("session_server", session_id, str(server_id)), [])
+            self._voice_index().get(
+                ("session_server", session_id, str(server_id)), []
+            )
             if kind == "voice" and server_id not in (None, 0, "0")
             else []
         )
@@ -3060,9 +2986,7 @@ class DirectWeChatReader:
         try:
             rowid = int(row["_rowid"])
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
-            raise DirectSchemaError(
-                "message row lacks a stable physical identity"
-            ) from exc
+            raise DirectSchemaError("message row lacks a stable physical identity") from exc
         return "row", f"{shard_key}\0{rowid}"
 
     def _private_message_candidate_signature(
@@ -3103,9 +3027,7 @@ class DirectWeChatReader:
         message_table: str,
         exact_media_lookup: bool,
     ) -> dict[str, Any]:
-        projected: list[
-            tuple[tuple[str, int, str], tuple[Any, ...], dict[str, Any]]
-        ] = []
+        projected: list[tuple[tuple[str, int, str], tuple[Any, ...], dict[str, Any]]] = []
         for source, connection, row in candidates:
             message = self._message_from_row(
                 row=row,
@@ -3118,7 +3040,7 @@ class DirectWeChatReader:
             )
             try:
                 rowid = int(row["_rowid"])
-            except KeyError, TypeError, ValueError, OverflowError:
+            except (KeyError, TypeError, ValueError, OverflowError):
                 rowid = 0
             representative_key = (
                 self._group_projection_shard_key(source, message_table),
@@ -3151,7 +3073,7 @@ class DirectWeChatReader:
         base_type = _base_message_type(row["local_type"])
         try:
             native_status = int(row["status"])
-        except TypeError, ValueError, OverflowError:
+        except (TypeError, ValueError, OverflowError):
             native_status = None
         if (
             strict_group_projection
@@ -3164,11 +3086,7 @@ class DirectWeChatReader:
                 if group_self_sender_receipt is not None
                 else None
             )
-            if (
-                sender_key is None
-                or group_shard_key is None
-                or sender_commitment is None
-            ):
+            if sender_key is None or group_shard_key is None or sender_commitment is None:
                 return base_type, "unknown", "unknown", None
             candidate = self._opaque_sha256_commitment(
                 GROUP_SELF_SENDER_RECEIPT_ALGORITHM,
@@ -3207,8 +3125,7 @@ class DirectWeChatReader:
             private_session
             and not strict_group_projection
             and base_type != 10000
-            and native_status
-            not in {_OUTGOING_MESSAGE_STATUS, _INCOMING_MESSAGE_STATUS}
+            and native_status not in {_OUTGOING_MESSAGE_STATUS, _INCOMING_MESSAGE_STATUS}
             and not (
                 native_status in _CALIBRATED_MESSAGE_STATUSES
                 and calibrated_self_sender is not None
@@ -3258,7 +3175,7 @@ class DirectWeChatReader:
         ):
             try:
                 value = row[column]
-            except IndexError, KeyError:
+            except (IndexError, KeyError):
                 continue
             identities.update(_quote_identities(_readable_payload_text(value)))
         if len(identities) == 1:
@@ -3286,7 +3203,7 @@ class DirectWeChatReader:
         sender_id = row["real_sender_id"]
         try:
             sender_key = int(sender_id)
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             sender_key = None
         base_type, sender_role, direction, is_send = self._message_row_sender_role(
             message_source,
@@ -3344,15 +3261,15 @@ class DirectWeChatReader:
         if strict_group_projection:
             quote_id, quote_conflict = self._row_structured_quote_resolution(row)
             if quote_conflict:
-                raise DirectSchemaError(
-                    "group projection structured quote is conflicting"
-                )
+                raise DirectSchemaError("group projection structured quote is conflicting")
         else:
             quote_identities: set[str] = set()
             for text in payload_texts:
                 quote_identities.update(_quote_identities(text))
             quote_id = (
-                next(iter(quote_identities)) if len(quote_identities) == 1 else None
+                next(iter(quote_identities))
+                if len(quote_identities) == 1
+                else None
             )
             if len(quote_identities) > 1:
                 message["quoteGap"] = "quote_identity_conflict"
@@ -3379,12 +3296,9 @@ class DirectWeChatReader:
                 shard_key = self._group_projection_shard_key(
                     message_source, message_table
                 )
-                message["shardLocalIdentity"] = (
-                    "sha256:"
-                    + hashlib.sha256(
-                        f"{shard_key}\0{local_identity}".encode("utf-8")
-                    ).hexdigest()
-                )
+                message["shardLocalIdentity"] = "sha256:" + hashlib.sha256(
+                    f"{shard_key}\0{local_identity}".encode("utf-8")
+                ).hexdigest()
         return message
 
     @staticmethod
@@ -3393,7 +3307,7 @@ class DirectWeChatReader:
 
         try:
             rowid = int(row["_rowid"])
-        except KeyError, TypeError, ValueError, OverflowError:
+        except (KeyError, TypeError, ValueError, OverflowError):
             return None
         return rowid if rowid > 0 else None
 
@@ -3425,20 +3339,18 @@ class DirectWeChatReader:
 
     def _group_projection_shard_key(self, source: Path, table: str) -> str:
         relative = source.relative_to(self._storage).as_posix()
-        return (
-            "sha256:"
-            + hashlib.sha256(f"{relative}\0{table}".encode("utf-8")).hexdigest()
-        )
+        return "sha256:" + hashlib.sha256(
+            f"{relative}\0{table}".encode("utf-8")
+        ).hexdigest()
 
-    def _group_projection_shards(self, session_native_id: str) -> list[dict[str, Any]]:
+    def _group_projection_shards(
+        self, session_native_id: str
+    ) -> list[dict[str, Any]]:
         """Return a stable, metadata-only catalog for one group message table."""
 
-        table = (
-            "Msg_"
-            + hashlib.md5(
-                session_native_id.encode("utf-8"), usedforsecurity=False
-            ).hexdigest()
-        )
+        table = "Msg_" + hashlib.md5(
+            session_native_id.encode("utf-8"), usedforsecurity=False
+        ).hexdigest()
         quoted_table = _quote_identifier(table)
         shards: list[dict[str, Any]] = []
         for source, connection in self._message_connections(table):
@@ -3477,9 +3389,7 @@ class DirectWeChatReader:
     ) -> dict[str, Any]:
         rowid = DirectWeChatReader._group_projection_rowid(row)
         if rowid is None:
-            raise DirectSchemaError(
-                "group projection row lacks a stable physical locator"
-            )
+            raise DirectSchemaError("group projection row lacks a stable physical locator")
         return {"shard": shard, "row": row, "rowid": rowid}
 
     def _group_record_identity(
@@ -3550,7 +3460,11 @@ class DirectWeChatReader:
         media = result.get("media_manifest")
         if isinstance(media, list):
             result["media_manifest"] = [
-                {str(key): value for key, value in item.items() if key != "locator"}
+                {
+                    str(key): value
+                    for key, value in item.items()
+                    if key != "locator"
+                }
                 if isinstance(item, Mapping)
                 else item
                 for item in media
@@ -3637,9 +3551,7 @@ class DirectWeChatReader:
                 (int(start_rowid), int(end_rowid)),
             )
         except sqlite3.DatabaseError as exc:
-            raise DirectSchemaError(
-                "group projection rowid cursor is unavailable"
-            ) from exc
+            raise DirectSchemaError("group projection rowid cursor is unavailable") from exc
         yield from _iter_cursor_pages(cursor, page_size=page_size)
 
     def _exact_group_server_records(
@@ -3656,9 +3568,7 @@ class DirectWeChatReader:
         for shard in shards:
             index_name = shard.get("server_index")
             if not isinstance(index_name, str) or not index_name:
-                raise DirectSchemaError(
-                    "group projection server lookup index is unavailable"
-                )
+                raise DirectSchemaError("group projection server lookup index is unavailable")
             quoted_table = _quote_identifier(str(shard["table"]))
             quoted_index = _quote_identifier(index_name)
             for offset in range(0, len(wanted), 500):
@@ -3759,7 +3669,7 @@ class DirectWeChatReader:
         for key, value in dict(prior_shard_rowid_highs or {}).items():
             try:
                 rowid = int(value)
-            except TypeError, ValueError, OverflowError:
+            except (TypeError, ValueError, OverflowError):
                 invalid_prior = True
                 continue
             if rowid < 0:
@@ -3782,7 +3692,7 @@ class DirectWeChatReader:
         receipt_input_invalid = False
         try:
             raw_prior_receipts = dict(prior_shard_self_sender_receipts or {})
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             raw_prior_receipts = {}
             receipt_input_invalid = True
 
@@ -3796,9 +3706,7 @@ class DirectWeChatReader:
             # A tail re-read cannot roll an already durable cursor backwards;
             # it can only stop newly discovered rows from advancing it.
             candidate = max(previous_high, candidate) if initialized else candidate
-            shard_highs[shard_key] = min(
-                shard_highs.get(shard_key, candidate), candidate
-            )
+            shard_highs[shard_key] = min(shard_highs.get(shard_key, candidate), candidate)
 
         if invalid_prior:
             hold(None, None, "group_anchor_cursor_invalid")
@@ -3857,7 +3765,7 @@ class DirectWeChatReader:
                 return
             try:
                 native_status = int(row["status"])
-            except TypeError, ValueError, OverflowError:
+            except (TypeError, ValueError, OverflowError):
                 return
             if native_status != _OUTGOING_MESSAGE_STATUS:
                 return
@@ -3893,7 +3801,6 @@ class DirectWeChatReader:
                 shard_key=key,
                 calibrated_sender=sender_key,
             )
-
         for shard in shards:
             key = str(shard["key"])
             if shard.get("server_index") is None:
@@ -3901,16 +3808,12 @@ class DirectWeChatReader:
                 continue
             try:
                 maximum = int(
-                    shard["connection"]
-                    .execute(
+                    shard["connection"].execute(
                         f"SELECT COALESCE(MAX(rowid),0) FROM {_quote_identifier(str(shard['table']))}"
-                    )
-                    .fetchone()[0]
+                    ).fetchone()[0]
                 )
             except (TypeError, ValueError, sqlite3.DatabaseError) as exc:
-                raise DirectSchemaError(
-                    "group projection rowid cursor is unavailable"
-                ) from exc
+                raise DirectSchemaError("group projection rowid cursor is unavailable") from exc
             previous_high = normalized_prior.get(key, 0)
             if initialized and maximum < previous_high:
                 hold(key, maximum + 1, "group_anchor_rowid_rollback")
@@ -3955,7 +3858,7 @@ class DirectWeChatReader:
                             break
                         try:
                             native_time = int(row["create_time"])
-                        except TypeError, ValueError, OverflowError:
+                        except (TypeError, ValueError, OverflowError):
                             native_time = None
                         if native_time is not None and native_time > int(end_s):
                             hold(key, rowid, "group_anchor_future_cutoff_hole")
@@ -3965,9 +3868,7 @@ class DirectWeChatReader:
                         if hold_reasons:
                             stopped = True
                             break
-                        _, relation_conflict = self._row_structured_quote_resolution(
-                            row
-                        )
+                        _, relation_conflict = self._row_structured_quote_resolution(row)
                         if relation_conflict:
                             # A metadata-only app message can otherwise be
                             # silently skipped as unrelated while two native
@@ -4001,15 +3902,13 @@ class DirectWeChatReader:
                             )
                             existing = self_signatures.get(identity[1])
                             if existing is not None and existing != signature:
-                                hold(
-                                    key, rowid, "group_anchor_server_identity_conflict"
-                                )
+                                hold(key, rowid, "group_anchor_server_identity_conflict")
                                 stopped = True
                                 break
                             self_signatures[identity[1]] = signature
                         try:
                             sort_seq = int(row["sort_seq"])
-                        except TypeError, ValueError, OverflowError:
+                        except (TypeError, ValueError, OverflowError):
                             sort_seq = None
                         if sort_seq is not None:
                             max_sort_seq = (
@@ -4035,7 +3934,7 @@ class DirectWeChatReader:
         ) -> bool:
             try:
                 native_time = int(record["row"]["create_time"])
-            except TypeError, ValueError, OverflowError:
+            except (TypeError, ValueError, OverflowError):
                 hold(
                     origin_shard_key,
                     origin_rowid,
@@ -4050,46 +3949,38 @@ class DirectWeChatReader:
                 )
                 return False
             if not record_is_safe(record):
-                hold(
-                    origin_shard_key,
-                    origin_rowid,
-                    "group_anchor_target_after_safe_cursor",
-                )
+                hold(origin_shard_key, origin_rowid, "group_anchor_target_after_safe_cursor")
                 return False
-            _, relation_conflict = self._row_structured_quote_resolution(record["row"])
+            _, relation_conflict = self._row_structured_quote_resolution(
+                record["row"]
+            )
             if relation_conflict:
                 hold(origin_shard_key, origin_rowid, "group_anchor_relation_conflict")
                 return False
             identity = self._group_record_identity(record["shard"], record["row"])
             if identity is None:
-                hold(
-                    origin_shard_key,
-                    origin_rowid,
-                    "group_anchor_target_identity_missing",
-                )
+                hold(origin_shard_key, origin_rowid, "group_anchor_target_identity_missing")
                 return False
             existing = selected_records.get(identity)
             if existing is not None:
-                if str(existing["shard"]["key"]) == str(record["shard"]["key"]) and int(
-                    existing["rowid"]
-                ) == int(record["rowid"]):
+                if (
+                    str(existing["shard"]["key"]) == str(record["shard"]["key"])
+                    and int(existing["rowid"]) == int(record["rowid"])
+                ):
                     return True
                 # The metadata signature catches the cheap common case, but a
                 # same-server copy with an app body/title/media difference is
                 # also an identity conflict.  Compare the exact selected
                 # output inputs before choosing a shard deterministically.
                 try:
-                    same = self._group_record_exact_signature(
-                        existing
-                    ) == self._group_record_exact_signature(record)
+                    same = (
+                        self._group_record_exact_signature(existing)
+                        == self._group_record_exact_signature(record)
+                    )
                 except DirectSchemaError:
                     same = False
                 if not same:
-                    hold(
-                        origin_shard_key,
-                        origin_rowid,
-                        "group_anchor_server_identity_conflict",
-                    )
+                    hold(origin_shard_key, origin_rowid, "group_anchor_server_identity_conflict")
                     return False
             selected_records[identity] = dict(record)
             return True
@@ -4113,14 +4004,12 @@ class DirectWeChatReader:
                     pass_rows[1] += len(page)
                     page_count += 1
                     max_page_rows = max(max_page_rows, len(page))
-                    records = [
-                        self._group_projection_record(shard, row) for row in page
-                    ]
+                    records = [self._group_projection_record(shard, row) for row in page]
                     target_ids: set[str] = set()
                     for record in records:
                         row = record["row"]
-                        quote_id, relation_conflict = (
-                            self._row_structured_quote_resolution(row)
+                        quote_id, relation_conflict = self._row_structured_quote_resolution(
+                            row
                         )
                         if relation_conflict:
                             hold(
@@ -4139,9 +4028,7 @@ class DirectWeChatReader:
                             target_ids.add(quote_id)
                     if stopped:
                         break
-                    targets, conflicts = self._exact_group_server_records(
-                        shards, target_ids
-                    )
+                    targets, conflicts = self._exact_group_server_records(shards, target_ids)
                     for record in records:
                         row = record["row"]
                         rowid = int(record["rowid"])
@@ -4152,8 +4039,8 @@ class DirectWeChatReader:
                             hold(key, rowid, "group_anchor_sender_role_unproven")
                             stopped = True
                             break
-                        quote_id, relation_conflict = (
-                            self._row_structured_quote_resolution(row)
+                        quote_id, relation_conflict = self._row_structured_quote_resolution(
+                            row
                         )
                         if relation_conflict:
                             hold(key, rowid, "group_anchor_relation_conflict")
@@ -4212,11 +4099,7 @@ class DirectWeChatReader:
                         if sender_role == "self":
                             if server_id is not None:
                                 if server_id in conflicts or server_id not in targets:
-                                    hold(
-                                        key,
-                                        rowid,
-                                        "group_anchor_server_identity_conflict",
-                                    )
+                                    hold(key, rowid, "group_anchor_server_identity_conflict")
                                     stopped = True
                                     break
                                 if not select_record(
@@ -4239,11 +4122,7 @@ class DirectWeChatReader:
                             # it does not cause a history scan.
                             if quote_id is not None:
                                 if quote_id in conflicts:
-                                    hold(
-                                        key,
-                                        rowid,
-                                        "group_anchor_server_identity_conflict",
-                                    )
+                                    hold(key, rowid, "group_anchor_server_identity_conflict")
                                     stopped = True
                                     break
                                 target = targets.get(quote_id)
@@ -4256,9 +4135,7 @@ class DirectWeChatReader:
                                     break
                         elif quote_id is not None:
                             if quote_id in conflicts:
-                                hold(
-                                    key, rowid, "group_anchor_server_identity_conflict"
-                                )
+                                hold(key, rowid, "group_anchor_server_identity_conflict")
                                 stopped = True
                                 break
                             target = targets.get(quote_id)
@@ -4266,22 +4143,14 @@ class DirectWeChatReader:
                                 # Whether this counterpart message touches the
                                 # user is unknown, so no cursor may advance past
                                 # it without a durable pending backlog.
-                                hold(
-                                    key,
-                                    rowid,
-                                    "group_anchor_relation_target_unresolved",
-                                )
+                                hold(key, rowid, "group_anchor_relation_target_unresolved")
                                 stopped = True
                                 break
                             _, target_role, _, _ = self._group_message_sender_role(
                                 target["shard"], target["row"]
                             )
                             if target_role == "unknown":
-                                hold(
-                                    key,
-                                    rowid,
-                                    "group_anchor_relation_target_role_unproven",
-                                )
+                                hold(key, rowid, "group_anchor_relation_target_role_unproven")
                                 stopped = True
                                 break
                             if target_role == "self":
@@ -4446,15 +4315,14 @@ class DirectWeChatReader:
         native_value: str | int = (
             int(normalized_id) if normalized_id.isdecimal() else normalized_id
         )
-        table = (
-            "Msg_"
-            + hashlib.md5(
-                session_native_id.encode("utf-8"), usedforsecurity=False
-            ).hexdigest()
-        )
+        table = "Msg_" + hashlib.md5(
+            session_native_id.encode("utf-8"), usedforsecurity=False
+        ).hexdigest()
         quoted_table = _quote_identifier(table)
         candidates: list[tuple[Path, sqlite3.Connection, sqlite3.Row]] = []
-        table_sources: list[tuple[Path, sqlite3.Connection, str, str, str | None]] = []
+        table_sources: list[
+            tuple[Path, sqlite3.Connection, str, str, str | None]
+        ] = []
         for source, connection in self._message_connections(table):
             exists = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
@@ -4497,7 +4365,6 @@ class DirectWeChatReader:
             candidates.extend((source, connection, row) for row in rows)
         if not candidates:
             return None
-
         return self._project_private_message_candidates(
             candidates,
             session_native_id=session_native_id,
@@ -4520,12 +4387,9 @@ class DirectWeChatReader:
             limit = int(limit)
             if limit < 1:
                 raise ValueError("message_fetch_limit_invalid")
-        table = (
-            "Msg_"
-            + hashlib.md5(
-                session_native_id.encode("utf-8"), usedforsecurity=False
-            ).hexdigest()
-        )
+        table = "Msg_" + hashlib.md5(
+            session_native_id.encode("utf-8"), usedforsecurity=False
+        ).hexdigest()
         quoted_table = _quote_identifier(table)
         rows: list[tuple[Path, sqlite3.Row]] = []
         table_found = False
@@ -4543,7 +4407,9 @@ class DirectWeChatReader:
                 for column in connection.execute(f"PRAGMA table_info({quoted_table})")
             }
             status_expr = "status" if "status" in columns else "NULL"
-            origin_expr = "origin_source" if "origin_source" in columns else "NULL"
+            origin_expr = (
+                "origin_source" if "origin_source" in columns else "NULL"
+            )
             predicates: list[tuple[str, list[Any], str | None]] = []
             if since_s is not None and since_sort_seq is not None:
                 sort_index = self._index_with_leading_columns(
@@ -4555,8 +4421,9 @@ class DirectWeChatReader:
                     f"SELECT max(sort_seq) FROM {quoted_table} INDEXED BY "
                     f"{_quote_identifier(sort_index)}"
                 ).fetchone()[0]
-                if current_max_sort is not None and int(current_max_sort) < int(
-                    since_sort_seq
+                if (
+                    current_max_sort is not None
+                    and int(current_max_sort) < int(since_sort_seq)
                 ):
                     raise DirectSchemaError(
                         "sort_seq_cursor_regressed_requires_full_reconcile"
@@ -4590,8 +4457,9 @@ class DirectWeChatReader:
                     f"SELECT max(sort_seq) FROM {quoted_table} INDEXED BY "
                     f"{_quote_identifier(sort_index)}"
                 ).fetchone()[0]
-                if current_max_sort is not None and int(current_max_sort) < int(
-                    since_sort_seq
+                if (
+                    current_max_sort is not None
+                    and int(current_max_sort) < int(since_sort_seq)
                 ):
                     raise DirectSchemaError(
                         "sort_seq_cursor_regressed_requires_full_reconcile"
@@ -4609,7 +4477,9 @@ class DirectWeChatReader:
                 )
                 if time_index is None:
                     if not allow_unindexed_time_fallback or limit is None:
-                        raise DirectSchemaError("incremental_time_index_unavailable")
+                        raise DirectSchemaError(
+                            "incremental_time_index_unavailable"
+                        )
                     sort_index = self._index_with_leading_columns(
                         connection, table, ("sort_seq",)
                     )
@@ -4668,9 +4538,7 @@ class DirectWeChatReader:
                         rows.extend((source, row) for row in page)
                         if limit is not None:
                             predicate_identities.update(
-                                self._private_message_record_identity(
-                                    source, table, row
-                                )
+                                self._private_message_record_identity(source, table, row)
                                 for row in page
                             )
                             if len(predicate_identities) >= limit:
@@ -4682,14 +4550,13 @@ class DirectWeChatReader:
                 "session message database is missing"
             )
         if limit is not None:
-
             def newest_key(item: tuple[Path, sqlite3.Row]) -> tuple[Any, ...]:
                 row = item[1]
 
                 def integer(value: Any) -> int:
                     try:
                         return int(value)
-                    except TypeError, ValueError:
+                    except (TypeError, ValueError):
                         return -1
 
                 return (
@@ -4702,9 +4569,7 @@ class DirectWeChatReader:
             selected_identities: list[tuple[str, str]] = []
             seen: set[tuple[str, str]] = set()
             for item in sorted(rows, key=newest_key, reverse=True):
-                identity = self._private_message_record_identity(
-                    item[0], table, item[1]
-                )
+                identity = self._private_message_record_identity(item[0], table, item[1])
                 if identity in seen:
                     continue
                 seen.add(identity)
@@ -4722,7 +4587,9 @@ class DirectWeChatReader:
             tuple[str, str], list[tuple[Path, sqlite3.Connection, sqlite3.Row]]
         ] = {}
         for message_source, row in rows:
-            identity = self._private_message_record_identity(message_source, table, row)
+            identity = self._private_message_record_identity(
+                message_source, table, row
+            )
             grouped.setdefault(identity, []).append(
                 (message_source, connection_by_source[message_source], row)
             )
@@ -4757,7 +4624,7 @@ class DirectWeChatReader:
         for message in ordered:
             try:
                 sort_watermarks.append(int(message["sortSeq"]))
-            except KeyError, TypeError, ValueError:
+            except (KeyError, TypeError, ValueError):
                 continue
         if since_sort_seq is not None:
             sort_watermarks.append(int(since_sort_seq))

@@ -333,7 +333,9 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
             for status in ("未应答", "通话时长 03:46")
         ]
         try:
-            projections = [_message_content_projection(row, 50)[0] for row in rows]
+            projections = [
+                _message_content_projection(row, 50)[0] for row in rows
+            ]
         finally:
             connection.close()
         self.assertEqual(projections, ["未应答", "通话时长 03:46"])
@@ -496,11 +498,8 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
             }
             try:
                 for limit in (None, 1):
-                    with (
-                        self.subTest(limit=limit),
-                        self.assertRaisesRegex(
-                            DirectSchemaError, "^message_identity_is_conflicting$"
-                        ),
+                    with self.subTest(limit=limit), self.assertRaisesRegex(
+                        DirectSchemaError, "^message_identity_is_conflicting$"
                     ):
                         reader.fetch_messages(
                             session_id,

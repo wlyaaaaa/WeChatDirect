@@ -293,6 +293,34 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
         )
         self.assertEqual(_readable_payload_text("你好\u200b"), "你好\u200b")
 
+    def test_unknown_message_type_keeps_an_explicit_content_gap(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT 1 AS local_id, 999 AS local_type, 42 AS server_id, "
+            "1 AS real_sender_id, 100 AS create_time, '' AS message_content, "
+            "'' AS source, '' AS packed_info_data, '' AS compress_content, "
+            "7 AS sort_seq, 4 AS status, '' AS origin_source"
+        ).fetchone()
+        reader = object.__new__(DirectWeChatReader)
+        reader._identity = "wxid-synthetic-self"
+        reader._media_entries = lambda *_args, **_kwargs: []
+        try:
+            message = reader._message_from_row(
+                row=row,
+                session_native_id="wxid-synthetic-contact",
+                message_source=Path("synthetic.db"),
+                message_table="Msg_synthetic",
+                connection=connection,
+                sender_index={1: "wxid-synthetic-other"},
+            )
+        finally:
+            connection.close()
+
+        self.assertEqual(message["type"], "unknown")
+        self.assertIsNone(message["content"])
+        self.assertEqual(message["contentGap"], "message_type_unsupported")
+
     def test_call_event_projects_source_status_not_opaque_body(self):
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row

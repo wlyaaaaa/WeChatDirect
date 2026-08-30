@@ -3166,10 +3166,12 @@ class DirectWeChatReader:
             message["senderGap"] = "sender_mapping_unresolved"
         elif sender_role == "unknown":
             message["directionGap"] = "message_status_unproven"
-        if content is None and base_type in {1, 49, 50, 10000}:
+        if content is None and base_type not in {3, 34, 43, 47}:
             message["contentGap"] = compressed_gap or (
                 "call_status_unavailable"
                 if base_type == 50
+                else "message_type_unsupported"
+                if base_type not in _TYPE_NAMES
                 else "message_content_unparsed"
             )
         if strict_group_projection:

@@ -1,0 +1,14 @@
+{
+  "primary": {
+    "config_path": "<encrypted-config-path>",
+    "local_state_path": "<primary-local-state-path>",
+    "expected_source_identity_sha256": "sha256:<primary-source-identity-commitment>",
+    "expected_moments_author_sha256": "sha256:<primary-moments-author-commitment>"
+  },
+  "secondary": {
+    "config_path": "<encrypted-config-path>",
+    "local_state_path": "<secondary-local-state-path>",
+    "expected_source_identity_sha256": "sha256:<secondary-source-identity-commitment>",
+    "expected_moments_author_sha256": "sha256:<secondary-moments-author-commitment>"
+  }
+}

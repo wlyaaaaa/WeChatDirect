@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wechatdirect"
+version = "0.1.0"
+description = "Read-only local WeChat context and export tools for Windows"
+readme = "README.md"
+requires-python = ">=3.14"
+license = { file = "LICENSE" }
+authors = [{ name = "wlyaaaaa" }]
+dependencies = [
+  "cryptography",
+  "tzdata; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+dev = ["ruff"]
+
+[project.scripts]
+wechat-direct = "wechat_cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "." }
+py-modules = ["wechat_cli", "wechat_source", "voice_decode"]

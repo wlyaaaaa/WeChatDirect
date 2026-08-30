@@ -333,9 +333,7 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
             for status in ("未应答", "通话时长 03:46")
         ]
         try:
-            projections = [
-                _message_content_projection(row, 50)[0] for row in rows
-            ]
+            projections = [_message_content_projection(row, 50)[0] for row in rows]
         finally:
             connection.close()
         self.assertEqual(projections, ["未应答", "通话时长 03:46"])
@@ -431,6 +429,109 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
                 self.assertEqual([item["localId"] for item in bounded["messages"]], [2])
             finally:
                 connection.close()
+                self._close(reader)
+
+    def test_cross_shard_server_identity_conflicts_fail_closed_for_all_limits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            storage = Path(temporary)
+            session_id = "wxid-contact"
+            table = (
+                "Msg_"
+                + hashlib.md5(
+                    session_id.encode("utf-8"), usedforsecurity=False
+                ).hexdigest()
+            )
+
+            def make_source(name, rows):
+                source = storage / name
+                connection = sqlite3.connect(source)
+                connection.row_factory = sqlite3.Row
+                connection.execute(
+                    f"CREATE TABLE {table}(local_id INTEGER, local_type INTEGER, "
+                    "server_id INTEGER, real_sender_id INTEGER, create_time INTEGER, "
+                    "message_content TEXT, source TEXT, packed_info_data TEXT, "
+                    "compress_content TEXT, sort_seq INTEGER, status INTEGER, "
+                    "origin_source TEXT)"
+                )
+                connection.execute(f"CREATE INDEX {name}_time ON {table}(create_time)")
+                connection.execute(f"CREATE INDEX {name}_sort ON {table}(sort_seq)")
+                connection.execute(f"CREATE INDEX {name}_server ON {table}(server_id)")
+                connection.executemany(
+                    f"INSERT INTO {table} VALUES(?, 1, ?, 1, ?, ?, '', '', '', ?, 4, '')",
+                    rows,
+                )
+                connection.commit()
+                return source, connection
+
+            left_source, left = make_source(
+                "message_left", [(101, 42, 300, "left-body", 30)]
+            )
+            right_source, right = make_source(
+                "message_right",
+                [
+                    (201, 99, 250, "other-body", 25),
+                    (202, 42, 100, "right-body", 10),
+                ],
+            )
+            reader = self._plain_reader(storage)
+            reader._message_connections = lambda _table=None: [
+                (left_source, left),
+                (right_source, right),
+            ]
+            reader._session_is_registered = lambda _session: True
+            reader._sender_index_for_message_source = lambda _source: {}
+            reader._message_from_row = lambda **kwargs: {
+                "serverId": kwargs["row"]["server_id"],
+                "localId": kwargs["row"]["local_id"],
+                "createTime": kwargs["row"]["create_time"],
+                "sortSeq": kwargs["row"]["sort_seq"],
+                "content": kwargs["row"]["message_content"],
+                "media_manifest": [
+                    {
+                        "mediaId": "same-media",
+                        "openable": True,
+                        "locator": kwargs["message_source"].name,
+                    }
+                ],
+            }
+            try:
+                for limit in (None, 1):
+                    with (
+                        self.subTest(limit=limit),
+                        self.assertRaisesRegex(
+                            DirectSchemaError, "^message_identity_is_conflicting$"
+                        ),
+                    ):
+                        reader.fetch_messages(
+                            session_id,
+                            since_s=0,
+                            end_s=400,
+                            limit=limit,
+                        )
+
+                right.execute(f"DELETE FROM {table}")
+                right.execute(
+                    f"INSERT INTO {table} VALUES(202, 1, 42, 1, 300, "
+                    "'left-body', '', '', '', 30, 4, '')"
+                )
+                right.commit()
+                forward = reader.fetch_messages(
+                    session_id, since_s=0, end_s=400, limit=1
+                )["messages"]
+                reader._message_connections = lambda _table=None: [
+                    (right_source, right),
+                    (left_source, left),
+                ]
+                reverse = reader.fetch_messages(
+                    session_id, since_s=0, end_s=400, limit=1
+                )["messages"]
+                self.assertEqual(forward, reverse)
+                self.assertEqual(len(forward), 1)
+                self.assertEqual(forward[0]["serverId"], 42)
+                self.assertEqual(forward[0]["content"], "left-body")
+            finally:
+                left.close()
+                right.close()
                 self._close(reader)
 
     def test_person_scoped_moments_scan_full_current_cache_before_limit(self):

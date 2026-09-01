@@ -12,7 +12,7 @@ WeChatDirect 是一个 Windows-only 的本地工具：从当前电脑上已登�
 - 账号按配置槽位严格隔离。每次读取都绑定一个账号的本地身份；身份不匹配时直接失败，不会把另一个账号的数据当作答案。
 - 聊天和朋友圈范围以当前设备可见的本地数据为准，不等于远端全历史。不可解析的正文、不可打开的媒体、缺少索引或源库在读取期间发生变化时，会作为明确缺口返回。
 - 朋友圈读取的是当前本机缓存；缓存中没有目标时，工具会报告未命中，并要求在同一账号中由用户先完成必要的本机操作后再重试。
-- 图片、文件、视频、表情和语音只有在消息关系与本地字节都能精确绑定时才会打开或复制；不会根据文件名、群名或上下文猜内容。通话状态不是可供转写的语音文件。
+- 当前公开实现中，图片、视频、表情和文件只保留它们与消息的资源关系、定位信息和不可打开缺口，不会打开或复制其字节。唯一能公开打开或复制原始字节的路径，是与一条消息唯一绑定的 `VoiceInfo` 语音；不会根据文件名、群名或上下文猜内容。通话状态不是可供转写的语音文件。
 
 ## 安装
 
@@ -80,14 +80,14 @@ wechat-direct context --account auto --contact "<contact-or-group>" --contains "
 
 这是有界读取，不会先做全账号同步。`auto` 在多个账号都匹配或无法唯一定位时会停止并返回候选，不会猜测。结果包含消息、发送者方向、可影响含义的媒体关系和缺口。
 
-### `sync-contact`：一个对象的首次导出与增量重放
+### `sync-contact`：一个对象的首次导出与完成态增量刷新
 
 ```powershell
 wechat-direct sync-contact --account primary --contact "<contact-or-group>"
 wechat-direct sync-contact --account primary --contact "<contact-or-group>" --full-reconcile
 ```
 
-第一次为点名对象建立本机可见档案；重复同一命令时使用来源指纹、游标和有界重叠窗口合并变化。需要重新核对全部本地历史时，才显式使用 `--full-reconcile`。这不是全账号同步，也没有常驻任务。
+第一次只在全新空目录中为点名对象建立本机可见档案。已有匹配 `manifest.json` 和 `state.json` 的完成态档案时，重复同一命令才会使用来源指纹、游标和有界重叠窗口增量刷新；需要重新核对全部本地历史时，可再次显式使用 `--full-reconcile`。它不是首次运行硬崩溃后的完整断点续跑，也不是全账号同步或常驻任务。
 
 ### `moments`：读取当前本机朋友圈缓存
 
@@ -105,18 +105,18 @@ wechat-direct sync-moments --account primary --self
 wechat-direct sync-moments --account primary --contact "<contact>"
 ```
 
-该命令保存并重放当前设备可见的朋友圈缓存快照，不承诺远端全历史。账号、对象和输出范围始终保持隔离。
+该命令建立或刷新当前设备可见的朋友圈缓存快照，不承诺远端全历史。只有完成态快照才能安全重复刷新；账号、对象和输出范围始终保持隔离。
 
-### `media-open`：打开一个精确媒体定位
+### `media-open`：打开一条精确绑定的语音
 
-定位值必须来自同一账号、同一消息结果中的 `locator`；不会扫描目录或猜测文件：
+定位值必须来自同一账号、同一消息结果中标记为可打开的唯一 `VoiceInfo` 语音 `locator`；不会扫描目录或猜测文件。当前图片、视频、表情和文件定位只表达资源关系与不可打开缺口，不能用于复制字节：
 
 ```powershell
-wechat-direct media-open --account primary --locator "<locator>" --output "<output-file>"
-wechat-direct media-open --account primary --locator "<voice-locator>" --output "<output-wav>" --voice-wav
+wechat-direct media-open --account primary --locator "<voice-locator>" --output "<output.silk>"
+wechat-direct media-open --account primary --locator "<voice-locator>" --output "<output.wav>" --voice-wav
 ```
 
-目标输出必须不存在。普通调用保留原始字节；`--voice-wav` 只接受精确绑定的 Tencent/WeChat SILK 语音，并使用上文的 Python 3.11 + `pilk` 路径。stdout 回执会给出输出文件的字节数和 SHA-256。
+目标输出必须不存在。普通调用保留原始 SILK 字节；`--voice-wav` 解码同一条精确绑定的 Tencent/WeChat SILK 语音，并使用上文的 Python 3.11 + `pilk` 路径。stdout 回执会给出输出文件的字节数和 SHA-256。
 
 ### `preserve`：保全一个明确的聊天窗口
 
@@ -124,7 +124,7 @@ wechat-direct media-open --account primary --locator "<voice-locator>" --output 
 wechat-direct preserve --account primary --contact "<contact-or-group>" --lookback-days 1 --output "<preserve-directory>"
 ```
 
-该命令只复制用户点名窗口内能精确打开的媒体，并生成自包含保全目录。原始语音保留 SILK；可用时同时生成 WAV。不能打开或解码的项目会留在缺口中，不会被静默丢弃或伪造。
+该命令生成一个自包含保全目录，并只复制用户点名窗口内能精确打开的唯一 `VoiceInfo` 语音。原始语音保留 SILK；可用时同时生成 WAV。图片、视频、表情和文件仍只保留消息资源关系与不可打开缺口，不会被静默丢弃、伪造或复制。
 
 ### `doctor` 与 `verify-export`
 
@@ -135,7 +135,14 @@ wechat-direct doctor --config "<path-to-accounts.json>"
 wechat-direct verify-export --output "<export-directory>"
 ```
 
-需要更多选项时先运行 `wechat-direct doctor --help` 或 `wechat-direct verify-export --help`。`doctor` 应用于确认 Windows、Python、配置入口和所需本地依赖；`verify-export` 只检查 `sync-contact` 或 `sync-moments` 产生的 v1 导出，不接受 `preserve` 保全目录。它们都只报告检查结果，不代替用户决定账号、对象或公开分享范围。
+需要更多选项时先运行 `wechat-direct doctor --help` 或 `wechat-direct verify-export --help`。`doctor` 应用于确认 Windows、Python、配置入口和所需本地依赖；`verify-export` 只读检查 `sync-contact` 或 `sync-moments` 产生的 v1 导出，不接受 `preserve` 保全目录，也不会重写、补齐或修复任何文件。它们都只报告检查结果，不代替用户决定账号、对象或公开分享范围。
+
+## 故障与恢复边界
+
+- 完成态档案可以再次运行同一命令做增量刷新，或显式使用 `--full-reconcile` 重核当前本机可见历史。`sync-contact` 每次 `noChange` 快速返回前都会重新核对 manifest 自身哈希、manifest/state 绑定，以及 `context.md`、`ai-context.md`、`messages.jsonl` 的已声明哈希、大小或记录数；任一不一致都会精确失败并保留原文件，不会静默覆盖未知内容。
+- 首次运行若在 `state.json` 提交前硬崩溃，目录会保留为没有 state 的半成品，并以 `sync_output_not_initialized` 精确失败。工具不会自动删除、覆盖或猜测接管这些未知内容；如需重做，应由用户保留或另行检查原目录后选择一个新的空输出目录。
+- 遗留 `.sync.lock` 会以 `sync_already_running_or_stale_lock` 失败。工具无法仅凭锁文件证明原进程已结束，因此不会自动删除它。
+- `verify-export` 是只读验证，不会修复归档；本项目也不提供 restore/import（恢复/导入）回微信的能力。
 
 ## 输出文件
 
@@ -147,11 +154,11 @@ wechat-direct verify-export --output "<export-directory>"
 - `manifest.json`：范围、完整性和文件哈希；
 - `state.json`：增量游标与来源状态；
 - `last-run.json`：最近一次运行的回执、缺口和耗时；
-- `media/`：当前能精确绑定并打开的媒体。
+- `media/`：工具当前只会写入能精确绑定并打开的 `VoiceInfo` 语音原始字节及可用的派生 WAV；不会为图片、视频、表情和文件创建字节文件。
 
 `sync-moments` 使用相同的 `ai-context.md`、`context.md`、`manifest.json`、`state.json` 和 `last-run.json`，并以 `moments.jsonl` 保存朋友圈结构记录。
 
-`preserve` 目录包含 `messages.json`、`manifest.json` 和按消息关系组织的 `media/`；语音 WAV 是从同一 SILK 字节派生的文件。`media-open` 只创建用户指定的单个输出文件，并在 stdout 返回来源与输出哈希。
+`preserve` 目录包含 `messages.json`、`manifest.json` 和按消息关系组织的 `media/`；当前只有唯一绑定的 `VoiceInfo` 语音会复制字节，语音 WAV 是从同一 SILK 字节派生的文件。`media-open` 只创建用户指定的单个语音输出文件，并在 stdout 返回来源与输出哈希。
 
 ## 许可证
 

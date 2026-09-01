@@ -292,6 +292,89 @@ class PublicCommandTests(unittest.TestCase):
             )
             self.assertEqual(0, payload["mediaFilesChecked"])
 
+    def test_contact_fast_path_rejects_hash_size_count_and_state_drift(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "export"
+            manifest = self._write_export(root)
+            state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+            wechat_cli._verify_contact_fast_path_archive(root, manifest, state)
+
+            drifted_manifest = dict(manifest)
+            drifted_manifest["archiveBytes"] += 1
+            with self.assertRaisesRegex(
+                wechat_cli.ProductError, "sync_manifest_sha256_mismatch"
+            ):
+                wechat_cli._verify_contact_fast_path_archive(root, drifted_manifest, state)
+
+            size_drift = dict(drifted_manifest)
+            size_drift.pop("manifestSha256")
+            size_drift["manifestSha256"] = _sha256(
+                wechat_cli._canonical_bytes(size_drift)
+            )
+            with self.assertRaisesRegex(
+                wechat_cli.ProductError, "sync_context_size_mismatch"
+            ):
+                wechat_cli._verify_contact_fast_path_archive(root, size_drift, state)
+
+            drifted_state = dict(state)
+            drifted_state["messageCount"] += 1
+            with self.assertRaisesRegex(
+                wechat_cli.ProductError, "sync_manifest_state_mismatch"
+            ):
+                wechat_cli._verify_contact_fast_path_archive(root, manifest, drifted_state)
+
+            records_path = root / "messages.jsonl"
+            records = (
+                records_path.read_bytes()
+                + wechat_cli._canonical_bytes({"nativeId": {"value": "2"}})
+                + b"\n"
+            )
+            records_path.write_bytes(records)
+            count_drift = dict(manifest)
+            count_drift["messagesSha256"] = _sha256(records)
+            count_drift.pop("manifestSha256")
+            count_drift["manifestSha256"] = _sha256(
+                wechat_cli._canonical_bytes(count_drift)
+            )
+            with self.assertRaisesRegex(
+                wechat_cli.ProductError, "sync_records_count_mismatch"
+            ):
+                wechat_cli._verify_contact_fast_path_archive(root, count_drift, state)
+
+    def test_public_copy_states_current_media_and_recovery_limits(self) -> None:
+        readme = Path(wechat_cli.__file__).with_name("README.md").read_text(
+            encoding="utf-8"
+        )
+        for phrase in (
+            "图片、视频、表情和文件只保留",
+            "唯一能公开打开或复制原始字节",
+            "`VoiceInfo` 语音",
+            "sync_output_not_initialized",
+            "sync_already_running_or_stale_lock",
+            "`verify-export` 是只读验证，不会修复归档",
+            "restore/import（恢复/导入）",
+        ):
+            self.assertIn(phrase, readme)
+
+        root_parser = wechat_cli.parser()
+        subparsers = next(
+            action
+            for action in root_parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        root_help = root_parser.format_help()
+        self.assertIn("VoiceInfo voice payloads", root_help)
+        self.assertIn("report only, never", root_help)
+        self.assertIn("repair it", root_help)
+        self.assertIn("not a crash resume", root_help)
+        self.assertIn(
+            "not restore or import",
+            subparsers.choices["sync-contact"].format_help(),
+        )
+        self.assertIn("VoiceInfo voice locator", root_help)
+
     def test_parser_preserves_six_existing_commands_and_body_free_failure(self) -> None:
         parser = wechat_cli.parser()
         samples = {

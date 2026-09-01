@@ -740,6 +740,59 @@ class WeChatCliTests(unittest.TestCase):
             self.assertTrue(created[0].fetch_calls[0]["exact_media_lookup"])
             self.assertEqual(created[1].fetch_calls, [])
 
+            context_path = destination / "context.md"
+            context_path.write_text("truncated archive\n", encoding="utf-8")
+            with (
+                patch("wechat_cli._read_config", return_value=self.config),
+                patch("wechat_cli._reader", side_effect=factory),
+                patch("wechat_cli.time.time", return_value=200),
+            ):
+                with self.assertRaisesRegex(
+                    wechat_cli.ProductError, "sync_context_sha256_mismatch"
+                ):
+                    wechat_cli.command_sync_contact(args)
+            self.assertEqual(
+                context_path.read_text(encoding="utf-8"), "truncated archive\n"
+            )
+            self.assertEqual(created[2].fetch_calls, [])
+            context_path.write_bytes(context.encode("utf-8"))
+
+            ai_context_path = destination / "ai-context.md"
+            ai_context_path.write_text("truncated AI context\n", encoding="utf-8")
+            with (
+                patch("wechat_cli._read_config", return_value=self.config),
+                patch("wechat_cli._reader", side_effect=factory),
+                patch("wechat_cli.time.time", return_value=200),
+            ):
+                with self.assertRaisesRegex(
+                    wechat_cli.ProductError, "sync_ai_context_sha256_mismatch"
+                ):
+                    wechat_cli.command_sync_contact(args)
+            self.assertEqual(
+                ai_context_path.read_text(encoding="utf-8"),
+                "truncated AI context\n",
+            )
+            self.assertEqual(created[3].fetch_calls, [])
+            ai_context_path.write_bytes(ai_context.encode("utf-8"))
+
+            records_path = destination / "messages.jsonl"
+            records_path.write_bytes(
+                records_path.read_bytes()
+                + wechat_cli._canonical_bytes({"serverId": 999})
+                + b"\n"
+            )
+            with (
+                patch("wechat_cli._read_config", return_value=self.config),
+                patch("wechat_cli._reader", side_effect=factory),
+                patch("wechat_cli.time.time", return_value=200),
+            ):
+                with self.assertRaisesRegex(
+                    wechat_cli.ProductError, "sync_records_sha256_mismatch"
+                ):
+                    wechat_cli.command_sync_contact(args)
+            self.assertEqual(created[4].fetch_calls, [])
+            self.assertFalse((destination / ".sync.lock").exists())
+
     def test_contact_sync_rejects_partial_first_snapshot(self):
         args = argparse.Namespace(
             config="unused.json",

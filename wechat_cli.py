@@ -2,8 +2,8 @@
 
 The CLI has no database, daemon, queue, background sync, event model or user
 profile.  A caller names an account and contact, receives one bounded native
-message window, and may explicitly open media or create a one-off preservation
-bundle.
+message window, and may explicitly open an exactly bound VoiceInfo voice or
+create a one-off preservation bundle.
 """
 
 from __future__ import annotations
@@ -1754,6 +1754,88 @@ def _sync_lock(output: Path) -> Path:
     return lock
 
 
+def _verify_contact_fast_path_archive(
+    output: Path,
+    manifest: Mapping[str, Any],
+    state: Mapping[str, Any],
+) -> None:
+    """Validate committed contact-export bindings before reporting no change.
+
+    Any drift fails precisely.  The command cannot prove that differing bytes
+    are disposable generated residue, so it must not overwrite them silently.
+    """
+
+    if (
+        manifest.get("format") != "wechat-direct-contact-export.v1"
+        or state.get("format") != "wechat-direct-contact-sync.v1"
+    ):
+        raise ProductError("sync_manifest_invalid")
+
+    manifest_copy = dict(manifest)
+    manifest_hash = manifest_copy.pop("manifestSha256", None)
+    if (
+        not _is_sha256(manifest_hash)
+        or _sha256(_canonical_bytes(manifest_copy)) != manifest_hash
+    ):
+        raise ProductError("sync_manifest_sha256_mismatch")
+
+    if any(
+        key not in state
+        or key not in manifest
+        or _canonical_bytes(state[key]) != _canonical_bytes(manifest[key])
+        for key in (
+            "account",
+            "accountIdentityCommitment",
+            "contact",
+            "sourceFingerprint",
+        )
+    ):
+        raise ProductError("sync_manifest_state_mismatch")
+
+    if (
+        manifest.get("archivePath") != "context.md"
+        or manifest.get("aiDefaultPath") != "ai-context.md"
+        or manifest.get("messagesPath") != "messages.jsonl"
+    ):
+        raise ProductError("sync_manifest_layout_mismatch")
+
+    manifest_count = _nonnegative_int(manifest.get("messageCount"))
+    state_count = _nonnegative_int(state.get("messageCount"))
+    if manifest_count is None or state_count is None or manifest_count != state_count:
+        raise ProductError("sync_manifest_state_mismatch")
+
+    records_path = output / "messages.jsonl"
+    records_file = _file_sha256_and_size(records_path)
+    if records_file is None:
+        raise ProductError("sync_records_unavailable")
+    records_hash = manifest.get("messagesSha256")
+    if not _is_sha256(records_hash) or records_file[0] != records_hash:
+        raise ProductError("sync_records_sha256_mismatch")
+    if len(_read_jsonl(records_path)) != manifest_count:
+        raise ProductError("sync_records_count_mismatch")
+
+    for relative_path, hash_key, size_key, error_prefix in (
+        ("context.md", "archiveSha256", "archiveBytes", "sync_context"),
+        (
+            "ai-context.md",
+            "aiDefaultSha256",
+            "aiDefaultBytes",
+            "sync_ai_context",
+        ),
+    ):
+        declared_hash = manifest.get(hash_key)
+        declared_size = _nonnegative_int(manifest.get(size_key))
+        if not _is_sha256(declared_hash) or declared_size is None:
+            raise ProductError("sync_manifest_invalid")
+        actual = _file_sha256_and_size(output / relative_path)
+        if actual is None:
+            raise ProductError(error_prefix + "_unavailable")
+        if actual[0] != declared_hash:
+            raise ProductError(error_prefix + "_sha256_mismatch")
+        if actual[1] != declared_size:
+            raise ProductError(error_prefix + "_size_mismatch")
+
+
 def command_sync_contact(args: argparse.Namespace) -> int:
     started = time.perf_counter()
     cutoff_s = int(time.time())
@@ -1850,25 +1932,22 @@ def command_sync_contact(args: argparse.Namespace) -> int:
             existing_state is not None
             and mode != "full_reconcile"
             and existing_state.get("sourceFingerprint") == source_fingerprint.get("sha256")
-            and records_path.is_file()
-            and context_path.is_file()
-            and ai_context_path.is_file()
-            and manifest_path.is_file()
         ):
             verified_fingerprint = reader.contact_source_fingerprint(contact_native_id)
             if verified_fingerprint.get("sha256") != source_fingerprint.get("sha256"):
                 source_fingerprint = verified_fingerprint
             else:
-                manifest = _read_json(manifest_path)
+                try:
+                    manifest = _read_json(manifest_path)
+                except ProductError as exc:
+                    raise ProductError("sync_manifest_invalid") from exc
                 if manifest is None:
                     raise ProductError("sync_manifest_invalid")
-                if (
-                    manifest.get("sourceFingerprint")
-                    != existing_state.get("sourceFingerprint")
-                    or int(manifest.get("messageCount") or 0)
-                    != int(existing_state.get("messageCount") or 0)
-                ):
-                    raise ProductError("sync_manifest_state_mismatch")
+                _verify_contact_fast_path_archive(
+                    output,
+                    manifest,
+                    existing_state,
+                )
                 receipt = {
                     "status": "success",
                     "mode": "incremental",
@@ -2793,7 +2872,12 @@ def _add_context_arguments(command: argparse.ArgumentParser) -> None:
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(description="Direct local WeChat reads")
+    root = argparse.ArgumentParser(
+        description=(
+            "Direct local WeChat reads. Exact byte opening is currently limited "
+            "to uniquely bound VoiceInfo voice payloads."
+        )
+    )
     commands = root.add_subparsers(dest="command", required=True)
 
     context = commands.add_parser("context", help="read one bounded chat context")
@@ -2807,7 +2891,8 @@ def parser() -> argparse.ArgumentParser:
     doctor.set_defaults(handler=command_doctor)
 
     verify_export = commands.add_parser(
-        "verify-export", help="verify one existing contact or Moments export offline"
+        "verify-export",
+        help="verify one existing export offline; report only, never repair it",
     )
     verify_export.add_argument("--output", required=True)
     verify_export.set_defaults(handler=command_verify_export)
@@ -2830,7 +2915,10 @@ def parser() -> argparse.ArgumentParser:
 
     sync_contact = commands.add_parser(
         "sync-contact",
-        help="first export one contact fully, then replay the same command incrementally",
+        help=(
+            "create or incrementally refresh one completed contact export; "
+            "not a crash resume"
+        ),
     )
     _add_config_argument(sync_contact)
     sync_contact.add_argument(
@@ -2847,13 +2935,16 @@ def parser() -> argparse.ArgumentParser:
     sync_contact.add_argument(
         "--full-reconcile",
         action="store_true",
-        help="explicitly rescan the full local history instead of the fast cursor replay",
+        help=(
+            "rescan all currently local history for a completed export; "
+            "not restore or import"
+        ),
     )
     sync_contact.set_defaults(handler=command_sync_contact)
 
     sync_moments = commands.add_parser(
         "sync-moments",
-        help="export and replay the current local Moments cache snapshot",
+        help="create or refresh one completed current-cache snapshot; not crash resume",
     )
     _add_config_argument(sync_moments)
     sync_moments.add_argument("--account", choices=ACCOUNT_LABELS, required=True)
@@ -2865,7 +2956,9 @@ def parser() -> argparse.ArgumentParser:
     sync_moments.add_argument("--output")
     sync_moments.set_defaults(handler=command_sync_moments)
 
-    media = commands.add_parser("media-open", help="open one exact media locator")
+    media = commands.add_parser(
+        "media-open", help="copy one exact, openable VoiceInfo voice locator"
+    )
     _add_config_argument(media)
     media.add_argument("--account", choices=ACCOUNT_LABELS, required=True)
     media.add_argument("--locator", required=True)
@@ -2878,7 +2971,11 @@ def parser() -> argparse.ArgumentParser:
     media.set_defaults(handler=command_media_open)
 
     preserve = commands.add_parser(
-        "preserve", help="create one explicit, self-contained preservation bundle"
+        "preserve",
+        help=(
+            "create one explicit bundle; currently copies only exact VoiceInfo "
+            "voice bytes"
+        ),
     )
     _add_context_arguments(preserve)
     preserve.add_argument("--output", required=True)

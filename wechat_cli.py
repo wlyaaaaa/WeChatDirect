@@ -2,8 +2,8 @@
 
 The CLI has no database, daemon, queue, background sync, event model or user
 profile.  A caller names an account and contact, receives one bounded native
-message window, and may explicitly open an exactly bound VoiceInfo voice or
-create a one-off preservation bundle.
+message window, and may explicitly materialize its bound media for downstream
+readers or create a one-off preservation bundle.
 """
 
 from __future__ import annotations
@@ -15,7 +15,9 @@ from datetime import datetime
 import hashlib
 import hmac
 import importlib.util
+import io
 import json
+import mimetypes
 import os
 from pathlib import Path, PurePosixPath
 import shutil
@@ -778,7 +780,7 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
                 if not media.get("openable"):
                     gaps.append(
                         {
-                            "kind": "media_not_openable",
+                            "kind": "media_not_opened" if media.get("materializable") else "media_not_openable",
                             "message": _message_native_id(message),
                             "mediaKind": key,
                             "reason": media.get("resolution_gap")
@@ -845,6 +847,97 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_context(args: argparse.Namespace) -> int:
     sys.stdout.buffer.write(_canonical_bytes(_context_result(args)))
+    return 0
+
+
+def command_export_context(args: argparse.Namespace) -> int:
+    """Materialize one selected page as a portable, ordered reading package."""
+
+    output = Path(args.output).resolve()
+    incomplete = output.with_name(output.name + ".incomplete")
+    if output.exists() or incomplete.exists():
+        raise ProductError("reading_output_already_exists")
+    started = time.perf_counter()
+    context = _context_result(args)
+    incomplete.mkdir(parents=True)
+    try:
+        totals: dict[str, int] = {}
+        config = _read_config(_resolve_config_path(getattr(args, "config", None)))
+        with _reader(config[context["account"]], context["sourceSnapshotCutoffS"]) as reader:
+            if "sha256:" + reader.account_identity_commitment != context["accountIdentityCommitment"]:
+                raise ProductError("reading_account_changed_during_export")
+            for field in ("messages", "quotedMessages"):
+                materialized = []
+                for message in context.get(field) or []:
+                    projected, counters = _sync_message_media(reader, message, incomplete, allow_remote=not getattr(args, "local_only", False))
+                    materialized.append(projected)
+                    for key, value in counters.items():
+                        totals[key] = totals.get(key, 0) + value
+                    for media in projected.get("media_manifest") or []:
+                        media.pop("locator", None)
+                        if media.get("exportStatus") == "open_failed":
+                            context["gaps"].append({
+                                "kind": "media_export_failed", "message": projected.get("nativeId"),
+                                "mediaKind": media.get("kind"), "reason": media.get("exportGap"),
+                            })
+                context[field] = materialized
+        context["gaps"] = [gap for gap in context["gaps"] if gap.get("kind") not in {"media_not_opened", "media_not_openable"}]
+        for message in [*context["messages"], *context["quotedMessages"]]:
+            for media in message.get("media_manifest") or []:
+                if media.get("exportStatus") != "available_local":
+                    context["gaps"].append({
+                        "kind": "media_unavailable", "message": message.get("nativeId"),
+                        "mediaKind": media.get("kind"),
+                        "reason": media.get("exportGap") or media.get("resolution_gap") or "not_available",
+                    })
+        context["format"] = "wechat-direct-reading-package.v1"
+        context["mediaExport"] = totals
+        if totals.get("mediaUnavailable") or context["gaps"] or any(
+            item.get("contentGap") for item in context["messages"]
+        ):
+            context["status"] = "partial"
+        context.pop("manifestSha256", None)
+        context["manifestSha256"] = _sha256(_canonical_bytes(context))
+        _write_json_atomic(incomplete / "conversation.json", context)
+        if getattr(args, "html", False):
+            from wechat_render import render_conversation_html
+
+            html = render_conversation_html(
+                account=context["account"], contact=context["contact"],
+                messages=context["messages"], quoted_messages=context["quotedMessages"],
+                metadata={
+                    "requestedWindow": context["requestedWindow"],
+                    "coverage": context["coverage"], "status": context["status"],
+                    "sourceSnapshotCutoffS": context["sourceSnapshotCutoffS"],
+                },
+            )
+            _write_text_atomic(incomplete / "conversation.html", html)
+        ai_context, ai_count = _bounded_contact_ai_context(
+            account=context["account"], contact=context["contact"],
+            messages=context["messages"],
+            quote_messages=[*context["messages"], *context["quotedMessages"]],
+            scope_note=(
+                f"本次窗口共 {len(context['messages'])} 条消息，下面是阅读摘要。"
+                "按消息顺序实际查看图片和表情包，不要仅凭文件名推断画面。"
+                "完整文字、媒体对应关系和续查游标见 conversation.json；"
+                "媒体路径相对于本目录，可直接交给视觉或其他媒体读取能力。"
+            ),
+        )
+        _write_text_atomic(incomplete / "ai-context.md", ai_context)
+        incomplete.replace(output)
+    except Exception:
+        shutil.rmtree(incomplete, ignore_errors=True)
+        raise
+    sys.stdout.buffer.write(_canonical_bytes({
+        "status": context["status"], "format": context["format"],
+        "output": str(output),
+        **({"htmlPath": str(output / "conversation.html")} if getattr(args, "html", False) else {}),
+        "dataPath": str(output / "conversation.json"),
+        "aiPath": str(output / "ai-context.md"), "aiContextMessages": ai_count,
+        "messageCount": len(context["messages"]), "mediaExport": totals,
+        "hasMore": context["coverage"]["hasMore"],
+        "elapsedMs": round((time.perf_counter() - started) * 1000, 3),
+    }))
     return 0
 
 
@@ -967,7 +1060,12 @@ def command_media_open(args: argparse.Namespace) -> int:
     config = _read_config(_resolve_config_path(getattr(args, "config", None)))
     account = config[args.account]
     with _reader(account, cutoff_s) as reader:
-        data = reader.open_locator(args.locator)
+        resolved = reader.resolve_locator(args.locator)
+        data = (
+            reader.open_locator(args.locator, allow_remote=True)
+            if resolved.get("materializable") and not getattr(args, "local_only", False)
+            else reader.open_locator(args.locator)
+        )
         resolved = reader.resolve_locator(args.locator)
         if args.voice_wav and resolved.get("kind") != "voice":
             raise ProductError("media_is_not_voice")
@@ -998,6 +1096,9 @@ def command_media_open(args: argparse.Namespace) -> int:
             "bytes": len(output_data),
             "sha256": _sha256(output_data),
             "output": os.fspath(output.resolve()),
+            "mimeType": resolved.get("mimeType"),
+            "quality": resolved.get("quality"),
+            "materializationSource": resolved.get("materializationSource", "local"),
         }
     sys.stdout.buffer.write(_canonical_bytes(receipt))
     return 0
@@ -1050,6 +1151,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         "compression": "available"
         if _module_available("compression")
         else "unavailable",
+        "pillow": "available" if _module_available("PIL") else "unavailable",
     }
     for name, status in dependencies.items():
         if status != "available":
@@ -1649,6 +1751,8 @@ def _media_context_lines(
             normalized = str(path).replace("\\", "/")
             if kind in {"image", "emoji"}:
                 lines.append(f"  ![{label}]({normalized})")
+                if int(media.get("frameCount") or 1) > 1:
+                    lines.append(f"  [动图，共 {media['frameCount']} 帧；判断动作时需查看连续帧，不能只看首帧。]")
             elif kind == "voice":
                 lines.append(f"  [语音（可播放，按需转写）]({normalized})")
             else:
@@ -1671,6 +1775,7 @@ def _contact_ai_context(
     quote_messages: list[Mapping[str, Any]] | None = None,
     full_archive: bool = False,
     omitted_messages: int = 0,
+    scope_note: str | None = None,
 ) -> str:
     name = str(contact.get("displayName") or contact.get("nickname") or "联系人")
     first = next((item.get("createTime") for item in messages if item.get("createTime")), None)
@@ -1684,7 +1789,7 @@ def _contact_ai_context(
         f"# 微信对话：{name}",
         "",
         f"账号：{'主号' if account == 'primary' else '副号'}｜消息：{len(messages)}｜可见范围：{first_date} {first_time} — {last_date} {last_time}",
-        (
+        scope_note or (
             "这是全量本地档案；不要整份送入模型。日常先读 ai-context.md，"
             "需要更早内容时只搜索并读取本文件的命中附近。"
             if full_archive
@@ -1737,6 +1842,8 @@ def _bounded_contact_ai_context(
     account: str,
     contact: Mapping[str, Any],
     messages: list[Mapping[str, Any]],
+    scope_note: str | None = None,
+    quote_messages: list[Mapping[str, Any]] | None = None,
 ) -> tuple[str, int]:
     window = list(messages[-DEFAULT_AI_CONTEXT_MESSAGES:])
     while True:
@@ -1744,8 +1851,9 @@ def _bounded_contact_ai_context(
             account=account,
             contact=contact,
             messages=window,
-            quote_messages=messages,
+            quote_messages=quote_messages or messages,
             omitted_messages=max(0, len(messages) - len(window)),
+            scope_note=scope_note,
         )
         if len(rendered.encode("utf-8")) <= MAX_AI_CONTEXT_BYTES or not window:
             return rendered, len(window)
@@ -1795,6 +1903,8 @@ def _sync_message_media(
     reader: DirectWeChatReader,
     message: Mapping[str, Any],
     output: Path,
+    *,
+    allow_remote: bool = False,
 ) -> tuple[dict[str, Any], dict[str, int]]:
     result = dict(message)
     projected_media: list[dict[str, Any]] = []
@@ -1810,12 +1920,27 @@ def _sync_message_media(
         media = dict(source_media)
         counters["mediaOccurrences"] += 1
         locator = media.get("locator")
-        if not media.get("openable") or not locator:
+        can_materialize = media.get("materializable") and (allow_remote or not media.get("requiresNetwork"))
+        if not locator or not (media.get("openable") or can_materialize):
             counters["mediaUnavailable"] += 1
             projected_media.append(media)
             continue
         try:
-            payload = reader.open_locator(str(locator))
+            payload = (
+                reader.open_locator(str(locator), allow_remote=True)
+                if allow_remote and media.get("materializable")
+                else reader.open_locator(str(locator))
+            )
+            if hasattr(reader, "resolve_locator"):
+                resolved = reader.resolve_locator(str(locator))
+                for field in ("fileName", "mimeType", "quality", "materializationSource"):
+                    if resolved.get(field) is not None:
+                        media[field] = resolved[field]
+            if media.get("kind") in {"image", "emoji"}:
+                from PIL import Image
+
+                with Image.open(io.BytesIO(payload)) as visual:
+                    media.update(width=visual.width, height=visual.height, frameCount=getattr(visual, "n_frames", 1))
         except Exception as exc:
             counters["mediaUnavailable"] += 1
             media["exportStatus"] = "open_failed"
@@ -1824,6 +1949,11 @@ def _sync_message_media(
             continue
         digest = hashlib.sha256(payload).hexdigest()
         extension = _media_extension(payload, media.get("kind"))
+        if extension == ".bin" and media.get("kind") == "file":
+            filename = str(media.get("fileName") or "").replace("\\", "/")
+            declared_extension = PurePosixPath(filename).suffix
+            if declared_extension and len(declared_extension) <= 20 and declared_extension[1:].isalnum():
+                extension = declared_extension.lower()
         relative = Path("media") / digest[:2] / (digest + extension)
         target = output / relative
         if target.is_file():
@@ -1837,11 +1967,18 @@ def _sync_message_media(
         media.update(
             {
                 "exportStatus": "available_local",
+                "openable": True,
+                "open_status": "openable",
+                "processing_state": "available",
                 "exportedPath": relative.as_posix(),
                 "bytes": len(payload),
                 "sha256": "sha256:" + digest,
+                "mimeType": media.get("mimeType") or mimetypes.guess_type(relative.as_posix())[0] or "application/octet-stream",
             }
         )
+        media.pop("materializable", None)
+        media.pop("requiresNetwork", None)
+        media.pop("resolution_gap", None)
         if media.get("kind") == "voice" and _is_tencent_silk(payload):
             wav_relative = Path("media") / digest[:2] / (digest + ".wav")
             wav_target = output / wav_relative
@@ -2861,7 +2998,8 @@ def command_preserve(args: argparse.Namespace) -> int:
                     f"{native_id.get('kind')}-{native_id.get('value')}"
                 )
                 for media in message.get("media_manifest") or []:
-                    if not media.get("openable") or not media.get("locator"):
+                    can_materialize = media.get("materializable") and not media.get("requiresNetwork")
+                    if not media.get("locator") or not (media.get("openable") or can_materialize):
                         continue
                     occurrence += 1
                     try:
@@ -2876,13 +3014,16 @@ def command_preserve(args: argparse.Namespace) -> int:
                             }
                         )
                         continue
+                    media.update(openable=True, open_status="openable", processing_state="available")
+                    media.pop("materializable", None)
+                    media.pop("requiresNetwork", None)
+                    media.pop("resolution_gap", None)
+                    context["gaps"] = [
+                        gap for gap in context["gaps"]
+                        if not (gap.get("kind") == "media_not_opened" and gap.get("message") == native_id and gap.get("mediaKind") == media.get("kind"))
+                    ]
                     media_directory.mkdir(exist_ok=True)
-                    extension = (
-                        ".silk"
-                        if media.get("kind") == "voice"
-                        and _is_tencent_silk(payload)
-                        else ".bin"
-                    )
+                    extension = _media_extension(payload, media.get("kind"))
                     filename = (
                         f"{native_label}-{occurrence:03d}-"
                         f"{_safe_filename(media.get('kind'))}{extension}"
@@ -3018,8 +3159,8 @@ def _add_context_arguments(command: argparse.ArgumentParser) -> None:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         description=(
-            "Direct local WeChat reads. Exact byte opening is currently limited "
-            "to uniquely bound VoiceInfo voice payloads."
+            "Read ordered local WeChat context and materialize precisely bound "
+            "media for downstream AI and other projects."
         )
     )
     commands = root.add_subparsers(dest="command", required=True)
@@ -3027,6 +3168,15 @@ def parser() -> argparse.ArgumentParser:
     context = commands.add_parser("context", help="read one bounded chat context")
     _add_context_arguments(context)
     context.set_defaults(handler=command_context)
+
+    reading = commands.add_parser(
+        "export-context", help="materialize one ordered conversation page and its local media for AI or other projects"
+    )
+    _add_context_arguments(reading)
+    reading.add_argument("--output", required=True, help="new reading-package directory; existing content is preserved")
+    reading.add_argument("--html", action="store_true", help="also create an optional offline HTML view; not required for AI consumption")
+    reading.add_argument("--local-only", action="store_true", help="materialize only existing local media; never request native emoji CDN bytes")
+    reading.set_defaults(handler=command_export_context)
 
     doctor = commands.add_parser(
         "doctor", help="check local readiness without reading WeChat message bodies"
@@ -3101,12 +3251,13 @@ def parser() -> argparse.ArgumentParser:
     sync_moments.set_defaults(handler=command_sync_moments)
 
     media = commands.add_parser(
-        "media-open", help="copy one exact, openable VoiceInfo voice locator"
+        "media-open", help="open one exact media locator as a readable local file"
     )
     _add_config_argument(media)
     media.add_argument("--account", choices=ACCOUNT_LABELS, required=True)
     media.add_argument("--locator", required=True)
     media.add_argument("--output", required=True)
+    media.add_argument("--local-only", action="store_true", help="do not request an exact native emoji CDN item when local bytes are unavailable")
     media.add_argument(
         "--voice-wav",
         action="store_true",
@@ -3117,8 +3268,7 @@ def parser() -> argparse.ArgumentParser:
     preserve = commands.add_parser(
         "preserve",
         help=(
-            "create one explicit bundle; currently copies only exact VoiceInfo "
-            "voice bytes"
+            "create one explicit preservation bundle with precisely bound local media"
         ),
     )
     _add_context_arguments(preserve)
@@ -3146,8 +3296,10 @@ def _failure_details(exc: Exception) -> dict[str, Any]:
         action = "correct_query_arguments"
     elif reason == "contact_not_found":
         action = "check_exact_contact_and_account"
-    elif reason in {"media_output_incomplete_exists", "voice_decode_output_already_exists"}:
+    elif reason in {"media_output_incomplete_exists", "voice_decode_output_already_exists", "reading_output_already_exists"}:
         action = "inspect_existing_output_or_choose_new_output"
+    elif reason == "reading_account_changed_during_export":
+        action = "check_configured_local_reader"
     elif reason == "sync_output_not_initialized":
         action = "inspect_incomplete_export_or_choose_empty_output"
     elif reason == "sync_already_running_or_stale_lock":

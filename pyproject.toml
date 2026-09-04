@@ -12,6 +12,7 @@ license = { file = "LICENSE" }
 authors = [{ name = "wlyaaaaa" }]
 dependencies = [
   "cryptography",
+  "Pillow",
   "tzdata; platform_system == 'Windows'",
 ]
 
@@ -23,4 +24,4 @@ wechat-direct = "wechat_cli:main"
 
 [tool.setuptools]
 package-dir = { "" = "." }
-py-modules = ["wechat_cli", "wechat_source", "voice_decode"]
+py-modules = ["wechat_cli", "wechat_source", "wechat_media", "wechat_image", "wechat_wxgf", "wechat_render", "voice_decode"]

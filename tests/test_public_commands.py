@@ -348,8 +348,9 @@ class PublicCommandTests(unittest.TestCase):
             encoding="utf-8"
         )
         for phrase in (
-            "图片、视频、表情和文件只保留",
-            "唯一能公开打开或复制原始字节",
+            "hardlink.db",
+            "materializationSource",
+            "HTML 只是可选查看方式",
             "`VoiceInfo` 语音",
             "sync_output_not_initialized",
             "sync_already_running_or_stale_lock",
@@ -365,7 +366,7 @@ class PublicCommandTests(unittest.TestCase):
             if isinstance(action, argparse._SubParsersAction)
         )
         root_help = root_parser.format_help()
-        self.assertIn("VoiceInfo voice payloads", root_help)
+        self.assertIn("media for downstream AI", " ".join(root_help.split()))
         self.assertIn("report only, never", root_help)
         self.assertIn("repair it", root_help)
         self.assertIn("not a crash resume", root_help)
@@ -373,7 +374,8 @@ class PublicCommandTests(unittest.TestCase):
             "not restore or import",
             subparsers.choices["sync-contact"].format_help(),
         )
-        self.assertIn("VoiceInfo voice locator", root_help)
+        self.assertIn("open one exact media locator", root_help)
+        self.assertIn("--local-only", subparsers.choices["export-context"].format_help())
 
     def test_parser_preserves_six_existing_commands_and_body_free_failure(self) -> None:
         parser = wechat_cli.parser()

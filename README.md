@@ -2,7 +2,9 @@
 
 WeChatDirect 主要供 AI 调用，是一个 Windows-only 的本地工具：从当前电脑上已登录的 WeChat 本地数据库和缓存中，读取一段有界的聊天或朋友圈上下文，并按需生成本机导出或保全文件。命令以结构化 JSON 表达消息、读取范围、缺口和下一步，便于 AI 判断本次结果能支持什么结论。
 
-源数据库和缓存始终只读。工具只会写入用户明确指定的本地导出、状态和保全目录，不会改写 WeChat 数据，也不会自动登录、联网补历史、打开远端主页、点赞、评论或启动后台同步。
+它面向其他项目交付同一份有序消息和真实可读的媒体：保留发送者、引用关系，以及每次图片、表情包和其他附件出现的位置。媒体含义由消费项目和 AI 在实际读取后理解。HTML 只是可选查看方式，不是 AI 的输入要求或运行依赖。
+
+源数据库和缓存始终只读。普通 `context` 只查本机；显式 `export-context` 或 `media-open` 可以按选定消息自带的原生微信 CDN 地址物化表情，并严格核对原生 MD5、声明大小和图片解码结果。`--local-only` 可禁止这一步。工具不会改写 WeChat 数据、自动登录、打开远端主页、点赞、评论或启动后台同步，也不会搜索或拼造媒体地址、补抓全账号历史。
 
 本项目与 Tencent 或 WeChat 没有关联。只应读取本人设备上、本人有权访问的数据；不要用它绕过账号、设备或他人的访问边界。
 
@@ -12,7 +14,9 @@ WeChatDirect 主要供 AI 调用，是一个 Windows-only 的本地工具：从�
 - 账号按配置槽位严格隔离。每次读取都绑定一个账号的本地身份；身份不匹配时直接失败，不会把另一个账号的数据当作答案。
 - 聊天和朋友圈范围以当前设备可见的本地数据为准，不等于远端全历史。不可解析的正文、不可打开的媒体、缺少索引或源库在读取期间发生变化时，会作为明确缺口返回。
 - 朋友圈读取的是当前本机缓存；缓存中没有目标时，工具会报告未命中，并要求在同一账号中由用户先完成必要的本机操作后再重试。
-- 当前公开实现中，图片、视频、表情和文件只保留它们与消息的资源关系、定位信息和不可打开缺口，不会打开或复制其字节。唯一能公开打开或复制原始字节的路径，是与一条消息唯一绑定的 `VoiceInfo` 语音；不会根据文件名、群名或上下文猜内容。通话状态不是可供转写的语音文件。
+- 图片通过消息原生 MD5 与 `hardlink.db` 精确定位，使用现有保护配置中的媒体密钥解开 V1/V2 DAT；可读原件优先，缩略图会明确标记。表情保留原 PNG/GIF 等格式及每次出现的位置；本机封装无法读取时，显式物化可尝试同条消息已记录的原生 CDN，原生 MD5/大小不符就保留缺口。
+- `VoiceInfo` 语音仍按同消息精确取出，按需派生 WAV；通话状态不是可转写的语音文件。视频、文件仅在消息 MD5 能通过本机原生索引定位到实际文件时交付；本机缺失、封装不可解或来源不一致时不猜内容。
+- `WXGF` 图像封装需要本机 PATH 中可用的 `ffmpeg` 与 `ffprobe`；仅在分区和帧数可证明时转成 PNG 或保留动作的 GIF。复杂多分区/透明度关系未能证明时明确保留缺口，不把第一帧冒充完整动图。
 
 ## 安装
 
@@ -30,7 +34,7 @@ python -m pip install .
 python -m pip install -e ".[dev]"
 ```
 
-安装会带上主 CLI 需要的 `cryptography`，以及 Windows Python 读取 `Asia/Shanghai` 时区所需的 `tzdata`。安装完成后可使用 console script，或直接运行脚本：
+安装会带上主 CLI 需要的 `cryptography`、验证图片和帧信息的 `Pillow`，以及 Windows Python 读取 `Asia/Shanghai` 时区所需的 `tzdata`。安装完成后可使用 console script，或直接运行脚本：
 
 ```powershell
 wechat-direct --help
@@ -67,6 +71,8 @@ py -3.11 -m pip install pilk
 
 示例中的路径和 `sha256:<...>` 都不是可用值，必须替换为自己的实际值。配置不保存微信密钥明文；仍应使用仅当前 Windows 用户可读的 ACL，并把本地配置、数据库路径、身份承诺、消息和媒体视为敏感资料。不要把真实配置、导出目录或终端回执发布到公开仓库。
 
+图片解码按当前来源身份从同一配置载体的 `wxidConfigs` 读取 `imageAesKey`、`imageXorKey`，缺少账号专属项时才使用身份一致的当前顶层项；沿用原有 DPAPI/safe 解封流程，仅在进程内使用。不会从昵称或配置目录名猜账号，不要求重新粘贴已保存的密钥，也不把密钥写入阅读包、终端或 Git。媒体字段缺失不影响普通文字读取。
+
 ## 命令
 
 下面的 `primary`、`secondary` 是示例配置中的隔离槽位名，不代表真实账号；`<contact>`、`<group>`、`<locator>` 和 `<output>` 都必须替换为当前结果中的值。除特别说明外，输出是 stdout 上的一份 JSON 回执或结果。
@@ -93,6 +99,23 @@ wechat-direct context --account primary --contact "<contact-or-group>" --around 
 ```
 
 `--around` 在允许的时间窗中优先读取离目标时间最近的消息，再按时间顺序返回。未指定起止时间时，窗口默认围绕目标时间前后各 `--lookback-days` 天，截止时间不晚于本次读取时间。显式时间窗不包含目标时间时返回参数错误。`--since`、`--until` 和 `--around` 接受 ISO 日期/时间；未写时区时按 `Asia/Shanghai` 解释。
+
+### `export-context`：给 AI 和其他项目的阅读包
+
+```powershell
+wechat-direct export-context --account primary --contact "<contact-or-group>" --lookback-days 7 --output "<new-directory>"
+wechat-direct export-context --account primary --contact "<contact-or-group>" --cursor "<continuation.cursor>" --output "<next-page-directory>"
+```
+
+该命令与 `context` 使用相同的范围、锚点和分页参数，默认生成：
+
+- `conversation.json`：完整的本次消息页、发送者、引用、媒体清单、读取缺口和后续游标。消息数组是阅读顺序的依据。
+- `media/`：本次能够精确打开的媒体文件。媒体项中的 `exportedPath` 相对于阅读包目录，`sha256` 和 `bytes` 描述实际导出的字节；相同文件可以复用，每次消息中的出现位置仍保留。`materializationSource` 区分 `local` 与 `remote`，`quality` 标记原件/缩略图，`mimeType`、尺寸和 `frameCount` 说明实际可读格式。阅读包不需要源数据库 locator、私有 URL 或解密参数。
+- `ai-context.md`：按顺序阅读的入口摘要及媒体引用。摘要不是完整历史，完整本次结果在 `conversation.json`；图片和表情包需要实际交给视觉能力查看，不能由文件名或占位文本推断内容。
+
+输出目录必须是新目录；已有目录和同名 `.incomplete` 均会保留并返回错误。部分消息或媒体不可读取时仍交付可用内容，并报告 `partial` 与具体缺口。`coverage.hasMore` 表示还可继续读取；后续页应使用其游标保持同一账号、聊天和时间窗。
+
+需要人工查看时，可追加 `--html` 生成引用同一批媒体文件的 `conversation.html`。复制阅读包时应一起复制整个目录，以保留相对媒体路径。默认 AI 阅读流程不需要 HTML、浏览器或服务。
 
 ### `sync-contact`：一个对象的首次导出与完成态增量刷新
 
@@ -123,16 +146,17 @@ wechat-direct sync-moments --account primary --contact "<contact>"
 
 该命令建立或刷新当前设备可见的朋友圈缓存快照，不承诺远端全历史。只有完成态快照才能安全重复刷新；账号、对象和输出范围始终保持隔离。
 
-### `media-open`：打开一条精确绑定的语音
+### `media-open`：打开一条精确绑定的媒体
 
-定位值必须来自同一账号、同一消息结果中标记为可打开的唯一 `VoiceInfo` 语音 `locator`；不会扫描目录或猜测文件。当前图片、视频、表情和文件定位只表达资源关系与不可打开缺口，不能用于复制字节：
+定位值必须来自同一账号、同一消息结果中的 `locator`。图片、文件或视频仅找到原生路径时，返回 `openable=null`、`materializable=true`，实际打开成功后才标记可读；`requiresNetwork` 区分本地待读取与需要请求原生表情来源。不会根据模糊文件名扫描目录或猜图。示例：
 
 ```powershell
 wechat-direct media-open --account primary --locator "<voice-locator>" --output "<output.silk>"
 wechat-direct media-open --account primary --locator "<voice-locator>" --output "<output.wav>" --voice-wav
+wechat-direct media-open --account primary --locator "<media-locator>" --output "<output-file>" --local-only
 ```
 
-目标输出必须不存在。普通调用保留原始 SILK 字节；`--voice-wav` 解码同一条精确绑定的 Tencent/WeChat SILK 语音，并使用上文的 Python 3.11 + `pilk` 路径。stdout 回执会给出输出文件的字节数和 SHA-256。
+目标输出必须不存在。图片会交付标准可读格式，表情保留静态或动画；语音普通调用保留 SILK，`--voice-wav` 使用上文的 Python 3.11 + `pilk` 派生 WAV。stdout 回执给出实际类型、质量、来源、字节数和 SHA-256。
 
 ### `preserve`：保全一个明确的聊天窗口
 
@@ -140,7 +164,7 @@ wechat-direct media-open --account primary --locator "<voice-locator>" --output 
 wechat-direct preserve --account primary --contact "<contact-or-group>" --lookback-days 1 --output "<preserve-directory>"
 ```
 
-该命令生成一个自包含保全目录，并只复制用户点名窗口内能精确打开的唯一 `VoiceInfo` 语音。原始语音保留 SILK；可用时同时生成 WAV。图片、视频、表情和文件仍只保留消息资源关系与不可打开缺口，不会被静默丢弃、伪造或复制。
+该命令生成一个自包含保全目录，复制点名窗口内当前本机能精确打开的媒体。原始语音保留 SILK，可用时派生 WAV；其他媒体保留可读格式及与消息的关系。保全不会自动请求远端表情；无法打开的内容仍保留明确缺口。
 
 ### `doctor` 与 `verify-export`
 
@@ -171,11 +195,11 @@ wechat-direct verify-export --output "<export-directory>"
 - `manifest.json`：范围、完整性和文件哈希；
 - `state.json`：增量游标与来源状态；
 - `last-run.json`：最近一次运行的回执、缺口和耗时；
-- `media/`：工具当前只会写入能精确绑定并打开的 `VoiceInfo` 语音原始字节及可用的派生 WAV；不会为图片、视频、表情和文件创建字节文件。
+- `media/`：能精确绑定并在本机打开的图片、表情、语音、视频和文件，以及可用的派生 WAV。`sync-contact` 不会自动向远端补取整份历史的表情；后来可用的本地媒体可通过 `--full-reconcile` 重新核对。
 
 `sync-moments` 使用相同的 `ai-context.md`、`context.md`、`manifest.json`、`state.json` 和 `last-run.json`，并以 `moments.jsonl` 保存朋友圈结构记录。
 
-`preserve` 目录包含 `messages.json`、`manifest.json` 和按消息关系组织的 `media/`；当前只有唯一绑定的 `VoiceInfo` 语音会复制字节，语音 WAV 是从同一 SILK 字节派生的文件。`media-open` 只创建用户指定的单个语音输出文件，并在 stdout 返回来源与输出哈希。
+`preserve` 目录包含 `messages.json`、`manifest.json` 和按消息关系组织的 `media/`；语音 WAV 从同一 SILK 派生。`media-open` 只创建用户指定的单个媒体文件，并返回来源与输出哈希。
 
 ## 许可证
 

@@ -182,6 +182,47 @@ def load_direct_source_identity(
     return account_root, master_hex.lower(), identity
 
 
+def load_direct_media_keys(
+    config_path: Path | str, local_state_path: Path | str, identity: str
+) -> tuple[bytes | None, int | None]:
+    """Read the same account's existing protected media fields in memory only."""
+
+    try:
+        config = json.loads(Path(config_path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise DirectCredentialError("local media configuration is unavailable") from exc
+    if not isinstance(config, Mapping):
+        raise DirectCredentialError("local media configuration is invalid")
+    safe_key = _safe_storage_key(local_state_path)
+    if _decode_safe_value(config.get("myWxid"), safe_key).strip() != identity:
+        raise DirectCredentialError("local media account identity changed")
+    scopes = config.get("wxidConfigs") or {}
+    scoped = scopes.get(identity, {}) if isinstance(scopes, Mapping) else {}
+    if not isinstance(scoped, Mapping):
+        scoped = {}
+    aes_value = scoped.get("imageAesKey") or config.get("imageAesKey")
+    xor_value = scoped.get("imageXorKey")
+    if xor_value in (None, ""):
+        xor_value = config.get("imageXorKey")
+    aes_key = None
+    xor_key = None
+    if aes_value:
+        decoded = _decode_safe_value(aes_value, safe_key).strip()
+        if len(decoded.encode("utf-8")) == 16:
+            aes_key = decoded.encode("utf-8")
+        elif re.fullmatch(r"[0-9a-fA-F]{32}", decoded):
+            aes_key = bytes.fromhex(decoded)
+    if xor_value is not None and xor_value != "":
+        decoded = _decode_safe_value(str(xor_value), safe_key).strip()
+        try:
+            xor_key = int(decoded, 16 if decoded.lower().startswith("0x") or re.search(r"[a-f]", decoded, re.I) else 10)
+        except ValueError:
+            pass
+        if xor_key is not None and not 0 <= xor_key <= 255:
+            xor_key = None
+    return aes_key, xor_key
+
+
 def _as_bytes(value: bytes | bytearray | memoryview | str, *, hex_text: bool = False) -> bytes:
     if isinstance(value, str):
         text = value.strip()
@@ -1145,6 +1186,8 @@ class DirectWeChatReader:
         account_root, master_hex, identity = load_direct_source_identity(
             config_path, local_state_path
         )
+        self._config_path = Path(config_path)
+        self._local_state_path = Path(local_state_path)
         self._storage = account_root / "db_storage"
         if not self._storage.is_dir():
             raise SnapshotCopyError("local account database storage is missing")
@@ -2545,6 +2588,17 @@ class DirectWeChatReader:
                 "server_id": server_id,
             }
         )
+        if kind in {"image", "emoji", "video", "file"}:
+            payload = self._decode_locator(fallback_locator)
+            payload["record"] = "native_media"
+            if "_rowid" in row.keys():
+                payload["message_rowid"] = row["_rowid"]
+            locator = self._make_locator(payload)
+            details = self._describe_native_media(payload)
+            return [{
+                "kind": kind, "mediaId": str(server_id or local_id or ""),
+                "locator": locator, **details,
+            }]
         def exact_lookup_unavailable(reason: str) -> list[dict[str, Any]]:
             # Do not turn a route that was not mechanically verified into a
             # ``not_openable`` fact.  The message event remains useful, but
@@ -2688,6 +2742,204 @@ class DirectWeChatReader:
             result.append(item)
         return result
 
+    @cached_property
+    def _media_keys(self) -> tuple[bytes | None, int | None]:
+        if not hasattr(self, "_config_path") or not hasattr(self, "_local_state_path"):
+            return None, None
+        return load_direct_media_keys(self._config_path, self._local_state_path, self._identity)
+
+    def _native_media_attributes(self, payload: Mapping[str, Any]) -> dict[str, str] | None:
+        table = str(payload.get("message_table") or "")
+        kind = str(payload.get("kind") or "")
+        if not re.fullmatch(r"Msg_[0-9a-fA-F]{32}", table):
+            return None
+        source = self._locator_source(payload.get("message_database"))
+        connection = self._open(source)
+        quoted = _quote_identifier(table)
+        try:
+            columns = {str(item[1]) for item in connection.execute(f"PRAGMA table_info({quoted})")}
+            extra = "".join(
+                f", NULL AS {name}" for name in
+                ("message_content", "compress_content", "source", "packed_info_data", "origin_source")
+                if name not in columns
+            )
+            where = "local_id IS ? AND server_id IS ?"
+            values = [payload.get("local_id"), payload.get("server_id")]
+            if payload.get("message_rowid") is not None:
+                where += " AND rowid=?"
+                values.append(payload["message_rowid"])
+            rows = list(connection.execute(f"SELECT rowid AS _rowid, *{extra} FROM {quoted} WHERE {where} LIMIT 2", values))
+        except sqlite3.DatabaseError:
+            return None
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        expected_type = {"image": 3, "emoji": 47, "video": 43, "file": 49}.get(kind)
+        if _base_message_type(row["local_type"]) != expected_type:
+            return None
+        bodies, _, _ = _message_payload_texts(row)
+        candidates: list[dict[str, str]] = []
+        tag = {"image": "img", "emoji": "emoji", "video": "videomsg", "file": "appmsg"}[kind]
+        for body in bodies:
+            start = body.find("<")
+            if start < 0:
+                continue
+            try:
+                root = ET.fromstring(body[start:])
+            except ET.ParseError:
+                continue
+            node = root if root.tag == tag else root.find(tag)
+            if node is None:
+                continue
+            attributes = dict(node.attrib)
+            if kind == "file":
+                if node.findtext("type") != "6":
+                    continue
+                attributes["md5"] = node.findtext("appattach/md5") or node.findtext("md5") or ""
+                attributes["fileName"] = node.findtext("title") or ""
+            if re.fullmatch(r"[0-9a-fA-F]{32}", attributes.get("md5", "")):
+                attributes["md5"] = attributes["md5"].lower()
+                candidates.append(attributes)
+        if not candidates or len({item["md5"] for item in candidates}) != 1:
+            return None
+        return candidates[0]
+
+    def _hardlink_media_paths(self, md5: str, kind: str) -> list[tuple[Path, str]]:
+        table = {"image": "image_hardlink_info_v4", "video": "video_hardlink_info_v4", "file": "file_hardlink_info_v4"}[kind]
+        root = self._storage.parent.resolve()
+        result: list[tuple[Path, str]] = []
+        for source in self._named_databases("hardlink.db"):
+            connection = self._open(source)
+            try:
+                rows = connection.execute(
+                    f"SELECT h.file_name,d1.username AS dir_one,d2.username AS dir_two FROM {table} h "
+                    "LEFT JOIN dir2id d1 ON d1.rowid=h.dir1 LEFT JOIN dir2id d2 ON d2.rowid=h.dir2 "
+                    "WHERE h.md5=? ORDER BY h.modify_time DESC", (md5,),
+                )
+                for row in rows:
+                    name = str(row["file_name"] or "")
+                    if not name:
+                        continue
+                    directories = [str(row[key]) for key in ("dir_one", "dir_two") if row[key]]
+                    if kind == "image":
+                        bases = [root.joinpath("msg", "attach", *directories, "Img")]
+                    else:
+                        bases = [root.joinpath("msg", kind, *directories)]
+                        bases.extend(root / "msg" / kind / value for value in directories if re.fullmatch(r"\d{4}-\d{2}", value))
+                    for base in bases:
+                        names = [(name, "original")]
+                        if kind == "image":
+                            stem = re.sub(r"(?:_[ht])?\.dat$", "", name, flags=re.I)
+                            if re.fullmatch(r"[0-9a-fA-F]{32}", stem):
+                                names = [(stem + "_h.dat", "original"), (stem + ".dat", "original"), (stem + "_t.dat", "thumbnail")]
+                            elif not Path(name).suffix:
+                                names.append((name + ".dat", "original"))
+                        for filename, quality in names:
+                            path = (base / filename).resolve()
+                            if path.is_relative_to(root) and path.is_file() and all(item[0] != path for item in result):
+                                result.append((path, quality))
+            except sqlite3.DatabaseError:
+                continue
+        return result
+
+    def _emoji_source(self, attributes: Mapping[str, str]) -> tuple[Any, str | None, str | None]:
+        from wechat_media import EmojiStoreRecord, _is_native_emoji_cdn_url
+
+        store = None
+        aes_key = None
+        native_url = attributes.get("cdnurl")
+        if not _is_native_emoji_cdn_url(native_url):
+            native_url = None
+        for source in self._named_databases("emoticon.db"):
+            connection = self._open(source)
+            try:
+                row = connection.execute("SELECT md5,aes_key,cdn_url FROM kNonStoreEmoticonTable WHERE md5=? LIMIT 1", (attributes["md5"],)).fetchone()
+                if row is not None:
+                    aes_key = str(row["aes_key"] or "") or None
+                    candidate_url = str(row["cdn_url"] or "") or None
+                    if _is_native_emoji_cdn_url(candidate_url):
+                        native_url = candidate_url
+            except sqlite3.DatabaseError:
+                pass
+            try:
+                row = connection.execute("SELECT package_id_,md5_,emoticon_offset_,emoticon_size_,thumb_offset_,thumb_size_ FROM kStoreEmoticonFilesTable WHERE md5_=? LIMIT 1", (attributes["md5"],)).fetchone()
+                if row is not None:
+                    store = EmojiStoreRecord(str(row[0]), str(row[1]), *(int(value or 0) for value in row[2:]))
+            except (sqlite3.DatabaseError, TypeError, ValueError):
+                pass
+        return store, aes_key, native_url
+
+    def _open_native_media(self, payload: Mapping[str, Any], *, allow_remote: bool = False) -> Any:
+        from wechat_image import decode_wechat_dat
+        from wechat_media import LocalMedia, _verify_pillow_visual, fetch_emoji_media, open_emoji_media
+
+        attributes = self._native_media_attributes(payload)
+        if attributes is None:
+            return None
+        kind = str(payload["kind"])
+        if kind == "emoji":
+            store, aes_key, native_url = self._emoji_source(attributes)
+            image_aes, image_xor = self._media_keys
+            result = open_emoji_media(
+                account_root=self._storage.parent, emoji_md5=attributes["md5"], store=store,
+                aes_key=aes_key,
+                decode_blob=lambda data, _key: decode_wechat_dat(data, aes_key=image_aes, xor_key=image_xor),
+            )
+            if result is not None or not allow_remote or not native_url:
+                return result
+            declared = attributes.get("len")
+            return fetch_emoji_media(
+                emoji_md5=attributes["md5"], native_url=native_url,
+                declared_size=int(declared) if declared and declared.isdigit() else None,
+            )
+        for path, quality in self._hardlink_media_paths(attributes["md5"], kind):
+            try:
+                data = path.read_bytes()
+            except OSError:
+                continue
+            if kind == "image":
+                aes_key, xor_key = self._media_keys
+                data = decode_wechat_dat(data, aes_key=aes_key, xor_key=xor_key)
+                if data is not None and data.startswith(b"wxgf"):
+                    try:
+                        from wechat_wxgf import wxgf_to_image
+                    except ImportError:
+                        continue
+                    data = wxgf_to_image(data)
+                visual = _verify_pillow_visual(data) if data is not None else None
+                if visual is None:
+                    continue
+                mime_type, extension = visual
+                return LocalMedia(data, attributes["md5"] + "." + extension, mime_type, quality)
+            import mimetypes
+
+            if hashlib.md5(data, usedforsecurity=False).hexdigest() != attributes["md5"]:
+                continue
+            name = attributes.get("fileName") or path.name
+            return LocalMedia(data, name, mimetypes.guess_type(name)[0] or "application/octet-stream", quality)
+        return None
+
+    def _describe_native_media(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        from wechat_media import _is_native_emoji_cdn_url
+
+        try:
+            attributes = self._native_media_attributes(payload)
+            if attributes is not None and payload.get("kind") in {"image", "video", "file"}:
+                paths = self._hardlink_media_paths(attributes["md5"], str(payload["kind"]))
+                if paths:
+                    path, quality = paths[0]
+                    return {"openable": None, "materializable": True, "requiresNetwork": False, "open_status": "not_requested", "processing_state": "unprocessed", "resolution_gap": "media_materialization_required", "fileName": attributes.get("fileName") or path.name, "quality": quality, "cachedBytes": path.stat().st_size, "materializationSource": "local"}
+            media = self._open_native_media(payload)
+            if media is not None:
+                return {"openable": True, "open_status": "openable", "processing_state": "available", "fileName": media.file_name, "mimeType": media.mime_type, "quality": media.quality, "size": len(media.payload), "materializationSource": media.source}
+            if payload.get("kind") == "emoji" and attributes is not None:
+                _, _, native_url = self._emoji_source(attributes)
+                if _is_native_emoji_cdn_url(native_url):
+                    return {"openable": None, "materializable": True, "requiresNetwork": True, "open_status": "not_requested", "processing_state": "unprocessed", "resolution_gap": "media_materialization_required"}
+        except (WeChatDirectError, OSError, ValueError):
+            pass
+        return {"openable": False, "open_status": "not_openable", "processing_state": "unprocessed", "resolution_gap": "native_media_missing_or_unreadable"}
+
     def _make_locator(self, payload: dict[str, Any]) -> str:
         body = dict(payload)
         body["version"] = 1
@@ -2742,6 +2994,9 @@ class DirectWeChatReader:
         """Resolve one locator without returning message bodies or native IDs."""
 
         payload = self._decode_locator(locator)
+        if payload.get("record") == "native_media":
+            cached = getattr(self, "_opened_native_media", {}).get(locator)
+            return {"kind": payload.get("kind"), **(cached or self._describe_native_media(payload))}
         record = payload.get("record")
         kind = str(payload.get("kind") or "unknown")
         if record == "voice":
@@ -2895,8 +3150,18 @@ class DirectWeChatReader:
             }
         raise DirectSchemaError("media locator record type is unsupported")
 
-    def open_locator(self, locator: str) -> bytes:
-        """Open an exactly located voice BLOB; other media stay explicit gaps."""
+    def open_locator(self, locator: str, *, allow_remote: bool = False) -> bytes:
+        """Open one bound native media item; remote emoji reads require opt-in."""
+
+        payload = self._decode_locator(locator)
+        if payload.get("record") == "native_media":
+            media = self._open_native_media(payload, allow_remote=allow_remote)
+            if media is None:
+                raise MediaNotOpenableError("bound native media is currently unavailable")
+            if not hasattr(self, "_opened_native_media"):
+                self._opened_native_media = {}
+            self._opened_native_media[locator] = {"openable": True, "open_status": "openable", "processing_state": "available", "fileName": media.file_name, "mimeType": media.mime_type, "quality": media.quality, "size": len(media.payload), "materializationSource": media.source}
+            return media.payload
 
         resolved = self.resolve_locator(locator)
         if not resolved["openable"]:
@@ -2942,17 +3207,27 @@ class DirectWeChatReader:
         base_type = _base_message_type(row["local_type"])
         kind = _TYPE_NAMES.get(base_type or -1)
         if kind == "app":
-            if not any(
-                re.search(r"<type>\s*6\s*</type>", text)
-                for text in payload_texts
-            ):
+            is_file = False
+            for text in payload_texts:
+                start = text.find("<")
+                if start < 0:
+                    continue
+                try:
+                    root = ET.fromstring(text[start:])
+                except ET.ParseError:
+                    continue
+                app = root if root.tag == "appmsg" else root.find("appmsg")
+                if app is not None and (app.findtext("type") or "").strip() == "6":
+                    is_file = True
+                    break
+            if not is_file:
                 return []
             kind = "file"
         if kind not in {"image", "voice", "video", "emoji", "file"}:
             return []
         server_id = row["server_id"]
         local_id = row["local_id"]
-        if exact_lookup_only:
+        if exact_lookup_only or kind in {"image", "emoji", "video", "file"}:
             return self._exact_media_entries(
                 row=row,
                 session_id=session_id,

@@ -1,6 +1,6 @@
 # WeChatDirect
 
-WeChatDirect 是一个 Windows-only 的本地工具：从当前电脑上已登录的 WeChat 本地数据库和缓存中，读取一段有界的聊天或朋友圈上下文，并按需生成本机导出或保全文件。
+WeChatDirect 主要供 AI 调用，是一个 Windows-only 的本地工具：从当前电脑上已登录的 WeChat 本地数据库和缓存中，读取一段有界的聊天或朋友圈上下文，并按需生成本机导出或保全文件。命令以结构化 JSON 表达消息、读取范围、缺口和下一步，便于 AI 判断本次结果能支持什么结论。
 
 源数据库和缓存始终只读。工具只会写入用户明确指定的本地导出、状态和保全目录，不会改写 WeChat 数据，也不会自动登录、联网补历史、打开远端主页、点赞、评论或启动后台同步。
 
@@ -80,6 +80,20 @@ wechat-direct context --account auto --contact "<contact-or-group>" --contains "
 
 这是有界读取，不会先做全账号同步。`auto` 在多个账号都匹配或无法唯一定位时会停止并返回候选，不会猜测。结果包含消息、发送者方向、可影响含义的媒体关系和缺口。
 
+AI 读取结果时还应检查这些字段：
+
+- `coverage.hasMore` 和 `continuation`：有下一批可读内容时，把返回的 `account`、`contact` 和 `cursor` 用于下一次 `context` 调用。游标固定账号身份、联系人、时间窗和搜索条件；不要自行构造或修改游标。扫描上限和返回上限可以调整。
+- `search.status`：关键词只匹配本次解码得到的消息文字。`not_found_in_page` 表示这一页未命中，通常同时返回 `status=partial` 和续查信息；只有读尽当前查询范围才能报告 `not_found_in_requested_window`。续查末页的 `not_found_in_remaining_window` 只描述剩余范围。`indeterminate_content_gaps` 表示存在无法解析的正文，不能据此断言从未说过。
+- `coverage.returnedAllScanned`：本次展示的上下文是否包含所有扫描消息。关键词命中会返回其附近的小窗口，不能把该窗口当作完整历史；`continuation.purpose` 区分继续找匹配上下文和普通翻页。
+- `coverage.snapshotScope`：每次调用读取独立的本地快照。续查固定查询时间上界，不承诺不同调用之间本地历史永远不变。
+
+```powershell
+wechat-direct context --account primary --contact "<contact-or-group>" --cursor "<continuation.cursor>"
+wechat-direct context --account primary --contact "<contact-or-group>" --around "2026-08-01T12:00:00+08:00"
+```
+
+`--around` 在允许的时间窗中优先读取离目标时间最近的消息，再按时间顺序返回。未指定起止时间时，窗口默认围绕目标时间前后各 `--lookback-days` 天，截止时间不晚于本次读取时间。显式时间窗不包含目标时间时返回参数错误。`--since`、`--until` 和 `--around` 接受 ISO 日期/时间；未写时区时按 `Asia/Shanghai` 解释。
+
 ### `sync-contact`：一个对象的首次导出与完成态增量刷新
 
 ```powershell
@@ -97,6 +111,8 @@ wechat-direct moments --account primary --contact "<contact>" --lookback-days 30
 ```
 
 必须显式指定账号，可读取该账号自己的缓存或按一个精确联系人筛选。它不会访问远端主页；当前缓存没有目标时会返回可行动的缺口。
+
+`targetCacheStatus=target_cached_outside_requested_window` 表示该人的内容已缓存，但本次日期范围内没有命中；`targetCachedWindow` 给出已缓存内容的时间范围。这种情况不会要求重新打开资料页。只有确认目标不在当前缓存中时，才返回 `target_not_in_current_local_cache` 及相应操作提示。
 
 ### `sync-moments`：导出当前缓存快照
 
@@ -139,10 +155,11 @@ wechat-direct verify-export --output "<export-directory>"
 
 ## 故障与恢复边界
 
-- 完成态档案可以再次运行同一命令做增量刷新，或显式使用 `--full-reconcile` 重核当前本机可见历史。`sync-contact` 每次 `noChange` 快速返回前都会重新核对 manifest 自身哈希、manifest/state 绑定，以及 `context.md`、`ai-context.md`、`messages.jsonl` 的已声明哈希、大小或记录数；任一不一致都会精确失败并保留原文件，不会静默覆盖未知内容。
+- 完成态档案可以再次运行同一命令做增量刷新，或显式使用 `--full-reconcile` 重核当前本机可见历史。`sync-contact` 在普通增量与 `noChange` 快速返回前都会重新核对 manifest 自身哈希、manifest/state 绑定，以及 `context.md`、`ai-context.md`、`messages.jsonl`、已声明导出媒体与派生 WAV 的哈希、大小或记录数；任一不一致都会精确失败并保留原文件，不会静默覆盖未知内容。
 - 首次运行若在 `state.json` 提交前硬崩溃，目录会保留为没有 state 的半成品，并以 `sync_output_not_initialized` 精确失败。工具不会自动删除、覆盖或猜测接管这些未知内容；如需重做，应由用户保留或另行检查原目录后选择一个新的空输出目录。
 - 遗留 `.sync.lock` 会以 `sync_already_running_or_stale_lock` 失败。工具无法仅凭锁文件证明原进程已结束，因此不会自动删除它。
 - `verify-export` 是只读验证，不会修复归档；本项目也不提供 restore/import（恢复/导入）回微信的能力。
+- 命令执行失败时，JSON 保留稳定的 `error`，并提供 `retryable` 与 `nextAction`。`retryable` 只说明原命令是否适合重试，不代表可以扩大账号、聊天或写入范围；已有 `.incomplete` 输出会保留，调用者可检查原文件或选择新的明确输出位置。
 
 ## 输出文件
 

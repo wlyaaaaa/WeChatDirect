@@ -168,7 +168,14 @@ def load_direct_source_identity(
             if child.is_dir() and (child / "db_storage").is_dir():
                 candidates.append(child)
     unique = {candidate.resolve() for candidate in candidates}
-    matching = [candidate for candidate in unique if candidate.name == identity or candidate.name.startswith(identity + "_")]
+    storage_suffix = re.compile(
+        re.escape(identity) + r"_[0-9a-fA-F]{4}"
+    )
+    matching = [
+        candidate
+        for candidate in unique
+        if candidate.name == identity or storage_suffix.fullmatch(candidate.name)
+    ]
     if len(matching) != 1:
         raise DirectCredentialError("local source account directory is ambiguous")
     account_root = matching[0]
@@ -1652,41 +1659,75 @@ class DirectWeChatReader:
         """List all local sessions, including hidden groups, for source truth."""
 
         sessions: dict[str, dict[str, Any]] = {}
-        for source in self._named_databases("session.db"):
+        sources = self._named_databases("session.db")
+        if not sources:
+            raise DirectSchemaError("session_database_unavailable")
+        invalid_source = False
+        usable_sources = 0
+        for source in sources:
             connection = self._open(source)
-            columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(SessionTable)")}
-            if "username" not in columns:
-                continue
-            type_expr = "type" if "type" in columns else "NULL"
-            last_expr = "last_timestamp" if "last_timestamp" in columns else "NULL"
-            sort_expr = "sort_timestamp" if "sort_timestamp" in columns else "NULL"
-            hidden_expr = "is_hidden" if "is_hidden" in columns else "0"
-            order = "ORDER BY sort_timestamp DESC" if "sort_timestamp" in columns else ""
-            for row in connection.execute(
-                f"SELECT username, {type_expr} AS session_type, "
-                f"{last_expr} AS last_timestamp, {sort_expr} AS sort_timestamp, "
-                f"{hidden_expr} AS is_hidden FROM SessionTable {order}"
-            ):
-                if row["username"]:
-                    username = str(row["username"])
-                    folded_username = username.casefold()
-                    session_type = (
-                        "channel"
-                        if folded_username.startswith("gh_")
-                        else "group"
-                        if folded_username.endswith("@chatroom")
-                        else "contact"
+            try:
+                columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(SessionTable)"
                     )
-                    sessions[username] = {
-                        "id": username,
-                        "username": username,
-                        "type": session_type,
-                        "nativeType": row["session_type"],
-                        "lastTimestamp": row["last_timestamp"],
-                        "sortTimestamp": row["sort_timestamp"],
-                        "isHidden": bool(row["is_hidden"]),
-                    }
-        return list(sessions.values())
+                }
+                if "username" not in columns:
+                    invalid_source = True
+                    continue
+                usable_sources += 1
+                type_expr = "type" if "type" in columns else "NULL"
+                last_expr = "last_timestamp" if "last_timestamp" in columns else "NULL"
+                sort_expr = "sort_timestamp" if "sort_timestamp" in columns else "NULL"
+                hidden_expr = "is_hidden" if "is_hidden" in columns else "0"
+                order = (
+                    "ORDER BY sort_timestamp DESC"
+                    if "sort_timestamp" in columns
+                    else ""
+                )
+                for row in connection.execute(
+                    f"SELECT username, {type_expr} AS session_type, "
+                    f"{last_expr} AS last_timestamp, {sort_expr} AS sort_timestamp, "
+                    f"{hidden_expr} AS is_hidden FROM SessionTable {order}"
+                ):
+                    if row["username"]:
+                        username = str(row["username"])
+                        folded_username = username.casefold()
+                        session_type = (
+                            "channel"
+                            if folded_username.startswith("gh_")
+                            else "group"
+                            if folded_username.endswith("@chatroom")
+                            else "contact"
+                        )
+                        sessions[username] = {
+                            "id": username,
+                            "username": username,
+                            "type": session_type,
+                            "nativeType": row["session_type"],
+                            "lastTimestamp": row["last_timestamp"],
+                            "sortTimestamp": row["sort_timestamp"],
+                            "isHidden": bool(row["is_hidden"]),
+                        }
+            except sqlite3.DatabaseError:
+                invalid_source = True
+        if invalid_source or not usable_sources:
+            raise DirectSchemaError("session_database_unavailable")
+
+        def sort_key(item: Mapping[str, Any]) -> tuple[bool, int, str]:
+            raw_timestamp = item.get("sortTimestamp")
+            try:
+                timestamp = int(raw_timestamp)
+            except (TypeError, ValueError, OverflowError):
+                timestamp = -1
+            return (
+                raw_timestamp is not None,
+                timestamp,
+                str(item.get("id") or ""),
+            )
+
+        return sorted(sessions.values(), key=sort_key, reverse=True)
 
     def list_contacts(
         self, *, include_unregistered: bool = False
@@ -1700,17 +1741,45 @@ class DirectWeChatReader:
         session.
         """
 
+        session_gap: str | None = None
+        try:
+            session_items = self.list_sessions()
+        except DirectSchemaError:
+            if not include_unregistered:
+                raise
+            session_items = []
+            session_gap = "session_database_unavailable"
         sessions = {
-            str(item["id"]): item
-            for item in self.list_sessions()
-            if item.get("id")
+            str(item["id"]): item for item in session_items if item.get("id")
         }
         contacts: dict[str, dict[str, Any]] = {}
-        for source in self._named_databases("contact.db"):
+        contact_sources = self._named_databases("contact.db")
+        contact_gap: str | None = (
+            None if contact_sources else "contact_database_unavailable"
+        )
+        for source in contact_sources:
             connection = self._open(source)
             try:
+                columns = {
+                    str(row[1])
+                    for row in connection.execute("PRAGMA table_info(contact)")
+                }
+                if "username" not in columns:
+                    contact_gap = "contact_database_unavailable"
+                    continue
+                missing_label_columns = tuple(
+                    column
+                    for column in ("remark", "nick_name", "alias")
+                    if column not in columns
+                )
+                label_expressions = [
+                    column if column in columns else f"NULL AS {column}"
+                    for column in ("alias", "remark", "nick_name")
+                ]
                 rows = connection.execute(
-                    "SELECT username, alias, remark, nick_name FROM contact"
+                    "SELECT username, "
+                    + ", ".join(label_expressions)
+                    + " FROM contact"
                 )
                 for row in rows:
                     native_id = str(row["username"] or "")
@@ -1722,7 +1791,7 @@ class DirectWeChatReader:
                     remark = str(row["remark"] or "").strip()
                     nickname = str(row["nick_name"] or "").strip()
                     alias = str(row["alias"] or "").strip()
-                    contacts[native_id] = {
+                    contact = {
                         "nativeId": native_id,
                         "sessionType": (
                             str(session.get("type") or "unknown")
@@ -1739,22 +1808,36 @@ class DirectWeChatReader:
                             else None
                         ),
                     }
+                    if missing_label_columns:
+                        contact["labelGap"] = "contact_label_fields_unavailable"
+                    elif not (remark or nickname or alias):
+                        contact["labelGap"] = "contact_label_unavailable"
+                    if session_gap:
+                        contact["sessionGap"] = session_gap
+                    contacts[native_id] = contact
             except sqlite3.DatabaseError:
-                continue
+                contact_gap = "contact_database_unavailable"
+
+        if contact_gap and not include_unregistered:
+            raise DirectSchemaError(contact_gap)
+        if contact_gap and include_unregistered:
+            for contact in contacts.values():
+                contact.setdefault("labelGap", "contact_database_incomplete")
 
         for native_id, session in sessions.items():
-            contacts.setdefault(
-                native_id,
-                {
-                    "nativeId": native_id,
-                    "sessionType": str(session.get("type") or "unknown"),
-                    "displayName": native_id,
-                    "remark": None,
-                    "nickname": None,
-                    "alias": None,
-                    "lastTimestamp": session.get("lastTimestamp"),
-                },
-            )
+            fallback = {
+                "nativeId": native_id,
+                "sessionType": str(session.get("type") or "unknown"),
+                "displayName": native_id,
+                "remark": None,
+                "nickname": None,
+                "alias": None,
+                "lastTimestamp": session.get("lastTimestamp"),
+                "labelGap": contact_gap or "contact_row_unavailable",
+            }
+            if session_gap:
+                fallback["sessionGap"] = session_gap
+            contacts.setdefault(native_id, fallback)
         return list(contacts.values())
 
     def list_group_member_labels(
@@ -1848,6 +1931,9 @@ class DirectWeChatReader:
         gaps: list[dict[str, Any]] = []
         scanned = 0
         visible_cutoff: int | None = None
+        target_cached_rows = 0
+        target_latest_time_s: int | None = None
+        target_earliest_time_s: int | None = None
         database_found = False
         for source in self._named_databases("sns.db"):
             connection = self._open(source)
@@ -1909,6 +1995,15 @@ class DirectWeChatReader:
                     create_time = 0
                 if create_time:
                     visible_cutoff = max(visible_cutoff or create_time, create_time)
+                if username is None or native_username == username:
+                    target_cached_rows += 1
+                    if create_time:
+                        target_latest_time_s = max(
+                            target_latest_time_s or create_time, create_time
+                        )
+                        target_earliest_time_s = min(
+                            target_earliest_time_s or create_time, create_time
+                        )
                 if username and native_username != username:
                     continue
                 if create_time < int(since_s) or create_time > int(end_s):
@@ -1977,6 +2072,9 @@ class DirectWeChatReader:
             "sourceVisibleCutoffS": visible_cutoff,
             "scannedRows": scanned,
             "matchedRows": len(ordered),
+            "targetCachedRows": target_cached_rows,
+            "targetLatestTimeS": target_latest_time_s,
+            "targetEarliestTimeS": target_earliest_time_s,
             "hasMoreCurrentCache": False if limit is None else len(ordered) > limit,
             "historyScope": "current_local_cache_only",
             "gaps": gaps,
@@ -4416,15 +4514,41 @@ class DirectWeChatReader:
         limit: int | None = None,
         exact_media_lookup: bool = False,
         allow_unindexed_time_fallback: bool = False,
+        before_key: Sequence[Any] | None = None,
+        around_s: int | None = None,
     ) -> dict[str, Any]:
         if limit is not None:
             limit = int(limit)
             if limit < 1:
                 raise ValueError("message_fetch_limit_invalid")
+        if before_key is not None:
+            key_offset = int(around_s is not None)
+            if (
+                limit is None
+                or len(before_key) != 5 + key_offset
+                or any(type(value) is not int for value in before_key[:3 + key_offset])
+                or before_key[key_offset] not in (0, 1)
+                or any(not isinstance(value, str) for value in before_key[3 + key_offset:])
+                or before_key[3 + key_offset] not in {"server", "local", "row"}
+            ):
+                raise ValueError("message_page_cursor_invalid")
+            before_key = tuple(before_key)
         table = "Msg_" + hashlib.md5(
             session_native_id.encode("utf-8"), usedforsecurity=False
         ).hexdigest()
         quoted_table = _quote_identifier(table)
+
+        def newest_key(item: tuple[Path, sqlite3.Row]) -> tuple[Any, ...]:
+            row = item[1]
+            identity = self._private_message_record_identity(item[0], table, row)
+            key = (
+                int(row["create_time"] is not None),
+                int(row["create_time"]) if row["create_time"] is not None else -1,
+                int(row["sort_seq"]) if row["sort_seq"] is not None else -1,
+                *identity,
+            )
+            return (-abs(key[1] - around_s), *key) if around_s is not None else key
+
         rows: list[tuple[Path, sqlite3.Row]] = []
         table_found = False
         message_connections = self._message_connections(table)
@@ -4546,8 +4670,16 @@ class DirectWeChatReader:
                 )
             for where, params, index_name in predicates:
                 order_by = (
-                    " ORDER BY (create_time IS NULL), create_time DESC, "
-                    "sort_seq DESC, server_id DESC, local_id DESC, rowid DESC"
+                    " ORDER BY (create_time IS NOT NULL) DESC, "
+                    "coalesce(create_time, -1) DESC, coalesce(sort_seq, -1) DESC, "
+                    "CASE WHEN server_id IS NOT NULL AND CAST(server_id AS TEXT) != '0' "
+                    "THEN 'server' WHEN local_id IS NOT NULL AND CAST(local_id AS TEXT) != '0' "
+                    "THEN 'local' ELSE 'row' END COLLATE BINARY DESC, "
+                    "CASE WHEN server_id IS NOT NULL AND CAST(server_id AS TEXT) != '0' "
+                    "THEN CAST(server_id AS TEXT) "
+                    "WHEN local_id IS NOT NULL AND CAST(local_id AS TEXT) != '0' "
+                    "THEN CAST(local_id AS TEXT) ELSE CAST(rowid AS TEXT) END "
+                    "COLLATE BINARY DESC"
                     if limit is not None
                     else ""
                 )
@@ -4556,6 +4688,11 @@ class DirectWeChatReader:
                     if index_name is not None
                     else ""
                 )
+                if around_s is not None and limit is not None:
+                    order_by = order_by.replace(
+                        " ORDER BY ", " ORDER BY abs(coalesce(create_time, -1) - ?) ASC, ", 1
+                    )
+                    params = [*params, int(around_s)]
                 cursor = connection.execute(
                     "SELECT rowid AS _rowid, local_id, local_type, server_id, "
                     "real_sender_id, create_time, "
@@ -4569,13 +4706,18 @@ class DirectWeChatReader:
                     for page in _iter_cursor_pages(
                         cursor, page_size=MESSAGE_FETCH_PAGE_SIZE
                     ):
-                        rows.extend((source, row) for row in page)
+                        eligible = [
+                            (source, row)
+                            for row in page
+                            if before_key is None or newest_key((source, row)) < before_key
+                        ]
+                        rows.extend(eligible)
                         if limit is not None:
                             predicate_identities.update(
                                 self._private_message_record_identity(source, table, row)
-                                for row in page
+                                for _, row in eligible
                             )
-                            if len(predicate_identities) >= limit:
+                            if len(predicate_identities) > limit:
                                 break
                 finally:
                     cursor.close()
@@ -4583,23 +4725,9 @@ class DirectWeChatReader:
             raise SessionMessageDatabaseMissingError(
                 "session message database is missing"
             )
+        has_more = False
+        next_before_key = None
         if limit is not None:
-            def newest_key(item: tuple[Path, sqlite3.Row]) -> tuple[Any, ...]:
-                row = item[1]
-
-                def integer(value: Any) -> int:
-                    try:
-                        return int(value)
-                    except (TypeError, ValueError):
-                        return -1
-
-                return (
-                    row["create_time"] is not None,
-                    integer(row["create_time"]),
-                    integer(row["sort_seq"]),
-                    str(row["server_id"] or row["local_id"] or ""),
-                )
-
             selected_identities: list[tuple[str, str]] = []
             seen: set[tuple[str, str]] = set()
             for item in sorted(rows, key=newest_key, reverse=True):
@@ -4607,9 +4735,11 @@ class DirectWeChatReader:
                 if identity in seen:
                     continue
                 seen.add(identity)
-                selected_identities.append(identity)
                 if len(selected_identities) == limit:
+                    has_more = True
                     break
+                selected_identities.append(identity)
+                next_before_key = list(newest_key(item))
             selected = set(selected_identities)
             rows = [
                 item
@@ -4628,6 +4758,10 @@ class DirectWeChatReader:
                 (message_source, connection_by_source[message_source], row)
             )
         messages: dict[tuple[str, str], dict[str, Any]] = {}
+        page_keys = {
+            identity: list(max(newest_key((source, row)) for source, _, row in candidates))
+            for identity, candidates in grouped.items()
+        } if limit is not None else {}
         exact_messages = (
             self._private_messages_by_server_ids(
                 session_native_id=session_native_id,
@@ -4652,13 +4786,18 @@ class DirectWeChatReader:
                     message_table=table,
                     exact_media_lookup=exact_media_lookup,
                 )
+            if limit is not None:
+                messages[identity]["_pageKey"] = page_keys[identity]
         ordered = sorted(
             messages.values(),
             key=lambda item: (
-                item.get("createTime") is None,
-                int(item.get("createTime") or 0),
-                int(item.get("sortSeq") or 0),
-                str(item.get("serverId") or item.get("localId") or ""),
+                tuple(item["_pageKey"][1:] if around_s is not None else item["_pageKey"])
+                if limit is not None else (
+                    item.get("createTime") is None,
+                    int(item.get("createTime") or 0),
+                    int(item.get("sortSeq") or 0),
+                    str(item.get("serverId") or item.get("localId") or ""),
+                )
             ),
         )
         sort_watermarks = []
@@ -4672,9 +4811,13 @@ class DirectWeChatReader:
         return {
             "messages": ordered,
             "sync": {
-                "hasMore": False,
-                "watermark": end_s,
-                "sortSeqWatermark": max(sort_watermarks, default=None),
+                "hasMore": has_more,
+                "nextBeforeKey": next_before_key if has_more else None,
+                "watermark": end_s if not has_more and before_key is None else None,
+                "sortSeqWatermark": (
+                    max(sort_watermarks, default=None)
+                    if not has_more and before_key is None else None
+                ),
             },
         }
 

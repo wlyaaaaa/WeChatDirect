@@ -9,6 +9,8 @@ create a one-off preservation bundle.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 from datetime import datetime
 import hashlib
 import hmac
@@ -188,6 +190,10 @@ def _normalize_name(value: object) -> str:
 
 
 def _contact_match_fields(contact: Mapping[str, Any]) -> tuple[str, ...]:
+    builtin_names = (
+        ("文件传输助手", "file transfer assistant", "file_transfer_assistant")
+        if str(contact.get("nativeId") or "").casefold() == "filehelper" else ()
+    )
     return tuple(
         item
         for item in (
@@ -195,6 +201,7 @@ def _contact_match_fields(contact: Mapping[str, Any]) -> tuple[str, ...]:
             _normalize_name(contact.get("nickname")),
             _normalize_name(contact.get("alias")),
             _normalize_name(contact.get("nativeId")),
+            *builtin_names,
         )
         if item
     )
@@ -215,6 +222,9 @@ def _safe_contact(contact: Mapping[str, Any], account: str) -> dict[str, Any]:
         result["isSelf"] = bool(contact.get("isSelf"))
     if contact.get("labelScope"):
         result["labelScope"] = contact.get("labelScope")
+    for gap in ("labelGap", "sessionGap"):
+        if contact.get(gap):
+            result[gap] = contact[gap]
     if str(contact.get("nativeId") or "").casefold() == "filehelper":
         result["conversationKind"] = "file_transfer_assistant"
     return result
@@ -481,8 +491,10 @@ def _message_receipt(
     account: str | None = None,
 ) -> dict[str, Any]:
     result = dict(message)
+    result.pop("_pageKey", None)
+    message_body = dict(result)
     result["nativeId"] = _message_native_id(message)
-    result["messageSha256"] = _sha256(_canonical_bytes(message))
+    result["messageSha256"] = _sha256(_canonical_bytes(message_body))
     result["sender"] = _sender_receipt(
         message,
         contacts=contacts,
@@ -504,9 +516,15 @@ def _select_window(
     anchor: int | None = None
     if contains:
         wanted = contains.casefold()
+        matches = []
         for index, message in enumerate(messages):
             if wanted in str(message.get("content") or "").casefold():
-                anchor = index
+                matches.append(index)
+        if matches:
+            anchor = (
+                min(matches, key=lambda index: abs(int(messages[index].get("createTime") or 0) - around_s))
+                if around_s is not None else matches[-1]
+            )
         if anchor is None:
             raise ProductError("message_text_anchor_not_found")
     elif around_s is not None:
@@ -519,9 +537,10 @@ def _select_window(
             raise ProductError("message_time_anchor_not_found")
         anchor = min(timed)[1]
     else:
-        return messages[-return_limit:], len(messages) - 1
+        selected = messages[-return_limit:]
+        return selected, len(selected) - 1
 
-    before = max(1, return_limit * 3 // 5)
+    before = min(return_limit - 1, return_limit * 3 // 5)
     start = max(0, anchor - before)
     end = min(len(messages), start + return_limit)
     start = max(0, end - return_limit)
@@ -594,41 +613,117 @@ def _attach_quote_targets(
     return list(targets.values()), gaps
 
 
+def _read_context_cursor(value: str | None) -> dict[str, Any] | None:
+    if not value:
+        return None
+    try:
+        if len(value) > 4096:
+            raise ValueError
+        decoded = json.loads(base64.b64decode(value, altchars=b"-_", validate=True))
+        if (
+            not isinstance(decoded, dict)
+            or set(decoded) != {"v", "account", "identity", "contact", "since", "until", "contains", "around", "before"}
+            or decoded["v"] != 1
+            or decoded["account"] not in ACCOUNT_LABELS
+            or any(not isinstance(decoded[key], str) for key in ("identity", "contact"))
+            or any(type(decoded[key]) is not int for key in ("since", "until"))
+            or decoded["since"] > decoded["until"]
+            or (decoded["contains"] is not None and not isinstance(decoded["contains"], str))
+            or (decoded["around"] is not None and type(decoded["around"]) is not int)
+            or not isinstance(decoded["before"], list)
+        ):
+            raise ValueError
+        return decoded
+    except (ValueError, TypeError, UnicodeError, binascii.Error) as exc:
+        raise ProductError("context_cursor_invalid") from exc
+
+
 def _context_result(args: argparse.Namespace) -> dict[str, Any]:
     if not 1 <= int(args.scan_limit) <= MAX_SCAN_MESSAGES:
         raise ProductError("scan_limit_invalid")
     if not 1 <= int(args.return_limit) <= MAX_RETURN_MESSAGES:
         raise ProductError("return_limit_invalid")
+    if int(args.lookback_days) < 0:
+        raise ProductError("lookback_days_invalid")
     cutoff_s = int(time.time())
+    cursor = _read_context_cursor(getattr(args, "cursor", None))
+    around_s = _parse_time(args.around, default=cutoff_s) if args.around else None
+    contains = args.contains
+    if cursor is not None:
+        for supplied, expected in ((contains, cursor["contains"]), (around_s, cursor["around"])):
+            if supplied is not None and supplied != expected:
+                raise ProductError("context_cursor_query_mismatch")
+        contains, around_s = cursor["contains"], cursor["around"]
+        since_s, end_s = cursor["since"], cursor["until"]
+        if (
+            (args.since and _parse_time(args.since, default=since_s) != since_s)
+            or (args.until and _parse_time(args.until, default=end_s) != end_s)
+            or args.account not in ("auto", cursor["account"])
+        ):
+            raise ProductError("context_cursor_query_mismatch")
+    else:
+        span = int(args.lookback_days) * 86_400
+        end_default = min(cutoff_s, around_s + span) if around_s is not None else cutoff_s
+        end_s = _parse_time(args.until, default=end_default)
+        since_default = (around_s if around_s is not None else end_s) - span
+        since_s = _parse_time(args.since, default=since_default)
+    if since_s > end_s:
+        raise ProductError("time_window_reversed")
+    if around_s is not None and not since_s <= around_s <= end_s:
+        raise ProductError("context_anchor_outside_requested_window")
     config = _read_config(_resolve_config_path(getattr(args, "config", None)))
     label, reader, contact = _resolve_contact(
         config,
-        account=args.account,
+        account=cursor["account"] if cursor is not None else args.account,
         query=args.contact,
         cutoff_s=cutoff_s,
     )
     try:
-        end_s = _parse_time(args.until, default=cutoff_s)
-        since_default = end_s - int(args.lookback_days) * 86_400
-        since_s = _parse_time(args.since, default=since_default)
-        if since_s > end_s:
-            raise ProductError("time_window_reversed")
+        identity = "sha256:" + reader.account_identity_commitment
+        contact_binding = _sha256(str(contact["nativeId"]).encode("utf-8"))
+        if cursor is not None and (
+            cursor["identity"] != identity or cursor["contact"] != contact_binding
+        ):
+            raise ProductError("context_cursor_target_mismatch")
+        fetch_options: dict[str, Any] = {}
+        if cursor is not None:
+            fetch_options["before_key"] = cursor["before"]
+        if around_s is not None:
+            fetch_options["around_s"] = around_s
+        fetch_limit = min(int(args.scan_limit), int(args.return_limit)) if around_s is not None else int(args.scan_limit)
         fetched = reader.fetch_messages(
             str(contact["nativeId"]),
             since_s=since_s,
             end_s=end_s,
-            limit=int(args.scan_limit),
+            limit=fetch_limit,
             exact_media_lookup=True,
             allow_unindexed_time_fallback=True,
+            **fetch_options,
         )
         scanned = list(fetched.get("messages") or [])
-        around_s = _parse_time(args.around, default=end_s) if args.around else None
-        selected, anchor_index = _select_window(
-            scanned,
-            contains=args.contains,
-            around_s=around_s,
-            return_limit=int(args.return_limit),
-        )
+        sync = fetched.get("sync") or {}
+        scan_has_more = bool(sync.get("hasMore"))
+        match_count = sum(contains.casefold() in str(item.get("content") or "").casefold() for item in scanned) if contains else None
+        content_gaps = sum(bool(item.get("contentGap")) for item in scanned)
+        if contains and not match_count:
+            selected, anchor_index = [], None
+        else:
+            selected, anchor_index = _select_window(
+                scanned, contains=contains, around_s=around_s,
+                return_limit=int(args.return_limit),
+            )
+        scanned_keys = [tuple(item["_pageKey"]) for item in scanned if item.get("_pageKey")]
+        selected_keys = [tuple(item["_pageKey"]) for item in selected if item.get("_pageKey")]
+        next_key = min(selected_keys) if selected_keys else sync.get("nextBeforeKey")
+        omitted_older = bool(selected_keys and scanned_keys and min(selected_keys) > min(scanned_keys))
+        has_more = scan_has_more or omitted_older
+        next_cursor = None
+        if has_more and next_key is not None:
+            next_cursor = base64.urlsafe_b64encode(_canonical_bytes({
+                "v": 1, "account": label, "identity": identity,
+                "contact": contact_binding, "since": since_s, "until": end_s,
+                "contains": contains, "around": around_s, "before": list(next_key),
+            })).decode("ascii")
         contacts = {
             str(item["nativeId"]): item
             for item in _contact_directory(reader, str(contact["nativeId"]))
@@ -692,7 +787,7 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
                         }
                     )
         result: dict[str, Any] = {
-            "status": "success",
+            "status": "partial" if contains and not match_count and (scan_has_more or content_gaps) else "success",
             "account": label,
             "accountIdentityCommitment": "sha256:"
             + reader.account_identity_commitment,
@@ -717,6 +812,24 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
             },
             "availableHistoryHint": history_hint,
             "anchorIndex": anchor_index,
+            "coverage": {
+                "hasMore": has_more,
+                "scanHasMore": scan_has_more,
+                "returnedAllScanned": len(selected) == len(scanned),
+                "unreadableContentCount": content_gaps,
+                "snapshotScope": "per_call_local_snapshot",
+            },
+            "search": ({
+                "contains": contains,
+                "matchedInScan": match_count,
+                "status": "matched" if match_count else "not_found_in_page" if scan_has_more else "indeterminate_content_gaps" if content_gaps else "not_found_in_remaining_window" if cursor else "not_found_in_requested_window",
+                "searchableContent": "decoded_message_text",
+            } if contains else None),
+            "continuation": ({
+                "purpose": "continue_matching_contexts" if contains else "next_context_page",
+                "command": "context", "account": label,
+                "contact": args.contact, "cursor": next_cursor,
+            } if next_cursor else None),
             "messages": messages,
             "quotedMessages": quote_targets,
             "mediaCounts": dict(sorted(media_counts.items())),
@@ -789,14 +902,19 @@ def command_moments(args: argparse.Namespace) -> int:
                         }
                     )
             moments.append(projected)
+        target_cached_rows = int(source.get("targetCachedRows") or len(moments))
         target_cache_status = (
             "target_cached"
             if contact is not None and moments
+            else "target_cached_outside_requested_window"
+            if contact is not None and target_cached_rows
+            else "target_cache_unreadable"
+            if contact is not None and source.get("gaps")
             else "target_not_in_current_local_cache"
             if contact is not None
             else "account_cache_read"
         )
-        if contact is not None and not moments:
+        if target_cache_status == "target_not_in_current_local_cache":
             gaps.append(
                 {
                     "kind": "target_moments_not_in_current_local_cache",
@@ -820,6 +938,11 @@ def command_moments(args: argparse.Namespace) -> int:
             "matchedRows": source.get("matchedRows"),
             "returnedMoments": len(moments),
             "targetCacheStatus": target_cache_status,
+            "targetCachedRows": target_cached_rows if contact is not None else None,
+            "targetCachedWindow": {
+                "sinceS": source.get("targetEarliestTimeS"),
+                "untilS": source.get("targetLatestTimeS"),
+            } if contact is not None else None,
             "hasMoreCurrentCache": source.get("hasMoreCurrentCache"),
             "moments": moments,
             "gaps": gaps,
@@ -837,6 +960,9 @@ def command_media_open(args: argparse.Namespace) -> int:
     output = Path(args.output)
     if output.exists():
         raise ProductError("media_output_already_exists")
+    temporary = output.with_name(output.name + ".incomplete")
+    if temporary.exists():
+        raise ProductError("media_output_incomplete_exists")
     cutoff_s = int(time.time())
     config = _read_config(_resolve_config_path(getattr(args, "config", None)))
     account = config[args.account]
@@ -846,7 +972,6 @@ def command_media_open(args: argparse.Namespace) -> int:
         if args.voice_wav and resolved.get("kind") != "voice":
             raise ProductError("media_is_not_voice")
         output.parent.mkdir(parents=True, exist_ok=True)
-        temporary = output.with_name(output.name + ".incomplete")
         if args.voice_wav:
             if not _is_tencent_silk(data):
                 raise ProductError("wechat_voice_format_unsupported")
@@ -1008,6 +1133,8 @@ def _is_tencent_silk(value: bytes) -> bool:
 
 
 def _decode_voice_file(source: Path, output: Path) -> None:
+    if output.exists():
+        raise ProductError("voice_decode_output_already_exists")
     completed = subprocess.run(
         [
             *_voice_interpreter_command(),
@@ -1721,14 +1848,17 @@ def _sync_message_media(
             if not wav_target.is_file():
                 temporary = wav_target.with_name(wav_target.name + ".incomplete")
                 wav_target.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    _decode_voice_file(target, temporary)
-                    temporary.replace(wav_target)
-                except ProductError as exc:
-                    media["voiceWavGap"] = str(exc)
-                    temporary.unlink(missing_ok=True)
+                if temporary.exists():
+                    media["voiceWavGap"] = "voice_decode_output_already_exists"
                 else:
-                    counters["voiceWavCreated"] += 1
+                    try:
+                        _decode_voice_file(target, temporary)
+                        temporary.replace(wav_target)
+                    except ProductError as exc:
+                        media["voiceWavGap"] = str(exc)
+                        temporary.unlink(missing_ok=True)
+                    else:
+                        counters["voiceWavCreated"] += 1
             if wav_target.is_file():
                 wav = wav_target.read_bytes()
                 media["derivedVoiceWav"] = {
@@ -1759,7 +1889,7 @@ def _verify_contact_fast_path_archive(
     manifest: Mapping[str, Any],
     state: Mapping[str, Any],
 ) -> None:
-    """Validate committed contact-export bindings before reporting no change.
+    """Validate committed contact-export bindings before an incremental refresh.
 
     Any drift fails precisely.  The command cannot prove that differing bytes
     are disposable generated residue, so it must not overwrite them silently.
@@ -1813,6 +1943,15 @@ def _verify_contact_fast_path_archive(
         raise ProductError("sync_records_sha256_mismatch")
     if len(_read_jsonl(records_path)) != manifest_count:
         raise ProductError("sync_records_count_mismatch")
+    media_errors: set[str] = set()
+    _verify_export_records(
+        output,
+        records_path,
+        media_errors,
+        {"recordCount": 0, "mediaFilesChecked": 0},
+    )
+    if media_errors:
+        raise ProductError(sorted(media_errors)[0])
 
     for relative_path, hash_key, size_key, error_prefix in (
         ("context.md", "archiveSha256", "archiveBytes", "sync_context"),
@@ -1900,6 +2039,19 @@ def command_sync_contact(args: argparse.Namespace) -> int:
             ):
                 raise ProductError("sync_identity_mismatch")
             mode = "full_reconcile" if getattr(args, "full_reconcile", False) else "incremental"
+            manifest_path = output / "manifest.json"
+            if mode != "full_reconcile":
+                try:
+                    manifest = _read_json(manifest_path)
+                except ProductError as exc:
+                    raise ProductError("sync_manifest_invalid") from exc
+                if manifest is None:
+                    raise ProductError("sync_manifest_invalid")
+                _verify_contact_fast_path_archive(
+                    output,
+                    manifest,
+                    existing_state,
+                )
             prior_sort = existing_state.get("sortSeqWatermark")
             prior_time = int(existing_state.get("lastCreateTimeS") or 0)
             replay_floor = existing_state.get("sortSeqReplayFloor")
@@ -1923,11 +2075,11 @@ def command_sync_contact(args: argparse.Namespace) -> int:
                 fetch_sort_cursor = None
         else:
             mode = "full"
+            manifest = None
             prior_sort = None
             fetch_sort_cursor = None
             source_catalog_unchanged = False
             since_s = None
-        manifest_path = output / "manifest.json"
         if (
             existing_state is not None
             and mode != "full_reconcile"
@@ -1937,17 +2089,8 @@ def command_sync_contact(args: argparse.Namespace) -> int:
             if verified_fingerprint.get("sha256") != source_fingerprint.get("sha256"):
                 source_fingerprint = verified_fingerprint
             else:
-                try:
-                    manifest = _read_json(manifest_path)
-                except ProductError as exc:
-                    raise ProductError("sync_manifest_invalid") from exc
                 if manifest is None:
                     raise ProductError("sync_manifest_invalid")
-                _verify_contact_fast_path_archive(
-                    output,
-                    manifest,
-                    existing_state,
-                )
                 receipt = {
                     "status": "success",
                     "mode": "incremental",
@@ -2862,13 +3005,14 @@ def _add_context_arguments(command: argparse.ArgumentParser) -> None:
         "--account", choices=("auto", *ACCOUNT_LABELS), default="auto"
     )
     command.add_argument("--contact", required=True)
-    command.add_argument("--since")
-    command.add_argument("--until")
-    command.add_argument("--around")
-    command.add_argument("--contains")
+    command.add_argument("--since", help="inclusive ISO date/time; naive values use Asia/Shanghai")
+    command.add_argument("--until", help="inclusive ISO date/time; fixed across continuation pages")
+    command.add_argument("--around", help="select messages nearest this ISO date/time within the requested window")
+    command.add_argument("--contains", help="match decoded text in this page; follow continuation while status is partial")
+    command.add_argument("--cursor", help="opaque continuation.cursor from the same account, contact and query")
     command.add_argument("--lookback-days", type=int, default=7)
-    command.add_argument("--scan-limit", type=int, default=120)
-    command.add_argument("--return-limit", type=int, default=24)
+    command.add_argument("--scan-limit", type=int, default=120, help="maximum messages examined per page, 1-500 (default: 120)")
+    command.add_argument("--return-limit", type=int, default=24, help="maximum context messages returned, 1-80 (default: 24)")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -2983,6 +3127,54 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
+def _failure_details(exc: Exception) -> dict[str, Any]:
+    """Give callers a bounded recovery hint without exposing exception payloads."""
+
+    reason = str(exc)
+    retryable = False
+    if reason == "source_changed_during_sync_retry" or type(exc).__name__ == "SnapshotCopyError":
+        action = "retry_same_command"
+        retryable = True
+    elif reason.startswith("context_cursor_") or reason == "message_page_cursor_invalid":
+        action = "restart_context_without_cursor"
+    elif reason in {
+        "time_value_invalid", "time_window_reversed", "scan_limit_invalid",
+        "return_limit_invalid", "lookback_days_invalid",
+        "context_anchor_outside_requested_window", "moments_limit_invalid",
+        "moments_time_window_reversed",
+    }:
+        action = "correct_query_arguments"
+    elif reason == "contact_not_found":
+        action = "check_exact_contact_and_account"
+    elif reason in {"media_output_incomplete_exists", "voice_decode_output_already_exists"}:
+        action = "inspect_existing_output_or_choose_new_output"
+    elif reason == "sync_output_not_initialized":
+        action = "inspect_incomplete_export_or_choose_empty_output"
+    elif reason == "sync_already_running_or_stale_lock":
+        action = "inspect_export_lock_and_running_process"
+    elif (reason.startswith("sync_") and "mismatch" in reason) or reason.startswith("export_"):
+        action = "verify_existing_export_before_rebuilding"
+    elif reason in {"session_database_unavailable", "contact_database_unavailable"}:
+        action = "check_selected_account_local_database"
+    elif type(exc).__name__ == "SessionMessageDatabaseMissingError":
+        action = "check_selected_chat_local_history"
+    elif isinstance(exc, WeChatDirectError):
+        action = "check_configured_local_reader"
+    elif isinstance(exc, ProductError) and reason.startswith("wechat_"):
+        action = "run_doctor"
+    else:
+        action = "inspect_error_before_retrying"
+    result: dict[str, Any] = {"retryable": retryable, "nextAction": action}
+    if isinstance(exc, WeChatDirectError) and reason in {
+        "session_database_unavailable", "contact_database_unavailable",
+        "message_identity_is_conflicting", "incremental_time_index_unavailable",
+        "incremental_sort_seq_index_unavailable", "bounded_context_sort_index_unavailable",
+        "sort_seq_cursor_regressed_requires_full_reconcile",
+    }:
+        result["reason"] = reason
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
@@ -3000,9 +3192,15 @@ def main(argv: list[str] | None = None) -> int:
             payload = {
                 "status": "failed",
                 "error": message
-                if isinstance(exc, ProductError)
+                if isinstance(exc, ProductError) or (
+                    isinstance(exc, ValueError) and message in {
+                        "message_page_cursor_invalid", "moments_limit_invalid",
+                        "moments_time_window_reversed",
+                    }
+                )
                 else type(exc).__name__,
             }
+            payload.update(_failure_details(exc))
         sys.stdout.buffer.write(_canonical_bytes(payload))
         return 2
 

@@ -1182,6 +1182,7 @@ class DirectWeChatReader:
         config_path: Path | str,
         local_state_path: Path | str,
         snapshot_cutoff_s: int | None = None,
+        expected_self_username_sha256: str | None = None,
     ):
         account_root, master_hex, identity = load_direct_source_identity(
             config_path, local_state_path
@@ -1193,6 +1194,7 @@ class DirectWeChatReader:
             raise SnapshotCopyError("local account database storage is missing")
         self._master_hex = master_hex
         self._identity = identity
+        self._expected_self_username_sha256 = expected_self_username_sha256
         self.account_identity_commitment = hashlib.sha256(
             identity.encode("utf-8")
         ).hexdigest()
@@ -1205,7 +1207,7 @@ class DirectWeChatReader:
         self._message_schema_probe_pages: dict[Path, int] = {}
         self._message_self_sender_cache: dict[tuple[Path, str | None], str | None] = {}
         self._sender_index_cache: dict[int, str] | None = None
-        self._sender_index_by_message_directory_cache: (
+        self._sender_index_by_message_source_cache: (
             dict[Path, dict[int, str]] | None
         ) = None
         self._resource_index_cache: (
@@ -1220,7 +1222,7 @@ class DirectWeChatReader:
 
     @property
     def self_native_id(self) -> str:
-        """Return the account's source-proven native identity."""
+        """Legacy accessor for the configured account storage identity."""
 
         return self._identity
 
@@ -2175,26 +2177,20 @@ class DirectWeChatReader:
         return self._sender_index_cache
 
     def _sender_index_for_message_source(self, source: Path) -> dict[int, str]:
-        """Return only unambiguous native sender names beside one message shard.
+        """Resolve real_sender_id in the exact message shard's Name2Id.
 
-        ``real_sender_id`` is local to a physical message directory.  The
-        existing global index is useful for display, but an ID from another
-        directory must not change a private message's direction.  This map
-        therefore uses only the sibling ``message_resource.db``.
+        Message shards and resource databases have independent rowid spaces,
+        even when they occupy the same directory.
         """
 
-        if self._sender_index_by_message_directory_cache is None:
-            self._sender_index_by_message_directory_cache = {}
-        cached = self._sender_index_by_message_directory_cache.get(source.parent)
+        if self._sender_index_by_message_source_cache is None:
+            self._sender_index_by_message_source_cache = {}
+        cached = self._sender_index_by_message_source_cache.get(source)
         if cached is not None:
             return cached
-        resource_source = source.parent / "message_resource.db"
-        if not resource_source.is_file():
-            self._sender_index_by_message_directory_cache[source.parent] = {}
-            return {}
         try:
-            rows = self._open(resource_source).execute(
-                "SELECT rowid, user_name FROM SenderName2Id"
+            rows = self._open(source).execute(
+                "SELECT rowid, user_name FROM Name2Id"
             )
             result = {
                 int(rowid): str(username)
@@ -2202,11 +2198,19 @@ class DirectWeChatReader:
                 if username
             }
         except sqlite3.DatabaseError:
-            # An optional or unreadable local sender dictionary cannot
-            # establish direction for the paired message shard.
+            # A missing dictionary cannot be replaced by another ID space.
             result = {}
-        self._sender_index_by_message_directory_cache[source.parent] = result
+        self._sender_index_by_message_source_cache[source] = result
         return result
+
+    def _is_self_username(self, username: str) -> bool | None:
+        """Match a native username, never infer it from a storage suffix."""
+
+        expected = self._expected_self_username_sha256
+        if expected is None:
+            return None
+        actual = "sha256:" + hashlib.sha256(username.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(actual, expected)
 
     def _resource_index(
         self,
@@ -3437,7 +3441,6 @@ class DirectWeChatReader:
         connection: sqlite3.Connection,
         row: sqlite3.Row,
         *,
-        private_session: bool = False,
         message_table: str | None = None,
         strict_group_projection: bool = False,
         group_shard_key: str | None = None,
@@ -3487,16 +3490,15 @@ class DirectWeChatReader:
             )
             else None
         )
-        # Private message shards can carry statuses that are not the formal
+        # Message shards can carry statuses that are not the formal
         # 2/4 direction pair.  Their ``real_sender_id`` still has a precise,
-        # source-local relationship to ``SenderName2Id`` in the sibling
-        # resource database.  A same-table status-2 calibration remains the
+        # source-local relationship to ``Name2Id`` in this message database.
+        # A same-table status-2 calibration remains the
         # stronger fact for its known status family; the local dictionary only
         # fills the rows that calibration cannot reach.  No content,
         # chronology, or majority inference enters this decision.
         if (
-            private_session
-            and not strict_group_projection
+            not strict_group_projection
             and base_type != 10000
             and native_status not in {_OUTGOING_MESSAGE_STATUS, _INCOMING_MESSAGE_STATUS}
             and not (
@@ -3510,8 +3512,11 @@ class DirectWeChatReader:
                 if sender_key is not None
                 else None
             )
-            if sender_name is not None:
-                mapped_role = "self" if sender_name == self._identity else "other"
+            native_is_self = (
+                self._is_self_username(sender_name) if sender_name is not None else None
+            )
+            if native_is_self is not None:
+                mapped_role = "self" if native_is_self else "other"
                 return (
                     base_type,
                     mapped_role,
@@ -3574,37 +3579,35 @@ class DirectWeChatReader:
         server_id = row["server_id"]
         local_id = row["local_id"]
         sender_id = row["real_sender_id"]
-        try:
-            sender_key = int(sender_id)
-        except (TypeError, ValueError):
-            sender_key = None
+        valid_sender_key = _valid_sender_key(sender_id)
+        sender_key = int(valid_sender_key) if valid_sender_key is not None else None
         base_type, sender_role, direction, is_send = self._message_row_sender_role(
             message_source,
             connection,
             row,
-            private_session=(
-                not session_native_id.casefold().endswith("@chatroom")
-                and not session_native_id.casefold().startswith("gh_")
-            ),
             message_table=message_table,
             strict_group_projection=strict_group_projection,
             group_shard_key=group_shard_key,
             group_self_sender_receipt=group_self_sender_receipt,
         )
         sender = (
-            self._identity
-            if sender_role == "self"
-            else sender_index.get(sender_key)
-            if sender_role == "other" and sender_key is not None
+            sender_index.get(sender_key)
+            if sender_role in {"self", "other"} and sender_key is not None
             else "system"
             if sender_role == "system"
             else None
         )
+        if sender and sender_role in {"self", "other"}:
+            native_is_self = self._is_self_username(sender)
+            if (native_is_self is None and sender_role == "self") or (
+                native_is_self is not None and native_is_self != (sender_role == "self")
+            ):
+                sender = None
         content, payload_texts, compressed_gap = _message_content_projection(
             row, base_type
         )
         message: dict[str, Any] = {
-            "serverId": server_id,
+            "serverId": str(server_id) if server_id is not None else None,
             "localId": local_id,
             "localType": row["local_type"],
             "sortSeq": row["sort_seq"],
@@ -3619,7 +3622,7 @@ class DirectWeChatReader:
         }
         if sender:
             message["senderUsername"] = sender
-        elif sender_role == "other":
+        elif sender_role in {"self", "other"}:
             message["senderGap"] = "sender_mapping_unresolved"
         elif sender_role == "unknown":
             message["directionGap"] = "message_status_unproven"
@@ -3658,7 +3661,10 @@ class DirectWeChatReader:
         )
         if media:
             message["media_manifest"] = media
-        if strict_group_projection and local_id not in (None, 0, "0"):
+        if (
+            (strict_group_projection or server_id in (None, 0, "0"))
+            and local_id not in (None, 0, "0")
+        ):
             # The source's local id remains the stable output identity even if
             # a later native amendment fills in SERVERID.  SERVERID is still
             # used internally for reply/quote resolution and cross-shard

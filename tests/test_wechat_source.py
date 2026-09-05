@@ -88,7 +88,7 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
         reader._storage = storage
         reader.account_identity_commitment = "a" * 64
         reader._connections = {}
-        reader._sender_index_by_message_directory_cache = None
+        reader._sender_index_by_message_source_cache = None
 
         def open_source(source: Path) -> sqlite3.Connection:
             cached = reader._connections.get(source)
@@ -115,25 +115,22 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
         reader._identity = "wxid-account_suffix"
         self.assertEqual(reader.moments_self_native_id, "wxid-account_suffix")
 
-    def test_sender_name_dictionary_is_message_directory_local(self):
+    def test_sender_name_dictionary_is_message_shard_local(self):
         with tempfile.TemporaryDirectory() as temporary:
             storage = Path(temporary)
             first_dir = storage / "message" / "first"
-            second_dir = storage / "message" / "second"
+            second_dir = first_dir
             first_dir.mkdir(parents=True)
-            second_dir.mkdir(parents=True)
             first_message = first_dir / "message_0.db"
             second_message = second_dir / "message_1.db"
-            first_message.touch()
-            second_message.touch()
-            for directory, username in (
-                (first_dir, "wxid-first"),
-                (second_dir, "wxid-second"),
+            for source, username in (
+                (first_message, "wxid-first"),
+                (second_message, "wxid-second"),
             ):
-                connection = sqlite3.connect(directory / "message_resource.db")
-                connection.execute("CREATE TABLE SenderName2Id(user_name TEXT)")
+                connection = sqlite3.connect(source)
+                connection.execute("CREATE TABLE Name2Id(user_name TEXT)")
                 connection.execute(
-                    "INSERT INTO SenderName2Id(rowid, user_name) VALUES(1, ?)",
+                    "INSERT INTO Name2Id(rowid, user_name) VALUES(1, ?)",
                     (username,),
                 )
                 connection.commit()
@@ -200,7 +197,6 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
                 Path("message_0.db"),
                 connection,
                 row,
-                private_session=False,
                 message_table="Msg_selected",
             )
         finally:
@@ -304,6 +300,7 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
         ).fetchone()
         reader = object.__new__(DirectWeChatReader)
         reader._identity = "wxid-synthetic-self"
+        reader._expected_self_username_sha256 = None
         reader._media_entries = lambda *_args, **_kwargs: []
         try:
             message = reader._message_from_row(

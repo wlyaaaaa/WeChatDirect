@@ -286,6 +286,17 @@ class WeChatCliTests(unittest.TestCase):
             ):
                 wechat_cli._read_config(path)
 
+    def test_reader_binds_each_accounts_existing_native_username_commitment(self):
+        for label, account in self.config.items():
+            with self.subTest(label=label), patch(
+                "wechat_cli.DirectWeChatReader", return_value=FakeReader(label)
+            ) as constructor:
+                wechat_cli._reader(account, 200)
+                self.assertEqual(
+                    constructor.call_args.kwargs["expected_self_username_sha256"],
+                    account["expected_moments_author_sha256"],
+                )
+
     def test_moments_self_rejects_wrong_author_commitment(self):
         reader = FakeReader("primary")
         account = dict(self.config["primary"])
@@ -884,7 +895,100 @@ class WeChatCliTests(unittest.TestCase):
             self.assertIsNone(created[0].fetch_calls[0]["since_sort_seq"])
             self.assertIsNotNone(created[1].fetch_calls[0]["since_sort_seq"])
             records = wechat_cli._read_jsonl(destination / "messages.jsonl")
-            self.assertEqual([item["serverId"] for item in records], [10, 11, 12])
+            self.assertEqual([item["serverId"] for item in records], ["10", "11", "12"])
+
+    def test_sender_upgrade_rechecks_old_archive_once_and_preserves_missing_rows(self):
+        for local_only, explicit_full in ((False, False), (True, False), (False, True)):
+            with self.subTest(local_only=local_only, explicit_full=explicit_full), tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary) / "contact"
+                phase = {"old": True}
+                created = []
+
+                def factory(account, cutoff_s):
+                    reader = FakeReader(str(account["config_path"]))
+                    base_fetch = reader.fetch_messages
+
+                    def fetch(*args, **kwargs):
+                        result = base_fetch(*args, **kwargs)
+                        for item in result["messages"]:
+                            item.pop("media_manifest", None)
+                            if local_only:
+                                item["serverId"] = "0"
+                                if not phase["old"]:
+                                    item["shardLocalIdentity"] = "sha256:" + str(item["localId"]) * 64
+                        if phase["old"]:
+                            result["messages"][0].update(senderRole="other", senderUsername="wxid-old-wrong")
+                        else:
+                            # The second archived message is no longer visible.
+                            result["messages"] = result["messages"][:1]
+                            result["messages"][0].update(senderRole="self", senderUsername="wxid-primary")
+                        return result
+
+                    reader.fetch_messages = fetch
+                    created.append(reader)
+                    return reader
+
+                args = argparse.Namespace(
+                    config="unused", account="primary", contact="测试联系人",
+                    output=str(output), since=None, until=None,
+                    overlap_seconds=60, full_reconcile=explicit_full,
+                )
+
+                def run(version):
+                    with (
+                        patch("wechat_cli._read_config", return_value=self.config),
+                        patch("wechat_cli._reader", side_effect=factory),
+                        patch("wechat_cli.time.time", return_value=200),
+                        patch("wechat_cli.SENDER_IDENTITY_VERSION", version),
+                        patch.object(wechat_cli.sys, "stdout", BinaryOutput()),
+                    ):
+                        return wechat_cli.command_sync_contact(args)
+
+                self.assertEqual(run("old-dictionary-version"), 0)
+                phase["old"] = False
+                current = wechat_cli.SENDER_IDENTITY_VERSION
+                context_path = output / "context.md"
+                saved_context = context_path.read_bytes()
+                context_path.write_text("user modification", encoding="utf-8")
+                with self.assertRaisesRegex(wechat_cli.ProductError, "sync_context_sha256_mismatch"):
+                    run(current)
+                self.assertEqual(context_path.read_text(encoding="utf-8"), "user modification")
+                self.assertFalse(created[-1].fetch_calls)
+                context_path.write_bytes(saved_context)
+
+                self.assertEqual(run(current), 0)
+                receipt = wechat_cli._read_json(output / "last-run.json")
+                self.assertEqual(receipt["mode"], "full_reconcile" if explicit_full else "sender_identity_reconcile")
+                self.assertIsNone(created[-1].fetch_calls[0]["since_s"])
+                self.assertIsNone(created[-1].fetch_calls[0]["since_sort_seq"])
+                self.assertEqual(receipt["totalMessages"], 2)
+                self.assertEqual(receipt["newMessages"], 0)
+                self.assertEqual(receipt["senderIdentityUnrecheckedRetainedCount"], 1)
+                records = wechat_cli._read_jsonl(output / "messages.jsonl")
+                self.assertEqual(records[0]["senderRole"], "self")
+                self.assertEqual(records[0]["senderUsername"], "wxid-primary")
+                self.assertEqual(records[1]["senderRole"], "unknown")
+                self.assertIn("previousSenderAttribution", records[1])
+                self.assertEqual(records[1]["senderIdentityRecheckGap"], "source_message_unavailable")
+                self.assertEqual(records[1]["messageSha256"], wechat_cli._sha256(
+                    wechat_cli._canonical_bytes({
+                        key: value for key, value in records[1].items()
+                        if key not in {"nativeId", "messageSha256", "sender", "_pageKey"}
+                    })
+                ))
+                self.assertIn("身份未重核", context_path.read_text(encoding="utf-8"))
+                for filename in ("manifest.json", "state.json"):
+                    saved = wechat_cli._read_json(output / filename)
+                    self.assertEqual(saved["senderIdentityVersion"], current)
+                    self.assertEqual(saved["senderIdentityUnrecheckedRetainedCount"], 1)
+                before = (output / "messages.jsonl").read_bytes()
+                args.full_reconcile = False
+                self.assertEqual(run(current), 0)
+                self.assertFalse(created[-1].fetch_calls)
+                receipt = wechat_cli._read_json(output / "last-run.json")
+                self.assertTrue(receipt["sourceMetadataFastPath"])
+                self.assertEqual(receipt["senderIdentityUnrecheckedRetainedCount"], 1)
+                self.assertEqual(before, (output / "messages.jsonl").read_bytes())
 
     def test_manifest_is_published_before_state_commit_marker(self):
         with tempfile.TemporaryDirectory() as temporary:

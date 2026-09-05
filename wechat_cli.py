@@ -46,6 +46,7 @@ MAX_AI_CONTEXT_BYTES = 128 * 1024
 MAX_AI_ITEM_CHARS = 32 * 1024
 MAX_AI_MEDIA_OCCURRENCES_PER_MESSAGE = 32
 VOICE_DECODER = Path(__file__).with_name("voice_decode.py")
+SENDER_IDENTITY_VERSION = "message-shard-name2id-v1"
 
 
 class ProductError(RuntimeError):
@@ -167,6 +168,7 @@ def _reader(account: Mapping[str, str], cutoff_s: int) -> DirectWeChatReader:
         config_path=account["config_path"],
         local_state_path=account["local_state_path"],
         snapshot_cutoff_s=cutoff_s,
+        expected_self_username_sha256=account["expected_moments_author_sha256"],
     )
     actual = "sha256:" + reader.account_identity_commitment
     expected = str(account["expected_source_identity_sha256"])
@@ -494,6 +496,9 @@ def _message_receipt(
 ) -> dict[str, Any]:
     result = dict(message)
     result.pop("_pageKey", None)
+    if result.get("serverId") is not None:
+        result["serverId"] = str(result["serverId"])
+    result["senderIdentityVersion"] = SENDER_IDENTITY_VERSION
     message_body = dict(result)
     result["nativeId"] = _message_native_id(message)
     result["messageSha256"] = _sha256(_canonical_bytes(message_body))
@@ -1865,6 +1870,8 @@ def _message_export_key(message: Mapping[str, Any]) -> str:
     if isinstance(identity, Mapping) and identity.get("kind") and identity.get("value"):
         if str(identity["kind"]) == "server":
             return "server:" + str(identity["value"])
+        if message.get("shardLocalIdentity"):
+            return "local:" + str(message["shardLocalIdentity"])
         local_basis = "\0".join(
             (
                 str(identity["value"]),
@@ -1875,6 +1882,38 @@ def _message_export_key(message: Mapping[str, Any]) -> str:
         )
         return "local:" + hashlib.sha256(local_basis.encode("utf-8")).hexdigest()
     return "sha256:" + hashlib.sha256(_canonical_bytes(message)).hexdigest()
+
+
+def _remap_legacy_local_sender_keys(
+    merged: dict[str, dict[str, Any]], candidates: list[dict[str, Any]],
+) -> None:
+    """Match old local-only records without using their incorrect sender names."""
+
+    def local_basis(message: Mapping[str, Any]) -> tuple[str, str, str] | None:
+        identity = message.get("nativeId") or {}
+        if identity.get("kind") != "local" or not identity.get("value"):
+            return None
+        return (str(identity["value"]), str(message.get("createTime")),
+                str(message.get("sortSeq")))
+
+    old_keys: dict[tuple[str, str, str], list[str]] = {}
+    new_keys: dict[tuple[str, str, str], list[str]] = {}
+    for key, message in merged.items():
+        basis = local_basis(message)
+        if basis is not None and message.get("senderIdentityVersion") != SENDER_IDENTITY_VERSION:
+            old_keys.setdefault(basis, []).append(key)
+    for message in candidates:
+        basis = local_basis(message)
+        if basis is not None:
+            new_keys.setdefault(basis, []).append(_message_export_key(message))
+    for basis in old_keys.keys() & new_keys.keys():
+        if len(old_keys[basis]) != 1 or len(new_keys[basis]) != 1:
+            raise ProductError("sync_local_message_identity_ambiguous")
+        previous_key, current_key = old_keys[basis][0], new_keys[basis][0]
+        if previous_key != current_key:
+            if current_key in merged:
+                raise ProductError("sync_local_message_identity_ambiguous")
+            merged[current_key] = merged.pop(previous_key)
 
 
 def _ordered_messages(values: Mapping[str, Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -2177,11 +2216,20 @@ def command_sync_contact(args: argparse.Namespace) -> int:
                 raise ProductError("sync_identity_mismatch")
             mode = "full_reconcile" if getattr(args, "full_reconcile", False) else "incremental"
             manifest_path = output / "manifest.json"
-            if mode != "full_reconcile":
-                try:
-                    manifest = _read_json(manifest_path)
-                except ProductError as exc:
+            state_has_legacy_senders = (
+                existing_state.get("senderIdentityVersion") != SENDER_IDENTITY_VERSION
+            )
+            try:
+                manifest = _read_json(manifest_path)
+            except ProductError as exc:
+                if mode != "full_reconcile" or state_has_legacy_senders:
                     raise ProductError("sync_manifest_invalid") from exc
+                manifest = None
+            legacy_senders = state_has_legacy_senders or (
+                manifest is not None
+                and manifest.get("senderIdentityVersion") != SENDER_IDENTITY_VERSION
+            )
+            if mode != "full_reconcile" or legacy_senders:
                 if manifest is None:
                     raise ProductError("sync_manifest_invalid")
                 _verify_contact_fast_path_archive(
@@ -2189,6 +2237,8 @@ def command_sync_contact(args: argparse.Namespace) -> int:
                     manifest,
                     existing_state,
                 )
+                if legacy_senders and mode != "full_reconcile":
+                    mode = "sender_identity_reconcile"
             prior_sort = existing_state.get("sortSeqWatermark")
             prior_time = int(existing_state.get("lastCreateTimeS") or 0)
             replay_floor = existing_state.get("sortSeqReplayFloor")
@@ -2196,7 +2246,7 @@ def command_sync_contact(args: argparse.Namespace) -> int:
                 existing_state.get("messageSourceCatalogSha256")
                 == source_fingerprint.get("messageSourceCatalogSha256")
             )
-            if mode == "full_reconcile":
+            if mode in {"full_reconcile", "sender_identity_reconcile"}:
                 since_s = None
                 fetch_sort_cursor = None
             elif (
@@ -2219,7 +2269,7 @@ def command_sync_contact(args: argparse.Namespace) -> int:
             since_s = None
         if (
             existing_state is not None
-            and mode != "full_reconcile"
+            and mode == "incremental"
             and existing_state.get("sourceFingerprint") == source_fingerprint.get("sha256")
         ):
             verified_fingerprint = reader.contact_source_fingerprint(contact_native_id)
@@ -2233,6 +2283,10 @@ def command_sync_contact(args: argparse.Namespace) -> int:
                     "mode": "incremental",
                     "noChange": True,
                     "sourceMetadataFastPath": True,
+                    "senderIdentityVersion": SENDER_IDENTITY_VERSION,
+                    "senderIdentityUnrecheckedRetainedCount": int(
+                        manifest.get("senderIdentityUnrecheckedRetainedCount") or 0
+                    ),
                     "account": label,
                     "accountIdentityCommitment": commitment,
                     "contact": contact,
@@ -2319,6 +2373,7 @@ def command_sync_contact(args: argparse.Namespace) -> int:
         ]
         existing_rows = _read_jsonl(records_path)
         merged = {_message_export_key(item): item for item in existing_rows}
+        _remap_legacy_local_sender_keys(merged, candidates)
         new_count = 0
         updated_count = 0
         media_totals = {
@@ -2351,7 +2406,31 @@ def command_sync_contact(args: argparse.Namespace) -> int:
             else:
                 updated_count += 1
             merged[key] = projected
+        for previous in merged.values():
+            if (
+                previous.get("senderIdentityVersion") != SENDER_IDENTITY_VERSION
+                and not previous.get("senderIdentityRecheckGap")
+            ):
+                # Preserve the archived body and old attribution as evidence;
+                # an unavailable source cannot certify that old attribution.
+                previous["previousSenderAttribution"] = {
+                    key: previous.get(key)
+                    for key in ("senderRole", "senderUsername", "direction", "isSend", "sender")
+                }
+                previous.pop("senderUsername", None)
+                if previous.get("serverId") is not None:
+                    previous["serverId"] = str(previous["serverId"])
+                previous.update(senderRole="unknown", direction="unknown", isSend=None)
+                previous["sender"] = {"role": "unknown", "nativeId": None,
+                                      "displayName": "身份未重核"}
+                previous["senderIdentityRecheckGap"] = "source_message_unavailable"
+                previous["messageSha256"] = _sha256(_canonical_bytes({
+                    key: value for key, value in previous.items()
+                    if key not in {"nativeId", "messageSha256", "sender", "_pageKey"}
+                }))
+                updated_count += 1
         ordered = _ordered_messages(merged)
+        unrechecked_senders = sum(bool(item.get("senderIdentityRecheckGap")) for item in ordered)
         metadata_changed = existing_state is not None and existing_state.get(
             "contact"
         ) != _safe_contact(contact, label)
@@ -2404,7 +2483,7 @@ def command_sync_contact(args: argparse.Namespace) -> int:
         sort_cursor_eligible = (
             int(source_fingerprint.get("messageSourceCount") or 0) == 1
             and (
-                mode in {"full", "full_reconcile"}
+                mode in {"full", "full_reconcile", "sender_identity_reconcile"}
                 or (
                     bool(existing_state and existing_state.get("sortCursorEligible"))
                     and source_catalog_unchanged
@@ -2429,6 +2508,8 @@ def command_sync_contact(args: argparse.Namespace) -> int:
         )
         state = {
             "format": "wechat-direct-contact-sync.v1",
+            "senderIdentityVersion": SENDER_IDENTITY_VERSION,
+            "senderIdentityUnrecheckedRetainedCount": unrechecked_senders,
             "account": label,
             "accountIdentityCommitment": commitment,
             "contactNativeId": contact_native_id,
@@ -2457,12 +2538,16 @@ def command_sync_contact(args: argparse.Namespace) -> int:
         ai_context_bytes = ai_context_path.read_bytes()
         manifest = {
             "format": "wechat-direct-contact-export.v1",
+            "senderIdentityVersion": SENDER_IDENTITY_VERSION,
+            "senderIdentityUnrecheckedRetainedCount": unrechecked_senders,
             "account": label,
             "accountIdentityCommitment": commitment,
             "contact": _safe_contact(contact, label),
             "historyScope": "full_local_history_then_indexed_cursor_overlap_increment",
             "historicalMutationCoverage": (
-                "explicit_full_reconcile"
+                "sender_identity_reconcile_current_local_history"
+                if mode == "sender_identity_reconcile"
+                else "explicit_full_reconcile"
                 if mode == "full_reconcile"
                 else "first_full_snapshot"
                 if mode == "full"
@@ -2509,6 +2594,8 @@ def command_sync_contact(args: argparse.Namespace) -> int:
             "status": "success",
             "mode": mode,
             "noChange": not changed,
+            "senderIdentityVersion": SENDER_IDENTITY_VERSION,
+            "senderIdentityUnrecheckedRetainedCount": unrechecked_senders,
             "account": label,
             "accountIdentityCommitment": commitment,
             "contact": _safe_contact(contact, label),

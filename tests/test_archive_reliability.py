@@ -158,7 +158,7 @@ class ArchiveIncrementReliabilityTests(unittest.TestCase):
                 "\n".join(
                     json.dumps(row, ensure_ascii=False, separators=(",", ":"))
                     for row in records
-                    if row["serverId"] != 1
+                    if row["serverId"] != "1"
                 )
                 + "\n",
                 encoding="utf-8",

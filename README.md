@@ -126,6 +126,10 @@ wechat-direct sync-contact --account primary --contact "<contact-or-group>" --fu
 
 第一次只在全新空目录中为点名对象建立本机可见档案。已有匹配 `manifest.json` 和 `state.json` 的完成态档案时，重复同一命令才会使用来源指纹、游标和有界重叠窗口增量刷新；需要重新核对全部本地历史时，可再次显式使用 `--full-reconcile`。它不是首次运行硬崩溃后的完整断点续跑，也不是全账号同步或常驻任务。
 
+说话人编号只在消息所在分片的 `Name2Id` 中解释；本人原生用户名按该账号既有用户名承诺匹配，不从账号目录后缀、昵称或其他数据库推断。主副账号、私聊和群聊共用此规则，消息 `serverId` 与 `nativeId.value` 始终以字符串返回，避免长整数精度丢失。
+
+旧版档案在下次运行同一对象的 `sync-contact` 时，先校验原档案，再自动重核该对象当前本机可见的全部历史，回执模式为 `sender_identity_reconcile`；完成后恢复普通增量。源中已不存在的旧消息保留正文和原归属证据，但现行说话人显示“身份未重核”，数量见 `senderIdentityUnrecheckedRetainedCount`。升级不会主动扫描或修改其他聊天档案。
+
 ### `moments`：读取当前本机朋友圈缓存
 
 ```powershell

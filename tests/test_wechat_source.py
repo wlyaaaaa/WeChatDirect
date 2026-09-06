@@ -279,6 +279,46 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
         self.assertEqual(payload_texts, ["可读正文"])
         self.assertEqual(_text_from_message(body_texts[0], 1), "可读正文")
 
+    def test_zstd_message_separator_is_normalized_by_text_type(self):
+        from compression import zstd
+
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT ? AS message_content, '' AS compress_content, "
+            "'' AS source, '' AS packed_info_data, '' AS origin_source",
+            (zstd.compress("可读\x14正文".encode("utf-8")),),
+        ).fetchone()
+        try:
+            body_texts, _payloads, gap = _message_payload_texts(row)
+        finally:
+            connection.close()
+        self.assertIsNone(gap)
+        self.assertEqual(body_texts, ["可读\x14正文"])
+        self.assertEqual(_text_from_message(body_texts[0], 1), "可读正文")
+
+    def test_zstd_app_projection_keeps_structural_nul_for_field_extraction(self):
+        from compression import zstd
+
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT ? AS message_content, '' AS compress_content, "
+            "'' AS source, '' AS packed_info_data, '' AS origin_source",
+            (
+                zstd.compress(
+                    "<msg><appmsg><title>标题</title>\x00"
+                    "<des>说明</des></appmsg></msg>".encode("utf-8")
+                ),
+            ),
+        ).fetchone()
+        try:
+            content, _payloads, gap = _message_content_projection(row, 49)
+        finally:
+            connection.close()
+        self.assertEqual(content, "标题\n说明")
+        self.assertIsNone(gap)
+
     def test_control_payload_is_never_exposed_as_plain_text(self):
         self.assertIsNone(_readable_payload_text("text\x00binary"))
         self.assertIsNone(_readable_payload_text(b"text\x00binary"))

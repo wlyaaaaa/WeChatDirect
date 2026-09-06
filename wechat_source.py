@@ -1104,13 +1104,11 @@ def _message_value_text(
     if isinstance(value, (bytes, bytearray, memoryview)):
         raw = bytes(value)
         if raw.find(b"\x28\xb5\x2f\xfd", 0, 64) >= 0:
-            text, gap = _decompress_message_text(raw)
-            return (
-                _safe_plain_text(
-                    text, normalize_message_separators=normalize_message_separators
-                ),
-                gap,
-            )
+            # Keep decompressed structure intact.  Type-aware projection below
+            # extracts app49 fields from XML that may contain structural NULs;
+            # ordinary text still receives control validation in
+            # _text_from_message.
+            return _decompress_message_text(raw)
     return (
         _readable_payload_text(
             value, normalize_message_separators=normalize_message_separators

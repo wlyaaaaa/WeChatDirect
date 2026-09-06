@@ -1003,6 +1003,9 @@ def _text_from_message(value: object, message_type: int | None) -> str | None:
             return call_status
         return None
     if message_type == 49:
+        transfer_status = _transfer_result_text(text)
+        if transfer_status:
+            return transfer_status
         fields = []
         for tag in ("title", "des", "url", "filename"):
             match = re.search(fr"<{tag}>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</{tag}>", text, re.S)
@@ -1011,6 +1014,46 @@ def _text_from_message(value: object, message_type: int | None) -> str | None:
                 fields.append(field)
         return "\n".join(dict.fromkeys(fields)) or None
     return None
+
+
+def _transfer_result_text(value: object) -> str | None:
+    """Project a transfer app body from its native settlement subtype."""
+
+    if not isinstance(value, str):
+        return None
+    title_match = re.search(
+        r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>",
+        value,
+        re.S | re.I,
+    )
+    title = _safe_plain_text(title_match.group(1)) if title_match else None
+    subtype_match = re.search(
+        r"<paysubtype>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</paysubtype>",
+        value,
+        re.S | re.I,
+    )
+    transfer_marker = bool(
+        subtype_match
+        or re.search(r"<(?:transferid|paymsgid|feedesc)>", value, re.I)
+        or title == "微信转账"
+    )
+    if not transfer_marker:
+        return None
+
+    subtype = _safe_plain_text(subtype_match.group(1)) if subtype_match else None
+    status = {
+        "1": "转账已发起",
+        "3": "转账已确认收款",
+        "4": "转账已退还",
+    }.get(subtype or "", "转账状态未知")
+    amount_match = re.search(
+        r"<feedesc>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</feedesc>",
+        value,
+        re.S | re.I,
+    )
+    amount = _safe_plain_text(amount_match.group(1)) if amount_match else None
+    suffix = f"，金额 {amount}" if amount else ""
+    return f"微信转账\n{status}{suffix}"
 
 
 def _call_result_text(value: object) -> str | None:

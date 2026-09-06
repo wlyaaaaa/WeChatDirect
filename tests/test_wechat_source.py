@@ -319,6 +319,40 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
         self.assertEqual(content, "标题\n说明")
         self.assertIsNone(gap)
 
+    def test_transfer_app_projects_native_settlement_subtype(self):
+        def transfer_xml(subtype: str) -> str:
+            return (
+                "<msg><appmsg><title><![CDATA[微信转账]]></title>"
+                "<des><![CDATA[收到转账194.00元。如需收钱，请点此升级]]></des>"
+                "<appattach><paysubtype>"
+                + subtype
+                + "</paysubtype><feedesc><![CDATA[￥194.00]]></feedesc>"
+                "<transferid>synthetic-transfer-id</transferid></appattach>"
+                "</appmsg></msg>"
+            )
+
+        projected = [_text_from_message(transfer_xml(value), 49) for value in ("1", "3", "4", "9")]
+        self.assertEqual(
+            projected,
+            [
+                "微信转账\n转账已发起，金额 ￥194.00",
+                "微信转账\n转账已确认收款，金额 ￥194.00",
+                "微信转账\n转账已退还，金额 ￥194.00",
+                "微信转账\n转账状态未知，金额 ￥194.00",
+            ],
+        )
+        self.assertNotIn("收到转账", projected[2])
+
+    def test_transfer_app_without_settlement_subtype_does_not_default_to_receipt(self):
+        content = _text_from_message(
+            "<msg><appmsg><title>微信转账</title>"
+            "<des>收到转账194.00元</des><appattach>"
+            "<feedesc>￥194.00</feedesc><transferid>synthetic</transferid>"
+            "</appattach></appmsg></msg>",
+            49,
+        )
+        self.assertEqual(content, "微信转账\n转账状态未知，金额 ￥194.00")
+
     def test_control_payload_is_never_exposed_as_plain_text(self):
         self.assertIsNone(_readable_payload_text("text\x00binary"))
         self.assertIsNone(_readable_payload_text(b"text\x00binary"))

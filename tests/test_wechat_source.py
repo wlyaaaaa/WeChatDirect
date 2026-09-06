@@ -448,6 +448,43 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
         self.assertEqual(projections, ["未应答", "通话时长 03:46"])
         self.assertEqual(_TYPE_NAMES[50], "call")
 
+    def test_call_event_projects_voip_result_xml_without_exposing_source_xml(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT ? AS message_content, '' AS compress_content, "
+            "'<msgsource><alnode><fr>1</fr></alnode></msgsource>' AS source, "
+            "'' AS packed_info_data, '1' AS origin_source",
+            (
+                "<voipinvitemsg><status>0</status></voipinvitemsg>"
+                "<voiplocalinfo><duration>0</duration>"
+                "<diaplay_content>对方已拒绝</diaplay_content>"
+                "</voiplocalinfo>",
+            ),
+        ).fetchone()
+        try:
+            content, _payloads, gap = _message_content_projection(row, 50)
+        finally:
+            connection.close()
+        self.assertEqual(content, "对方已拒绝")
+        self.assertIsNone(gap)
+
+    def test_call_event_keeps_source_xml_as_unreadable_when_result_is_missing(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT '<opaque>native</opaque>' AS message_content, "
+            "'' AS compress_content, "
+            "'<msgsource><alnode><fr>1</fr></alnode></msgsource>' AS source, "
+            "'' AS packed_info_data, '1' AS origin_source"
+        ).fetchone()
+        try:
+            content, _payloads, gap = _message_content_projection(row, 50)
+        finally:
+            connection.close()
+        self.assertIsNone(content)
+        self.assertIsNone(gap)
+
     def test_call_event_rejects_opaque_source_when_status_is_unavailable(self):
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row

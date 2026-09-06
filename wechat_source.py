@@ -989,11 +989,16 @@ def _text_from_message(value: object, message_type: int | None) -> str | None:
     if message_type in {1, 10000}:
         return _safe_plain_text(text, normalize_message_separators=True)
     if message_type == 50:
-        call_status = _safe_plain_text(text)
+        call_status = (
+            _call_result_text(text)
+            if "<" in text or ">" in text
+            else _safe_plain_text(text)
+        )
         if (
             call_status
             and len(call_status) <= 128
             and not re.fullmatch(r"[0-9a-fA-F]{32,}", call_status)
+            and not re.fullmatch(r"\d+", call_status)
         ):
             return call_status
         return None
@@ -1005,6 +1010,26 @@ def _text_from_message(value: object, message_type: int | None) -> str | None:
             if field:
                 fields.append(field)
         return "\n".join(dict.fromkeys(fields)) or None
+    return None
+
+
+def _call_result_text(value: object) -> str | None:
+    """Extract human call outcome from native voip result XML only."""
+
+    if not isinstance(value, str):
+        return None
+    for tag in ("diaplay_content", "display_content"):
+        match = re.search(
+            fr"<{tag}>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</{tag}>",
+            value,
+            re.S | re.I,
+        )
+        result = _safe_plain_text(match.group(1)) if match else None
+        if result:
+            return result
+    duration = re.search(r"<duration>(\d+)</duration>", value, re.I)
+    if duration and int(duration.group(1)) > 0:
+        return f"通话时长 {duration.group(1)}"
     return None
 
 
@@ -1154,7 +1179,7 @@ def _message_content_projection(
     if message_type == 49:
         content_texts = payload_texts
     elif message_type == 50:
-        content_texts = []
+        content_texts = list(body_texts)
         for column in ("source", "origin_source"):
             text = _readable_payload_text(row[column])
             if text and text not in content_texts:

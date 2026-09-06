@@ -1003,6 +1003,14 @@ def _text_from_message(value: object, message_type: int | None) -> str | None:
             return call_status
         return None
     if message_type == 49:
+        title_match = re.search(
+            r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>",
+            text,
+            re.S | re.I,
+        )
+        title = _safe_plain_text(title_match.group(1)) if title_match else None
+        if _is_red_packet_title(title):
+            return title
         transfer_status = _transfer_result_text(text)
         if transfer_status:
             return transfer_status
@@ -1027,6 +1035,8 @@ def _transfer_result_text(value: object) -> str | None:
         re.S | re.I,
     )
     title = _safe_plain_text(title_match.group(1)) if title_match else None
+    if _is_red_packet_title(title):
+        return None
     subtype_match = re.search(
         r"<paysubtype>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</paysubtype>",
         value,
@@ -1054,6 +1064,10 @@ def _transfer_result_text(value: object) -> str | None:
     amount = _safe_plain_text(amount_match.group(1)) if amount_match else None
     suffix = f"，金额 {amount}" if amount else ""
     return f"微信转账\n{status}{suffix}"
+
+
+def _is_red_packet_title(title: str | None) -> bool:
+    return title == "微信红包"
 
 
 def _call_result_text(value: object) -> str | None:

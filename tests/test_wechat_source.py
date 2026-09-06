@@ -10,6 +10,7 @@ from wechat_source import (
     DirectSchemaError,
     DirectWeChatReader,
     _TYPE_NAMES,
+    _base_message_type,
     _message_content_projection,
     _message_payload_texts,
     _quote_identities,
@@ -352,6 +353,20 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
             49,
         )
         self.assertEqual(content, "微信转账\n转账状态未知，金额 ￥194.00")
+
+    def test_red_packet_app_with_paymsgid_is_not_projected_as_transfer(self):
+        content = _text_from_message(
+            "<msg><appmsg><title><![CDATA[微信红包]]></title>"
+            "<des><![CDATA[恭喜发财]]></des><appattach>"
+            "<paymsgid>synthetic-red-packet-id</paymsgid>"
+            "<url>https://example.invalid/signed-red-packet</url>"
+            "</appattach></appmsg></msg>",
+            _base_message_type(8594229559345),
+        )
+        self.assertEqual(_base_message_type(8594229559345), 49)
+        self.assertEqual(content, "微信红包")
+        self.assertNotIn("微信转账", content)
+        self.assertNotIn("signed-red-packet", content)
 
     def test_control_payload_is_never_exposed_as_plain_text(self):
         self.assertIsNone(_readable_payload_text("text\x00binary"))

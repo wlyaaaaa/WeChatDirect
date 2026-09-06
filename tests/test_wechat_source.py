@@ -12,6 +12,7 @@ from wechat_source import (
     _TYPE_NAMES,
     _message_content_projection,
     _message_payload_texts,
+    _quote_identities,
     _readable_payload_text,
     _text_from_message,
 )
@@ -283,11 +284,80 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
         self.assertIsNone(_readable_payload_text(b"text\x00binary"))
         self.assertIsNone(_text_from_message("text\x00binary", 1))
         self.assertIsNone(_readable_payload_text("text\x7fbinary"))
+        self.assertIsNone(_readable_payload_text(b"\xff\xfe\x00"))
         self.assertEqual(
             _readable_payload_text("👨‍👩‍👧‍👦"),
             "👨‍👩‍👧‍👦",
         )
         self.assertEqual(_readable_payload_text("你好\u200b"), "你好\u200b")
+
+    def test_message_body_separator_is_normalized_without_widening_payloads(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT ? AS message_content, '' AS compress_content, "
+            "'' AS source, '' AS packed_info_data, '' AS origin_source",
+            ("中文演员\x14姓名",),
+        ).fetchone()
+        binary_row = connection.execute(
+            "SELECT ? AS message_content, '' AS compress_content, "
+            "'' AS source, '' AS packed_info_data, '' AS origin_source",
+            (b"\xff\xfe\x00",),
+        ).fetchone()
+        try:
+            content, payloads, gap = _message_content_projection(row, 1)
+            binary_content, binary_payloads, binary_gap = _message_content_projection(
+                binary_row, 1
+            )
+        finally:
+            connection.close()
+        self.assertEqual(content, "中文演员姓名")
+        self.assertEqual(payloads, ["中文演员姓名"])
+        self.assertIsNone(gap)
+        self.assertIsNone(_readable_payload_text("中文演员\x14姓名"))
+        self.assertIsNone(binary_content)
+        self.assertEqual(binary_payloads, [])
+        self.assertIsNone(binary_gap)
+
+    def test_message_projection_keeps_ordinary_quote_and_empty_text_behavior(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        rows = [
+            connection.execute(
+                "SELECT ? AS message_content, '' AS compress_content, "
+                "'' AS source, '' AS packed_info_data, '' AS origin_source",
+                ("普通中文",),
+            ).fetchone(),
+            connection.execute(
+                "SELECT ? AS message_content, '' AS compress_content, "
+                "'' AS source, '' AS packed_info_data, '' AS origin_source",
+                (
+                    "<refermsg><svrid>7</svrid><title>引用标题</title>"
+                    "<des>引用正文</des></refermsg>",
+                ),
+            ).fetchone(),
+            connection.execute(
+                "SELECT '' AS message_content, '' AS compress_content, "
+                "'' AS source, '' AS packed_info_data, '' AS origin_source"
+            ).fetchone(),
+        ]
+        try:
+            ordinary, _ordinary_payloads, ordinary_gap = _message_content_projection(
+                rows[0], 1
+            )
+            quoted, quoted_payloads, quoted_gap = _message_content_projection(
+                rows[1], 49
+            )
+            empty, _empty_payloads, empty_gap = _message_content_projection(rows[2], 1)
+        finally:
+            connection.close()
+        self.assertEqual(ordinary, "普通中文")
+        self.assertIsNone(ordinary_gap)
+        self.assertEqual(quoted, "引用标题\n引用正文")
+        self.assertEqual(_quote_identities(quoted_payloads[0]), {"7"})
+        self.assertIsNone(quoted_gap)
+        self.assertIsNone(empty)
+        self.assertIsNone(empty_gap)
 
     def test_unknown_message_type_keeps_an_explicit_content_gap(self):
         connection = sqlite3.connect(":memory:")

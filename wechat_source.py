@@ -987,7 +987,7 @@ def _text_from_message(value: object, message_type: int | None) -> str | None:
     if not text:
         return None
     if message_type in {1, 10000}:
-        return _safe_plain_text(text)
+        return _safe_plain_text(text, normalize_message_separators=True)
     if message_type == 50:
         call_status = _safe_plain_text(text)
         if (
@@ -1008,24 +1008,48 @@ def _text_from_message(value: object, message_type: int | None) -> str | None:
     return None
 
 
-def _safe_plain_text(value: object) -> str | None:
-    """Reject binary/control projections without rewriting their meaning."""
+# WeFlow can preserve DC4 as an internal separator in an otherwise readable
+# message body. Normalize it only on the body path; source and relation fields
+# remain strict so opaque bytes cannot become user text.
+_MESSAGE_TEXT_SEPARATOR_CONTROLS = frozenset({"\x14"})
+
+
+def _safe_plain_text(
+    value: object, *, normalize_message_separators: bool = False
+) -> str | None:
+    """Keep readable text while rejecting opaque control or binary payloads."""
 
     if not isinstance(value, str):
         return None
     text = value.strip()
-    if not text or any(
-        unicodedata.category(character) == "Cc"
-        and character not in "\n\r\t"
-        for character in text
-    ):
+    if not text:
         return None
+    for character in text:
+        if unicodedata.category(character) != "Cc":
+            continue
+        if character in "\n\r\t":
+            continue
+        if normalize_message_separators and character in _MESSAGE_TEXT_SEPARATOR_CONTROLS:
+            continue
+        return None
+    if normalize_message_separators:
+        text = "".join(
+            character
+            for character in text
+            if character not in _MESSAGE_TEXT_SEPARATOR_CONTROLS
+        )
+        if not text:
+            return None
     return text
 
 
-def _readable_payload_text(value: object) -> str | None:
+def _readable_payload_text(
+    value: object, *, normalize_message_separators: bool = False
+) -> str | None:
     if isinstance(value, str):
-        return _safe_plain_text(value)
+        return _safe_plain_text(
+            value, normalize_message_separators=normalize_message_separators
+        )
     if not isinstance(value, (bytes, bytearray, memoryview)):
         return None
     raw = bytes(value)
@@ -1035,7 +1059,9 @@ def _readable_payload_text(value: object) -> str | None:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         return None
-    return _safe_plain_text(text)
+    return _safe_plain_text(
+        text, normalize_message_separators=normalize_message_separators
+    )
 
 
 def _decompress_message_text(value: object) -> tuple[str | None, str | None]:
@@ -1070,24 +1096,41 @@ def _decompress_message_text(value: object) -> tuple[str | None, str | None]:
     return (text or None), (None if text else "compressed_content_empty")
 
 
-def _message_value_text(value: object) -> tuple[str | None, str | None]:
+def _message_value_text(
+    value: object, *, normalize_message_separators: bool = False
+) -> tuple[str | None, str | None]:
     """Read plain UTF-8 or one bounded zstd payload without guessing bytes."""
 
     if isinstance(value, (bytes, bytearray, memoryview)):
         raw = bytes(value)
         if raw.find(b"\x28\xb5\x2f\xfd", 0, 64) >= 0:
-            return _decompress_message_text(raw)
-    return _readable_payload_text(value), None
+            text, gap = _decompress_message_text(raw)
+            return (
+                _safe_plain_text(
+                    text, normalize_message_separators=normalize_message_separators
+                ),
+                gap,
+            )
+    return (
+        _readable_payload_text(
+            value, normalize_message_separators=normalize_message_separators
+        ),
+        None,
+    )
 
 
 def _message_payload_texts(
     row: sqlite3.Row,
 ) -> tuple[list[str], list[str], str | None]:
     body_texts: list[str] = []
-    message_text, message_gap = _message_value_text(row["message_content"])
+    message_text, message_gap = _message_value_text(
+        row["message_content"], normalize_message_separators=True
+    )
     if message_text:
         body_texts.append(message_text)
-    compressed, compressed_gap = _message_value_text(row["compress_content"])
+    compressed, compressed_gap = _message_value_text(
+        row["compress_content"], normalize_message_separators=True
+    )
     if compressed and compressed not in body_texts:
         body_texts.append(compressed)
     all_texts = list(body_texts)

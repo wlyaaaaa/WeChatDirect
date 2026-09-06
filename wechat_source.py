@@ -1018,6 +1018,15 @@ def _call_result_text(value: object) -> str | None:
 
     if not isinstance(value, str):
         return None
+    if re.search(r"<voipmsg(?:\s[^>]*)?>", value, re.I):
+        match = re.search(
+            r"<msg>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</msg>",
+            value,
+            re.S | re.I,
+        )
+        result = _safe_plain_text(match.group(1)) if match else None
+        if result:
+            return result
     for tag in ("diaplay_content", "display_content"):
         match = re.search(
             fr"<{tag}>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</{tag}>",

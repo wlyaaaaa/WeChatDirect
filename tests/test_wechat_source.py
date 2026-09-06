@@ -469,6 +469,25 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
         self.assertEqual(content, "对方已拒绝")
         self.assertIsNone(gap)
 
+    def test_call_event_projects_voip_bubble_msg_result(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT ? AS message_content, '' AS compress_content, "
+            "'' AS source, '' AS packed_info_data, '' AS origin_source",
+            (
+                '<voipmsg type="VoIPBubbleMsg"><VoIPBubbleMsg>'
+                "<msg><![CDATA[已取消]]></msg>"
+                "<duration>0</duration></VoIPBubbleMsg></voipmsg>",
+            ),
+        ).fetchone()
+        try:
+            content, _payloads, gap = _message_content_projection(row, 50)
+        finally:
+            connection.close()
+        self.assertEqual(content, "已取消")
+        self.assertIsNone(gap)
+
     def test_call_event_keeps_source_xml_as_unreadable_when_result_is_missing(self):
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row

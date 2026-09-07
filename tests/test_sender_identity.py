@@ -15,6 +15,7 @@ from wechat_source import DirectWeChatReader
 SELF = "wxid-synthetic-primary"
 OTHER = "wxid-synthetic-secondary"
 CONTACT = "wxid-synthetic-contact"
+OPENIM_CONTACT = "25984983387923028@openim"
 LARGE_ID = 9007199254740993
 
 
@@ -161,6 +162,39 @@ class SenderIdentityTests(unittest.TestCase):
         for message in messages:
             self.assertNotIn("senderUsername", message)
             self.assertEqual(message["senderGap"], "sender_mapping_unresolved")
+
+    def test_openim_status_three_prefers_message_shard_name2id_over_status_calibration(self):
+        self.table = "Msg_" + hashlib.md5(OPENIM_CONTACT.encode()).hexdigest()
+        self.add_shard(
+            {1: SELF, 454: OTHER},
+            [(10, 454, 2, 1), (11, 1, 3, 1), (12, 454, 3, 1)],
+        )
+        messages = self.reader.fetch_messages(
+            OPENIM_CONTACT, since_s=0, end_s=1000, limit=None,
+        )["messages"]
+        by_server = {message["serverId"]: message for message in messages}
+        self.assertEqual(by_server["11"]["senderRole"], "self")
+        self.assertEqual(by_server["11"]["senderUsername"], SELF)
+        self.assertEqual(by_server["11"]["isSend"], True)
+        self.assertEqual(by_server["12"]["senderRole"], "other")
+        self.assertEqual(by_server["12"]["senderUsername"], OTHER)
+        self.assertEqual(by_server["12"]["isSend"], False)
+
+    def test_openim_status_three_without_name2id_stays_unknown(self):
+        self.table = "Msg_" + hashlib.md5(OPENIM_CONTACT.encode()).hexdigest()
+        self.add_shard(
+            {1: SELF},
+            [(10, 454, 2, 1), (11, 454, 3, 1)],
+        )
+        message = next(
+            item for item in self.reader.fetch_messages(
+                OPENIM_CONTACT, since_s=0, end_s=1000, limit=None,
+            )["messages"] if item["serverId"] == "11"
+        )
+        self.assertEqual(message["senderRole"], "unknown")
+        self.assertEqual(message["direction"], "unknown")
+        self.assertIsNone(message["isSend"])
+        self.assertEqual(message["directionGap"], "message_status_unproven")
 
     def test_group_context_and_full_archive_use_the_same_native_mapping(self):
         group = "synthetic@chatroom"

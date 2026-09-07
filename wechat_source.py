@@ -3574,6 +3574,7 @@ class DirectWeChatReader:
         row: sqlite3.Row,
         *,
         message_table: str | None = None,
+        session_native_id: str | None = None,
         strict_group_projection: bool = False,
         group_shard_key: str | None = None,
         group_self_sender_receipt: Mapping[str, Any] | None = None,
@@ -3605,6 +3606,31 @@ class DirectWeChatReader:
             if hmac.compare_digest(str(sender_commitment), candidate):
                 return base_type, "self", "outgoing", True
             return base_type, "other", "incoming", False
+        if (
+            not strict_group_projection
+            and session_native_id is not None
+            and session_native_id.casefold().endswith("@openim")
+            and base_type != 10000
+            and native_status in _CALIBRATED_MESSAGE_STATUSES
+        ):
+            sender_key = _valid_sender_key(row["real_sender_id"])
+            sender_name = (
+                self._sender_index_for_message_source(source).get(int(sender_key))
+                if sender_key is not None
+                else None
+            )
+            native_is_self = (
+                self._is_self_username(sender_name) if sender_name is not None else None
+            )
+            if native_is_self is None:
+                return base_type, "unknown", "unknown", None
+            mapped_role = "self" if native_is_self else "other"
+            return (
+                base_type,
+                mapped_role,
+                "outgoing" if mapped_role == "self" else "incoming",
+                mapped_role == "self",
+            )
         calibrated_self_sender = (
             self._calibrated_self_sender(
                 source,
@@ -3718,6 +3744,7 @@ class DirectWeChatReader:
             connection,
             row,
             message_table=message_table,
+            session_native_id=session_native_id,
             strict_group_projection=strict_group_projection,
             group_shard_key=group_shard_key,
             group_self_sender_receipt=group_self_sender_receipt,

@@ -173,6 +173,9 @@ class SenderIdentityTests(unittest.TestCase):
             OPENIM_CONTACT, since_s=0, end_s=1000, limit=None,
         )["messages"]
         by_server = {message["serverId"]: message for message in messages}
+        self.assertEqual(by_server["10"]["senderRole"], "other")
+        self.assertEqual(by_server["10"]["senderUsername"], OTHER)
+        self.assertEqual(by_server["10"]["isSend"], False)
         self.assertEqual(by_server["11"]["senderRole"], "self")
         self.assertEqual(by_server["11"]["senderUsername"], SELF)
         self.assertEqual(by_server["11"]["isSend"], True)

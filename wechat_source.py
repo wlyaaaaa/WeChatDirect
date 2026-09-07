@@ -3611,7 +3611,6 @@ class DirectWeChatReader:
             and session_native_id is not None
             and session_native_id.casefold().endswith("@openim")
             and base_type != 10000
-            and native_status in _CALIBRATED_MESSAGE_STATUSES
         ):
             sender_key = _valid_sender_key(row["real_sender_id"])
             sender_name = (

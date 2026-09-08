@@ -466,6 +466,23 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
         self.assertIsNone(message["content"])
         self.assertEqual(message["contentGap"], "message_content_unparsed")
 
+    def test_native_pat_app_is_system_even_with_outgoing_status(self):
+        connection=sqlite3.connect(':memory:')
+        connection.row_factory=sqlite3.Row
+        row=connection.execute("SELECT 1 AS local_id, ? AS local_type, 42 AS server_id, 0 AS real_sender_id, 100 AS create_time, '<msg><appmsg><title>甲拍了拍乙</title><type>62</type></appmsg></msg>' AS message_content, '' AS source, '' AS packed_info_data, '' AS compress_content, 7 AS sort_seq, 2 AS status, '' AS origin_source", ((62 << 32) | 49,)).fetchone()
+        reader=object.__new__(DirectWeChatReader)
+        reader._identity='wxid-synthetic-self'
+        reader._expected_self_username_sha256=None
+        reader._media_entries=lambda *_args,**_kwargs:[]
+        try:
+            message=reader._message_from_row(row=row,session_native_id='synthetic@chatroom',message_source=Path('synthetic.db'),message_table='Msg_synthetic',connection=connection,sender_index={})
+        finally:
+            connection.close()
+        self.assertEqual(message['senderRole'],'system')
+        self.assertTrue(message['isSystem'])
+        self.assertEqual(message['type'],'system')
+        self.assertEqual(message['content'],'甲拍了拍乙')
+
     def test_control_payload_is_never_exposed_as_plain_text(self):
         self.assertIsNone(_readable_payload_text("text\x00binary"))
         self.assertIsNone(_readable_payload_text(b"text\x00binary"))

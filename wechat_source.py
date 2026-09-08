@@ -902,6 +902,7 @@ _TYPE_NAMES = {
 _OUTGOING_MESSAGE_STATUS = 2
 _INCOMING_MESSAGE_STATUS = 4
 _CALIBRATED_MESSAGE_STATUSES = {0, 3, 5}
+_PAT_SYSTEM_LOCAL_TYPE = (62 << 32) | 49
 
 
 def _base_message_type(value: object) -> int | None:
@@ -1798,7 +1799,7 @@ class DirectWeChatReader:
                     "GROUP BY real_sender_id, local_type",
                     (_OUTGOING_MESSAGE_STATUS,),
                 ):
-                    if _base_message_type(local_type) == 10000:
+                    if _base_message_type(local_type) == 10000 or str(local_type) == str(_PAT_SYSTEM_LOCAL_TYPE):
                         continue
                     sample_count = int(count)
                     total_samples += sample_count
@@ -3682,6 +3683,10 @@ class DirectWeChatReader:
         group_self_sender_receipt: Mapping[str, Any] | None = None,
     ) -> tuple[int | None, str, str | None, bool]:
         base_type = _base_message_type(row["local_type"])
+        # Native app subtype 62 is the generated pat event, not prose authored
+        # by the displayed participant.  Keep app decoding for its visible title.
+        if str(row["local_type"]) == str(_PAT_SYSTEM_LOCAL_TYPE):
+            return base_type, "system", "system", False
         try:
             native_status = int(row["status"])
         except (TypeError, ValueError, OverflowError):
@@ -3875,10 +3880,10 @@ class DirectWeChatReader:
             "content": content,
             "status": row["status"],
             "isSend": is_send,
-            "isSystem": base_type == 10000,
+            "isSystem": sender_role == "system",
             "senderRole": sender_role,
             "direction": direction,
-            "type": _TYPE_NAMES.get(base_type or -1, "unknown"),
+            "type": "system" if sender_role == "system" else _TYPE_NAMES.get(base_type or -1, "unknown"),
         }
         if sender:
             message["senderUsername"] = sender

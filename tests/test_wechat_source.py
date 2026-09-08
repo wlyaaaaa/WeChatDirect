@@ -368,6 +368,75 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
         self.assertNotIn("微信转账", content)
         self.assertNotIn("signed-red-packet", content)
 
+    def test_system_template_projects_only_human_display_fields(self):
+        content = _text_from_message(
+            "<sysmsg type=\"sysmsgtemplate\"><sysmsgtemplate>"
+            "<content_template><plain></plain>"
+            "<template>由于工作变更，$heirname$将在24小时后添加为你的企业微信联系人，"
+            "接替 $originname$ 继续为你提供服务。\n$switch$</template>"
+            "<link_list>"
+            "<link name=\"heirname\"><memberlist><member>"
+            "<username>machine-account</username><nickname>新客服</nickname>"
+            "<antispam_ticket>machine-antispam-ticket</antispam_ticket>"
+            "</member></memberlist></link>"
+            "<link name=\"originname\"><plain>原客服</plain></link>"
+            "<link name=\"switch\"><title>查看详情</title>"
+            "<succeed_ticket>machine-succeed-ticket</succeed_ticket>"
+            "<window_template><title>额外弹窗</title>"
+            "<link_list><link name=\"ignored\"><plain>不可见按钮值</plain>"
+            "</link></link_list></window_template></link>"
+            "</link_list></content_template></sysmsgtemplate></sysmsg>",
+            10000,
+        )
+        self.assertEqual(
+            content,
+            "由于工作变更，新客服将在24小时后添加为你的企业微信联系人，"
+            "接替 原客服 继续为你提供服务。\n查看详情",
+        )
+        self.assertNotIn("machine-", content)
+        self.assertNotIn("额外弹窗", content)
+        self.assertNotIn("不可见按钮值", content)
+
+    def test_system_plain_text_is_preserved_but_unknown_xml_is_a_gap(self):
+        self.assertEqual(_text_from_message("小王撤回了一条消息", 10000), "小王撤回了一条消息")
+        self.assertEqual(_text_from_message("小李拍了拍我", 10000), "小李拍了拍我")
+        self.assertIsNone(
+            _text_from_message(
+                "<sysmsg type=\"unknown\"><ticket>opaque</ticket></sysmsg>", 10000
+            )
+        )
+
+    def test_unknown_system_xml_keeps_system_role_and_explicit_content_gap(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT 1 AS local_id, 10000 AS local_type, 42 AS server_id, "
+            "1 AS real_sender_id, 100 AS create_time, "
+            "'<sysmsg type=\"unknown\"><ticket>opaque</ticket></sysmsg>' "
+            "AS message_content, '' AS source, '' AS packed_info_data, "
+            "'' AS compress_content, 7 AS sort_seq, 4 AS status, "
+            "'' AS origin_source"
+        ).fetchone()
+        reader = object.__new__(DirectWeChatReader)
+        reader._identity = "wxid-synthetic-self"
+        reader._expected_self_username_sha256 = None
+        reader._media_entries = lambda *_args, **_kwargs: []
+        try:
+            message = reader._message_from_row(
+                row=row,
+                session_native_id="wxid-synthetic-contact",
+                message_source=Path("synthetic.db"),
+                message_table="Msg_synthetic",
+                connection=connection,
+                sender_index={1: "wxid-synthetic-other"},
+            )
+        finally:
+            connection.close()
+        self.assertEqual(message["senderRole"], "system")
+        self.assertEqual(message["direction"], "system")
+        self.assertIsNone(message["content"])
+        self.assertEqual(message["contentGap"], "message_content_unparsed")
+
     def test_control_payload_is_never_exposed_as_plain_text(self):
         self.assertIsNone(_readable_payload_text("text\x00binary"))
         self.assertIsNone(_readable_payload_text(b"text\x00binary"))

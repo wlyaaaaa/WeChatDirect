@@ -962,6 +962,66 @@ def _valid_sender_key(value: object) -> str | None:
     return str(number) if number > 0 else None
 
 
+_SYSTEM_TEMPLATE_PLACEHOLDER = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)\$")
+
+
+def _system_template_link_text(link: ET.Element) -> str | None:
+    """Read only display fields from one top-level system template link."""
+
+    for path in ("plain", "title", "memberlist/member/nickname"):
+        field = link.find(path)
+        text = _safe_plain_text(
+            field.text if field is not None else None,
+            normalize_message_separators=True,
+        )
+        if text:
+            return text
+    return None
+
+
+def _system_template_text(value: str) -> str | None:
+    """Project the visible part of one known ``sysmsgtemplate`` body only."""
+
+    try:
+        root = ET.fromstring(value)
+    except (ET.ParseError, ValueError):
+        return None
+    if root.tag != "sysmsg" or root.get("type") != "sysmsgtemplate":
+        return None
+    content_template = root.find("./sysmsgtemplate/content_template")
+    if content_template is None:
+        return None
+    plain = _safe_plain_text(
+        content_template.findtext("plain"), normalize_message_separators=True
+    )
+    if plain:
+        return plain
+    template = _safe_plain_text(
+        content_template.findtext("template"), normalize_message_separators=True
+    )
+    if not template:
+        return None
+
+    replacements: dict[str, str] = {}
+    for link in content_template.findall("./link_list/link"):
+        name = link.get("name")
+        display = _system_template_link_text(link)
+        if name and display:
+            replacements[name] = display
+    projected = _SYSTEM_TEMPLATE_PLACEHOLDER.sub(
+        lambda match: replacements.get(match.group(1), match.group(0)), template
+    )
+    return _safe_plain_text(projected, normalize_message_separators=True)
+
+
+def _system_message_text(value: str) -> str | None:
+    """Keep plain system notices, but never surface unprojected system XML."""
+
+    if not value.lstrip().startswith("<"):
+        return _safe_plain_text(value, normalize_message_separators=True)
+    return _system_template_text(value)
+
+
 def _text_from_message(value: object, message_type: int | None) -> str | None:
     if isinstance(value, str):
         text = value.strip()
@@ -986,7 +1046,9 @@ def _text_from_message(value: object, message_type: int | None) -> str | None:
         return None
     if not text:
         return None
-    if message_type in {1, 10000}:
+    if message_type == 10000:
+        return _system_message_text(text)
+    if message_type == 1:
         return _safe_plain_text(text, normalize_message_separators=True)
     if message_type == 50:
         call_status = (

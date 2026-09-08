@@ -1833,7 +1833,13 @@ class DirectWeChatReader:
         }
 
     def list_sessions(self) -> list[dict[str, Any]]:
-        """List all local sessions, including hidden groups, for source truth."""
+        """List all local sessions, including hidden groups, for source truth.
+
+        A native account can expose more than one ``session.db``. Keep the
+        newest known timestamp when the same native session occurs in several
+        sources instead of letting filesystem ordering replace newer metadata
+        with an older row.
+        """
 
         sessions: dict[str, dict[str, Any]] = {}
         sources = self._named_databases("session.db")
@@ -1841,6 +1847,19 @@ class DirectWeChatReader:
             raise DirectSchemaError("session_database_unavailable")
         invalid_source = False
         usable_sources = 0
+
+        def timestamp_key(value: object) -> tuple[bool, int]:
+            try:
+                return True, int(value)
+            except (TypeError, ValueError, OverflowError):
+                return False, -1
+
+        def recency_key(item: Mapping[str, Any]) -> tuple[bool, int, bool, int]:
+            return (
+                *timestamp_key(item.get("lastTimestamp")),
+                *timestamp_key(item.get("sortTimestamp")),
+            )
+
         for source in sources:
             connection = self._open(source)
             try:
@@ -1878,7 +1897,7 @@ class DirectWeChatReader:
                             if folded_username.endswith("@chatroom")
                             else "contact"
                         )
-                        sessions[username] = {
+                        candidate = {
                             "id": username,
                             "username": username,
                             "type": session_type,
@@ -1887,19 +1906,21 @@ class DirectWeChatReader:
                             "sortTimestamp": row["sort_timestamp"],
                             "isHidden": bool(row["is_hidden"]),
                         }
+                        existing = sessions.get(username)
+                        if (
+                            existing is None
+                            or recency_key(candidate) > recency_key(existing)
+                        ):
+                            sessions[username] = candidate
             except sqlite3.DatabaseError:
                 invalid_source = True
         if invalid_source or not usable_sources:
             raise DirectSchemaError("session_database_unavailable")
 
         def sort_key(item: Mapping[str, Any]) -> tuple[bool, int, str]:
-            raw_timestamp = item.get("sortTimestamp")
-            try:
-                timestamp = int(raw_timestamp)
-            except (TypeError, ValueError, OverflowError):
-                timestamp = -1
+            has_timestamp, timestamp = timestamp_key(item.get("sortTimestamp"))
             return (
-                raw_timestamp is not None,
+                has_timestamp,
                 timestamp,
                 str(item.get("id") or ""),
             )

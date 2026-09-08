@@ -157,6 +157,36 @@ class SourceReadReliabilityTests(unittest.TestCase):
         finally:
             self._close_connections(databases)
 
+    def test_multi_source_sessions_keep_the_newest_last_timestamp(self):
+        newer = sqlite3.connect(":memory:")
+        older = sqlite3.connect(":memory:")
+        for connection, timestamp, hidden in ((newer, 200, 1), (older, 100, 0)):
+            connection.row_factory = sqlite3.Row
+            connection.execute(
+                "CREATE TABLE SessionTable(username TEXT, type INTEGER, "
+                "last_timestamp INTEGER, sort_timestamp INTEGER, is_hidden INTEGER)"
+            )
+            connection.execute(
+                "INSERT INTO SessionTable VALUES('wxid-synthetic', 1, ?, ?, ?)",
+                (timestamp, timestamp, hidden),
+            )
+        newer_path = Path("newer/session.db")
+        older_path = Path("older/session.db")
+        connections = {newer_path: newer, older_path: older}
+        reader = object.__new__(DirectWeChatReader)
+        reader._named_databases = lambda name: (
+            [newer_path, older_path] if name == "session.db" else []
+        )
+        reader._open = lambda source: connections[source]
+        try:
+            result = reader.list_sessions()
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0]["lastTimestamp"], 200)
+            self.assertTrue(result[0]["isHidden"])
+        finally:
+            newer.close()
+            older.close()
+
     def test_unregistered_contacts_keep_labels_when_session_schema_is_missing(self):
         session = sqlite3.connect(":memory:")
         session.row_factory = sqlite3.Row

@@ -100,6 +100,19 @@ wechat-direct context --account primary --contact "<contact-or-group>" --around 
 
 `--around` 在允许的时间窗中优先读取离目标时间最近的消息，再按时间顺序返回。未指定起止时间时，窗口默认围绕目标时间前后各 `--lookback-days` 天，截止时间不晚于本次读取时间。显式时间窗不包含目标时间时返回参数错误。`--since`、`--until` 和 `--around` 接受 ISO 日期/时间；未写时区时按 `Asia/Shanghai` 解释。
 
+### `changes`：发现本机当前会话的增量候选
+
+```powershell
+wechat-direct changes --account both --since "2026-09-01T00:00:00+08:00"
+wechat-direct changes --account primary --since "2026-09-01T00:00:00+08:00" --until "2026-09-08T12:00:00+08:00"
+```
+
+这个只读命令为后续阅读选择会话，不读取或返回消息正文，也不会复制数据库。`--account` 必须明确为 `primary`、`secondary` 或 `both`；使用 `both` 时，结果的 `accounts.primary` 与 `accounts.secondary` 完全分列，并各自带现有账号身份承诺。
+
+调用开始时会固定并回显 `discovery.requestedWindow.untilS`。每个账号返回所有当前 `SessionTable` 中 `lastTimestamp >= since` 的候选，以及所有时间未知的会话；不会以条数截断。隐藏群同样保留。读取期间如果一个会话的当前最后时间已经晚于 `untilS`，它仍会以 `timestampState=observed_after_until` 返回，避免因为扫描后新消息而漏掉可能需要按原时间窗阅读的会话。消费方应继续用该固定 `untilS` 对选中的会话读取正文。
+
+`complete=true` 只表示当前 `SessionTable` 的候选发现已完整返回，`completeScope` 会明确这一主语。它不代表所有历史变化都已检测：已从当前表消失的会话、旧消息后来补入或撤回、正文修改和标签历史都不能由这个命令证明；这些限制写在 `discovery.historicalChangeDetection`。会话项只包含账号、稳定 `nativeId`、当前标签、类型、最后时间、隐藏状态和可读的缺口字段。
+
 ### `export-context`：给 AI 和其他项目的阅读包
 
 ```powershell

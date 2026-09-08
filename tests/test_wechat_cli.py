@@ -52,6 +52,43 @@ class FakeReader:
             }
         ]
 
+    def list_sessions(self):
+        if self.label == "primary":
+            return [
+                {
+                    "id": "wxid-primary",
+                    "type": "contact",
+                    "lastTimestamp": 150,
+                    "isHidden": False,
+                },
+                {
+                    "id": "wxid-new-primary",
+                    "type": "contact",
+                    "lastTimestamp": None,
+                    "isHidden": False,
+                },
+                {
+                    "id": "primary-hidden@chatroom",
+                    "type": "group",
+                    "lastTimestamp": 250,
+                    "isHidden": True,
+                },
+                {
+                    "id": "wxid-old-primary",
+                    "type": "contact",
+                    "lastTimestamp": 99,
+                    "isHidden": False,
+                },
+            ]
+        return [
+            {
+                "id": "wxid-secondary",
+                "type": "contact",
+                "lastTimestamp": 150,
+                "isHidden": False,
+            }
+        ]
+
     def contact_source_fingerprint(self, session_native_id):
         assert session_native_id == f"wxid-{self.label}"
         return {
@@ -251,6 +288,77 @@ class WeChatCliTests(unittest.TestCase):
         self.assertNotIn("\u2028".encode("utf-8"), encoded)
         self.assertNotIn("\u2029".encode("utf-8"), encoded)
         self.assertEqual(json.loads(encoded)["content"], "甲\u2028乙\u2029丙")
+
+    def test_changes_returns_all_candidates_and_keeps_unknown_and_raced_sessions(self):
+        output = BinaryOutput()
+        created = []
+
+        def factory(account, cutoff_s):
+            reader = FakeReader(str(account["config_path"]))
+            created.append(reader)
+            return reader
+
+        args = argparse.Namespace(
+            config="unused.json",
+            account="both",
+            since="1970-01-01T00:01:40+00:00",
+            until=None,
+        )
+        with (
+            patch("wechat_cli._read_config", return_value=self.config),
+            patch("wechat_cli._reader", side_effect=factory),
+            patch("wechat_cli.time.time", return_value=200),
+            patch.object(wechat_cli.sys, "stdout", output),
+        ):
+            self.assertEqual(wechat_cli.command_changes(args), 0)
+
+        result = json.loads(output.buffer.getvalue())
+        self.assertEqual(result["format"], "wechat-direct-session-changes.v1")
+        self.assertEqual(
+            result["discovery"]["requestedWindow"], {"sinceS": 100, "untilS": 200}
+        )
+        self.assertTrue(result["discovery"]["complete"])
+        self.assertEqual(set(result["accounts"]), {"primary", "secondary"})
+        primary = result["accounts"]["primary"]
+        self.assertRegex(
+            primary["accountIdentityCommitment"], r"^sha256:[0-9a-f]{64}$"
+        )
+        self.assertTrue(primary["complete"])
+        self.assertEqual(primary["sourceSnapshotCutoffS"], 200)
+        self.assertTrue(primary["candidateDiscovery"]["returnedAllCandidates"])
+        self.assertTrue(primary["candidateDiscovery"]["includesHiddenSessions"])
+        self.assertTrue(primary["candidateDiscovery"]["unknownLastTimestampIncluded"])
+        self.assertEqual(primary["candidateDiscovery"]["sessionRowsScanned"], 4)
+        candidates = {item["nativeId"]: item for item in primary["sessions"]}
+        self.assertEqual(
+            set(candidates),
+            {"wxid-primary", "wxid-new-primary", "primary-hidden@chatroom"},
+        )
+        self.assertEqual(candidates["wxid-new-primary"]["timestampState"], "unknown")
+        self.assertEqual(
+            candidates["primary-hidden@chatroom"]["timestampState"],
+            "observed_after_until",
+        )
+        self.assertTrue(candidates["primary-hidden@chatroom"]["isHidden"])
+        self.assertEqual(
+            result["discovery"]["historicalChangeDetection"]["status"],
+            "not_provided",
+        )
+        self.assertNotIn("content", json.dumps(result))
+        self.assertTrue(all(reader.closed for reader in created))
+
+    def test_changes_parser_requires_explicit_account_and_since(self):
+        parsed = wechat_cli.parser().parse_args(
+            [
+                "changes",
+                "--account",
+                "primary",
+                "--since",
+                "2026-01-01T00:00:00+08:00",
+            ]
+        )
+        self.assertEqual(parsed.account, "primary")
+        self.assertIsNone(parsed.until)
 
     def test_reader_rejects_wrong_source_identity_commitment_before_reads(self):
         reader = FakeReader("primary")

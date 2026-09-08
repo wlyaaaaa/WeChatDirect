@@ -234,6 +234,171 @@ def _safe_contact(contact: Mapping[str, Any], account: str) -> dict[str, Any]:
     return result
 
 
+def _known_session_timestamp(value: object) -> int | None:
+    try:
+        timestamp = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return timestamp if timestamp > 0 else None
+
+
+def _changes_account_result(
+    reader: DirectWeChatReader,
+    *,
+    account: str,
+    since_s: int,
+    until_s: int,
+    cutoff_s: int,
+) -> dict[str, Any]:
+    """Return every current session that can be a candidate since ``since_s``.
+
+    This is deliberately session-table discovery rather than message-history
+    reconciliation. A row whose current timestamp raced beyond ``until_s``
+    remains a candidate: excluding it would hide a conversation that may also
+    contain messages in the requested window.
+    """
+
+    session_items = reader.list_sessions()
+    label_directory_gap: str | None = None
+    try:
+        labels = {
+            str(item["nativeId"]): dict(item)
+            for item in reader.list_contacts(include_unregistered=True)
+            if item.get("nativeId")
+        }
+    except WeChatDirectError:
+        labels = {}
+        label_directory_gap = "contact_directory_unavailable"
+
+    candidates: list[dict[str, Any]] = []
+    excluded_before_since = 0
+    for session in session_items:
+        native_id = str(session.get("id") or session.get("username") or "")
+        if not native_id:
+            continue
+        last_timestamp = _known_session_timestamp(session.get("lastTimestamp"))
+        if last_timestamp is not None and last_timestamp < since_s:
+            excluded_before_since += 1
+            continue
+
+        contact = labels.get(native_id)
+        if contact is None:
+            item: dict[str, Any] = {
+                "account": account,
+                "nativeId": native_id,
+                "displayName": native_id,
+                "remark": None,
+                "nickname": None,
+                "alias": None,
+                "labelScope": "session_table_fallback",
+                "labelGap": label_directory_gap or "contact_row_unavailable",
+            }
+        else:
+            item = _safe_contact(contact, account)
+            if label_directory_gap:
+                item["labelGap"] = label_directory_gap
+
+        item["sessionType"] = str(session.get("type") or "unknown")
+        item["isHidden"] = bool(session.get("isHidden"))
+        item["lastTimestamp"] = last_timestamp
+        if last_timestamp is None:
+            item["timestampState"] = "unknown"
+            item["candidateReason"] = "unknown_last_timestamp_included"
+            item["timestampGap"] = "last_timestamp_unavailable"
+        elif last_timestamp > until_s:
+            item["timestampState"] = "observed_after_until"
+            item["candidateReason"] = "last_timestamp_at_or_after_since"
+        else:
+            item["timestampState"] = "within_requested_window"
+            item["candidateReason"] = "last_timestamp_at_or_after_since"
+        candidates.append(item)
+
+    gaps: list[dict[str, str]] = []
+    if label_directory_gap:
+        gaps.append(
+            {
+                "kind": "contact_directory_unavailable",
+                "scope": "current_session_labels",
+            }
+        )
+    return {
+        "status": "success",
+        "account": account,
+        "accountIdentityCommitment": "sha256:"
+        + reader.account_identity_commitment,
+        "sourceSnapshotCutoffS": cutoff_s,
+        "complete": True,
+        "completeScope": "current_session_table_candidate_discovery",
+        "candidateDiscovery": {
+            "status": "complete",
+            "scope": "all_current_local_session_rows",
+            "candidateSelection": "last_timestamp_at_or_after_since_or_unknown",
+            "returnedAllCandidates": True,
+            "pagination": "none",
+            "includesHiddenSessions": True,
+            "unknownLastTimestampIncluded": True,
+            "sessionRowsScanned": len(session_items),
+            "candidateSessionsReturned": len(candidates),
+            "excludedBeforeSince": excluded_before_since,
+        },
+        "sessions": candidates,
+        "gaps": gaps,
+    }
+
+
+def command_changes(args: argparse.Namespace) -> int:
+    """Discover complete current session candidates for a bounded time window."""
+
+    cutoff_s = int(time.time())
+    since_s = _parse_time(args.since, default=cutoff_s)
+    until_s = _parse_time(args.until, default=cutoff_s)
+    if since_s > until_s:
+        raise ProductError("time_window_reversed")
+    if until_s > cutoff_s:
+        raise ProductError("changes_until_after_snapshot_cutoff")
+
+    config = _read_config(_resolve_config_path(getattr(args, "config", None)))
+    selected_accounts = ACCOUNT_LABELS if args.account == "both" else (args.account,)
+    accounts: dict[str, dict[str, Any]] = {}
+    for label in selected_accounts:
+        reader = _reader(config[label], cutoff_s)
+        try:
+            accounts[label] = _changes_account_result(
+                reader,
+                account=label,
+                since_s=since_s,
+                until_s=until_s,
+                cutoff_s=cutoff_s,
+            )
+        finally:
+            reader.close()
+
+    sys.stdout.buffer.write(
+        _canonical_bytes(
+            {
+                "format": "wechat-direct-session-changes.v1",
+                "status": "success",
+                "discovery": {
+                    "requestedWindow": {"sinceS": since_s, "untilS": until_s},
+                    "complete": True,
+                    "completeScope": "current_session_table_candidate_discovery",
+                    "historicalChangeDetection": {
+                        "status": "not_provided",
+                        "scope": "not_a_message_history_scan",
+                        "limitations": [
+                            "sessions_absent_from_current_session_table_are_not_discoverable",
+                            "old_message_insertion_withdrawal_or_body_change_is_not_detected",
+                            "current_labels_do_not_establish_label_history",
+                        ],
+                    },
+                },
+                "accounts": accounts,
+            }
+        )
+    )
+    return 0
+
+
 def _sender_role_counts(messages: list[Mapping[str, Any]]) -> dict[str, int]:
     counts = {"self": 0, "other": 0, "system": 0, "unknown": 0}
     for message in messages:
@@ -3256,6 +3421,20 @@ def parser() -> argparse.ArgumentParser:
     _add_context_arguments(context)
     context.set_defaults(handler=command_context)
 
+    changes = commands.add_parser(
+        "changes",
+        help="discover complete current local session candidates since a time",
+    )
+    _add_config_argument(changes)
+    changes.add_argument(
+        "--account", choices=(*ACCOUNT_LABELS, "both"), required=True
+    )
+    changes.add_argument("--since", required=True, help="inclusive ISO date/time")
+    changes.add_argument(
+        "--until", help="inclusive ISO date/time; defaults to this call's fixed cutoff"
+    )
+    changes.set_defaults(handler=command_changes)
+
     reading = commands.add_parser(
         "export-context", help="materialize one ordered conversation page and its local media for AI or other projects"
     )
@@ -3378,7 +3557,7 @@ def _failure_details(exc: Exception) -> dict[str, Any]:
         "time_value_invalid", "time_window_reversed", "scan_limit_invalid",
         "return_limit_invalid", "lookback_days_invalid",
         "context_anchor_outside_requested_window", "moments_limit_invalid",
-        "moments_time_window_reversed",
+        "moments_time_window_reversed", "changes_until_after_snapshot_cutoff",
     }:
         action = "correct_query_arguments"
     elif reason == "contact_not_found":

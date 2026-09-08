@@ -792,10 +792,14 @@ def _read_context_cursor(value: str | None) -> dict[str, Any] | None:
         if len(value) > 4096:
             raise ValueError
         decoded = json.loads(base64.b64decode(value, altchars=b"-_", validate=True))
+        expected_fields = {"v", "account", "identity", "contact", "since", "until", "contains", "around", "before"}
+        if isinstance(decoded, dict) and decoded.get("v") == 2:
+            expected_fields.add("selfOnly")
         if (
             not isinstance(decoded, dict)
-            or set(decoded) != {"v", "account", "identity", "contact", "since", "until", "contains", "around", "before"}
-            or decoded["v"] != 1
+            or set(decoded) != expected_fields
+            or decoded["v"] not in (1, 2)
+            or (decoded["v"] == 2 and type(decoded.get("selfOnly")) is not bool)
             or decoded["account"] not in ACCOUNT_LABELS
             or any(not isinstance(decoded[key], str) for key in ("identity", "contact"))
             or any(type(decoded[key]) is not int for key in ("since", "until"))
@@ -821,7 +825,12 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
     cursor = _read_context_cursor(getattr(args, "cursor", None))
     around_s = _parse_time(args.around, default=cutoff_s) if args.around else None
     contains = args.contains
+    self_only = bool(getattr(args, "self_only", None))
     if cursor is not None:
+        cursor_self_only = cursor.get("selfOnly", False)
+        if getattr(args, "self_only", None) is not None and self_only != cursor_self_only:
+            raise ProductError("context_cursor_query_mismatch")
+        self_only = cursor_self_only
         for supplied, expected in ((contains, cursor["contains"]), (around_s, cursor["around"])):
             if supplied is not None and supplied != expected:
                 raise ProductError("context_cursor_query_mismatch")
@@ -862,6 +871,8 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
             fetch_options["before_key"] = cursor["before"]
         if around_s is not None:
             fetch_options["around_s"] = around_s
+        if self_only:
+            fetch_options["self_only"] = True
         fetch_limit = min(int(args.scan_limit), int(args.return_limit)) if around_s is not None else int(args.scan_limit)
         fetched = reader.fetch_messages(
             str(contact["nativeId"]),
@@ -892,9 +903,10 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
         next_cursor = None
         if has_more and next_key is not None:
             next_cursor = base64.urlsafe_b64encode(_canonical_bytes({
-                "v": 1, "account": label, "identity": identity,
+                "v": 2 if self_only else 1, "account": label, "identity": identity,
                 "contact": contact_binding, "since": since_s, "until": end_s,
                 "contains": contains, "around": around_s, "before": list(next_key),
+                **({"selfOnly": True} if self_only else {}),
             })).decode("ascii")
         contacts = {
             str(item["nativeId"]): item
@@ -967,6 +979,7 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
             "sourceSnapshotCutoffS": cutoff_s,
             "requestedWindow": {"sinceS": since_s, "untilS": end_s},
             "historyScope": "bounded_requested_window",
+            "selectionScope": "self_messages_and_unresolved_senders" if self_only else "all_senders",
             "actualVisibleCutoffS": actual_cutoff,
             "scannedMessages": len(scanned),
             "returnedMessages": len(messages),
@@ -990,6 +1003,7 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
                 "returnedAllScanned": len(selected) == len(scanned),
                 "unreadableContentCount": content_gaps,
                 "snapshotScope": "per_call_local_snapshot",
+                "senderScope": "self_messages_and_unresolved_senders" if self_only else "all_senders",
             },
             "search": ({
                 "contains": contains,
@@ -3402,6 +3416,7 @@ def _add_context_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument("--until", help="inclusive ISO date/time; fixed across continuation pages")
     command.add_argument("--around", help="select messages nearest this ISO date/time within the requested window")
     command.add_argument("--contains", help="match decoded text in this page; follow continuation while status is partial")
+    command.add_argument("--self-only", action="store_true", default=None, help="page through native self messages and unresolved senders; quoted targets remain available, use ordinary --around context for other replies")
     command.add_argument("--cursor", help="opaque continuation.cursor from the same account, contact and query")
     command.add_argument("--lookback-days", type=int, default=7)
     command.add_argument("--scan-limit", type=int, default=120, help="maximum messages examined per page, 1-500 (default: 120)")

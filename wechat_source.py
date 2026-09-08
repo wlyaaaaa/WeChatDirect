@@ -1017,8 +1017,16 @@ def _system_template_text(value: str) -> str | None:
 def _system_message_text(value: str) -> str | None:
     """Keep plain system notices, but never surface unprojected system XML."""
 
+    value = re.sub(r"^\s*[^\s<>:]+:\s*\n(?=<sysmsg\b)", "", value, count=1)
     if not value.lstrip().startswith("<"):
         return _safe_plain_text(value, normalize_message_separators=True)
+    try:
+        root = ET.fromstring(value)
+    except (ET.ParseError, ValueError):
+        return None
+    if root.tag == "sysmsg" and root.find("./revokemsg") is not None:
+        # This is the withdrawal event, not the withdrawn message's body.
+        return "消息已撤回"
     return _system_template_text(value)
 
 
@@ -1050,6 +1058,17 @@ def _text_from_message(value: object, message_type: int | None) -> str | None:
         return _system_message_text(text)
     if message_type == 1:
         return _safe_plain_text(text, normalize_message_separators=True)
+    if message_type == 48:
+        try:
+            root = ET.fromstring(text)
+        except (ET.ParseError, ValueError):
+            return None
+        location = root if root.tag == "location" else root.find("./location") if root.tag == "msg" else None
+        if location is None:
+            return None
+        labels = [_safe_plain_text(location.get(name)) for name in ("poiname", "label")]
+        visible = "；".join(dict.fromkeys(value for value in labels if value))
+        return "位置分享：" + visible if visible else "位置分享（未提供地点名称）"
     if message_type == 50:
         call_status = (
             _call_result_text(text)
@@ -5002,10 +5021,10 @@ class DirectWeChatReader:
         *,
         exact_media_lookup: bool = False,
     ) -> dict[str, Any] | None:
-        """Resolve one private-chat quote target by its native server ID."""
+        """Resolve one chat's quote target by its native server ID."""
 
         folded = session_native_id.casefold()
-        if folded.endswith("@chatroom") or folded.startswith("gh_"):
+        if folded.startswith("gh_"):
             raise DirectSchemaError(
                 "exact quote lookup for this session requires an anchored projection"
             )
@@ -5038,6 +5057,7 @@ class DirectWeChatReader:
         allow_unindexed_time_fallback: bool = False,
         before_key: Sequence[Any] | None = None,
         around_s: int | None = None,
+        self_only: bool = False,
     ) -> dict[str, Any]:
         if limit is not None:
             limit = int(limit)
@@ -5233,6 +5253,18 @@ class DirectWeChatReader:
                             for row in page
                             if before_key is None or newest_key((source, row)) < before_key
                         ]
+                        if self_only:
+                            # Select by native direction before decoding bodies/media.
+                            # Unknown senders remain visible so this cannot silently
+                            # certify that a potentially self-authored row was absent.
+                            eligible = [
+                                (message_source, row)
+                                for message_source, row in eligible
+                                if self._message_row_sender_role(
+                                    message_source, connection, row,
+                                    message_table=table, session_native_id=session_native_id,
+                                )[1] in {"self", "unknown"}
+                            ]
                         rows.extend(eligible)
                         if limit is not None:
                             predicate_identities.update(

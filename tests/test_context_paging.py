@@ -116,10 +116,10 @@ class SyntheticReader:
             "createTime": row["create_time"],
             "content": None if self.unreadable_content else content,
             "status": row["status"],
-            "isSend": False,
+            "isSend": True if row["status"] == 2 else False if row["status"] == 4 else None,
             "isSystem": False,
-            "senderRole": "other",
-            "direction": "incoming",
+            "senderRole": "self" if row["status"] == 2 else "other" if row["status"] == 4 else "unknown",
+            "direction": "outgoing" if row["status"] == 2 else "incoming" if row["status"] == 4 else "unknown",
             "type": "text",
         }
         if self.unreadable_content:
@@ -146,6 +146,75 @@ def _public_identity(message: dict[str, object]) -> tuple[str, str] | None:
 
 
 class ContextPagingTests(unittest.TestCase):
+    def test_self_group_page_resolves_other_sender_quote_outside_selection(self):
+        group = 'synthetic-group@chatroom'
+        group_table = 'Msg_' + hashlib.md5(group.encode(), usedforsecurity=False).hexdigest()
+        original_project = SyntheticReader._project_row
+        def project(reader, **kwargs):
+            result = original_project(reader, **kwargs)
+            if result['serverId'] == 2:
+                result['quote'] = {'platformMessageId': '1'}
+            return result
+        rows = [
+            _message_row(local_id=1, server_id=1, create_time=100, sort_seq=1, content='other context'),
+            _message_row(local_id=2, server_id=2, create_time=200, sort_seq=2, content='own response', status=2),
+        ]
+        with patch.dict(globals(), {'SESSION_ID': group, 'MESSAGE_TABLE': group_table}), patch.object(SyntheticReader, '_project_row', project):
+            args = self._fetch_args(contact=group, scan_limit=1, return_limit=1)
+            args.self_only = True
+            result = self._run_context([rows], args)
+        self.assertEqual([m['content'] for m in result['messages']], ['own response'])
+        self.assertEqual([m['content'] for m in result['quotedMessages']], ['other context'])
+        self.assertEqual(result['quotedMessages'][0]['senderRole'], 'other')
+        self.assertFalse(result['gaps'])
+
+    def test_self_selection_skips_other_bodies_and_pages_all_native_candidates(self):
+        rows = [
+            _message_row(local_id=i, server_id=i, create_time=i, sort_seq=i,
+                         content=str(i), status=2 if i in {1, 101, 501} else 4)
+            for i in range(1, 601)
+        ]
+        args = self._fetch_args(scan_limit=2, return_limit=2)
+        args.self_only = True
+        first = self._run_context([rows], args)
+        self.assertEqual(first['selectionScope'], 'self_messages_and_unresolved_senders')
+        self.assertEqual([m['content'] for m in first['messages']], ['101', '501'])
+        self.assertTrue(first['coverage']['hasMore'])
+        self.assertTrue(first['coverage']['returnedAllScanned'])
+        second_args = self._fetch_args(scan_limit=2, return_limit=2, cursor=first['continuation']['cursor'])
+        second = self._run_context([rows], second_args)
+        self.assertEqual([m['content'] for m in second['messages']], ['1'])
+        self.assertFalse(second['coverage']['hasMore'])
+        self.assertEqual(second['selectionScope'], first['selectionScope'])
+
+    def test_self_selection_retains_unknown_senders_and_deduplicates_shards(self):
+        own = _message_row(local_id=2, server_id=2, create_time=200, sort_seq=2, content='own', status=2)
+        unknown = _message_row(local_id=1, server_id=1, create_time=100, sort_seq=1, content='unknown', status=99)
+        args = self._fetch_args(scan_limit=80, return_limit=80)
+        args.self_only = True
+        result = self._run_context([[own, unknown], [own]], args)
+        self.assertEqual([m['content'] for m in result['messages']], ['unknown', 'own'])
+        self.assertEqual(result['returnedSenderRoleCounts']['self'], 1)
+        self.assertEqual(result['returnedSenderRoleCounts']['unknown'], 1)
+
+    def test_self_filter_cannot_be_added_to_an_all_sender_cursor(self):
+        rows = [_message_row(local_id=i, server_id=i, create_time=i, sort_seq=i, content=str(i)) for i in (1, 2)]
+        first = self._run_context([rows], self._fetch_args(scan_limit=1, return_limit=1))
+        args = self._fetch_args(scan_limit=1, return_limit=1, cursor=first['continuation']['cursor'])
+        args.self_only = True
+        with self.assertRaises(wechat_cli.ProductError) as error:
+            self._run_context([rows], args)
+        self.assertEqual(str(error.exception), 'context_cursor_query_mismatch')
+
+    def test_self_selection_reports_empty_for_a_window_with_only_other_senders(self):
+        rows = [_message_row(local_id=i, server_id=i, create_time=i, sort_seq=i, content=str(i)) for i in range(1, 601)]
+        args = self._fetch_args(scan_limit=1, return_limit=1)
+        args.self_only = True
+        result = self._run_context([rows], args)
+        self.assertEqual(result['messages'], [])
+        self.assertFalse(result['coverage']['hasMore'])
+        self.assertEqual(result['coverage']['senderScope'], 'self_messages_and_unresolved_senders')
+
     @staticmethod
     def _fetch_args(
         *,

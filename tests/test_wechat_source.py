@@ -397,9 +397,38 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
         self.assertNotIn("额外弹窗", content)
         self.assertNotIn("不可见按钮值", content)
 
+    def test_zstd_withdrawal_event_does_not_expose_withdrawn_body(self):
+        from compression import zstd
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        xml = '<sysmsg type="revokemsg"><revokemsg><content>withdrawn-body</content><revoketime>100</revoketime></revokemsg></sysmsg>'
+        try:
+            row = connection.execute("SELECT ? AS message_content, '' AS compress_content, '' AS source, '' AS packed_info_data, '' AS origin_source", (zstd.compress(xml.encode()),)).fetchone()
+            content, _, gap = _message_content_projection(row, 10000)
+        finally:
+            connection.close()
+        self.assertEqual(content, '消息已撤回')
+        self.assertIsNone(gap)
+
+    def test_zstd_location_projects_display_labels(self):
+        from compression import zstd
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        xml = '<msg><location x="31.123" y="121.456" poiname="合成公园" label="合成路1号"/></msg>'
+        try:
+            row = connection.execute("SELECT ? AS message_content, '' AS compress_content, '' AS source, '' AS packed_info_data, '' AS origin_source", (zstd.compress(xml.encode()),)).fetchone()
+            content, _, gap = _message_content_projection(row, 48)
+        finally:
+            connection.close()
+        self.assertEqual(content, '位置分享：合成公园；合成路1号')
+        self.assertIsNone(gap)
+        self.assertEqual(_text_from_message('<msg><location x="1" y="2"/></msg>', 48), '位置分享（未提供地点名称）')
+        self.assertIsNone(_text_from_message('<msg><location', 48))
+
     def test_system_plain_text_is_preserved_but_unknown_xml_is_a_gap(self):
         self.assertEqual(_text_from_message("小王撤回了一条消息", 10000), "小王撤回了一条消息")
         self.assertEqual(_text_from_message("小李拍了拍我", 10000), "小李拍了拍我")
+        self.assertEqual(_text_from_message('123456@chatroom:\n<sysmsg type="sysmsgtemplate"><sysmsgtemplate><content_template><plain>群聊已解散</plain></content_template></sysmsgtemplate></sysmsg>', 10000), '群聊已解散')
         self.assertIsNone(
             _text_from_message(
                 "<sysmsg type=\"unknown\"><ticket>opaque</ticket></sysmsg>", 10000

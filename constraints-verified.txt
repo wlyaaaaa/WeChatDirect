@@ -1,0 +1,8 @@
+# Reproduction baseline verified on Windows, Python 3.14, 2026-09-18.
+# Not a runtime version gate. Revalidate and refresh after dependency upgrades.
+cryptography==49.0.0
+cffi==2.1.0
+pycparser==3.0
+Pillow==12.3.0
+tzdata==2026.3
+ruff==0.15.21

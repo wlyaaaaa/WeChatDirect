@@ -332,7 +332,8 @@ class MediaTemporaryRecoveryTests(unittest.TestCase):
             def failed_decode(
                 *_args: object, **_kwargs: object
             ) -> subprocess.CompletedProcess[str]:
-                output.write_bytes(b"partial bytes")
+                command = _args[0]
+                Path(command[command.index("--output") + 1]).write_bytes(b"partial bytes")
                 return subprocess.CompletedProcess([], 1)
 
             with patch("wechat_cli.subprocess.run", side_effect=failed_decode):

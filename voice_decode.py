@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-import tempfile
+from wechat_storage import ScratchDirectory
 import wave
 
 import pilk
@@ -18,7 +18,7 @@ def decode(source: Path, output: Path, sample_rate: int = 24_000) -> None:
     if not data.startswith(b"\x02#!SILK_V3"):
         raise ValueError("not_tencent_silk")
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="wechat-silk-") as scratch:
+    with ScratchDirectory(prefix="wechat-silk-") as scratch:
         pcm = Path(scratch) / "voice.pcm"
         wav = Path(scratch) / "voice.wav"
         pilk.decode(os.fspath(source), os.fspath(pcm), pcm_rate=sample_rate)

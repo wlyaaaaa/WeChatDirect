@@ -1,0 +1,45 @@
+name: Synthetic Windows validation
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dependencies: [verified, current]
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        id: voice
+        with:
+          python-version: '3.11'
+      - name: Install optional native voice codec
+        run: python -m pip install pilk==0.2.4
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - name: Install verified dependencies and package
+        if: matrix.dependencies == 'verified'
+        run: python -m pip install -c constraints-verified.txt '.[dev]'
+      - name: Install current compatible dependencies and package
+        if: matrix.dependencies == 'current'
+        run: python -m pip install '.[dev]'
+      - name: Synthetic unit and failure tests
+        run: python -B -m unittest discover -s tests -q
+      - name: Static checks
+        run: python -B -m ruff check --no-cache .
+      - name: Installed entry and real voice roundtrip outside checkout
+        env:
+          WECHAT_DIRECT_VOICE_PYTHON: ${{ steps.voice.outputs.python-path }}
+        run: |
+          Set-Location $env:RUNNER_TEMP
+          python -B "$env:GITHUB_WORKSPACE/tools/smoke_runtime.py" --require-voice

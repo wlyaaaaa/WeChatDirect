@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wechatdirect"
-version = "0.1.0"
+version = "0.2.0"
 description = "Read-only local WeChat context and export tools for Windows"
 readme = "README.md"
 requires-python = ">=3.14"
@@ -24,4 +24,12 @@ wechat-direct = "wechat_cli:main"
 
 [tool.setuptools]
 package-dir = { "" = "." }
-py-modules = ["wechat_cli", "wechat_source", "wechat_media", "wechat_image", "wechat_wxgf", "wechat_render", "voice_decode"]
+py-modules = ["wechat_cli", "wechat_source", "wechat_media", "wechat_image", "wechat_wxgf", "wechat_render", "voice_decode", "wechat_wal", "wechat_storage"]
+
+[tool.ruff]
+# voice_decode and wechat_storage are also imported by the separate 3.11 decoder.
+target-version = "py314"
+
+[tool.ruff.per-file-target-version]
+"wechat_storage.py" = "py311"
+"voice_decode.py" = "py311"

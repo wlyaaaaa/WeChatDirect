@@ -67,3 +67,11 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+# Local reading packages and interrupted publication state.
+conversation.json
+conversation.html
+*.wechat-transaction/
+*.incomplete
+.sync.lock
+wechat-direct-scratch/

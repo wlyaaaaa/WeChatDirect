@@ -27,7 +27,7 @@ WeChatDirect 主要供 AI 调用，是一个 Windows-only 的本地工具：从�
 ```powershell
 py -3.14 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install .
+python -m pip install -c constraints-verified.txt .
 ```
 
 开发依赖（包含未固定版本的 `ruff`）可安装为：
@@ -49,7 +49,7 @@ py -3.14 wechat_cli.py --help
 py -3.11 -m pip install pilk
 ```
 
-如需指定其他 Python 3.11 解释器，可设置 `WECHAT_DIRECT_VOICE_PYTHON` 为该解释器的完整路径。主 CLI 仍使用 Python 3.14 或更高版本；只有 `media-open --voice-wav` 和保全中的语音派生 WAV 会使用语音解释器。
+如需指定其他 Python 3.11 解释器，可设置 `WECHAT_DIRECT_VOICE_PYTHON` 为该解释器的完整路径。主 CLI 仍使用 Python 3.14 或更高版本；`media-open --voice-wav`、阅读包、联系人档案、定点媒体修复和保全中的语音派生 WAV 会使用语音解释器。
 
 ## 配置与导出位置
 
@@ -139,7 +139,7 @@ wechat-direct sync-contact --account primary --contact "<contact-or-group>"
 wechat-direct sync-contact --account primary --contact "<contact-or-group>" --full-reconcile
 ```
 
-第一次只在全新空目录中为点名对象建立本机可见档案。已有匹配 `manifest.json` 和 `state.json` 的完成态档案时，重复同一命令才会使用来源指纹、游标和有界重叠窗口增量刷新；需要重新核对全部本地历史时，可再次显式使用 `--full-reconcile`。它不是首次运行硬崩溃后的完整断点续跑，也不是全账号同步或常驻任务。
+第一次只在全新空目录中为点名对象建立本机可见档案。已有匹配 `manifest.json` 和 `state.json` 的完成态档案时，重复同一命令才会使用来源指纹、游标和有界重叠窗口增量刷新；需要重新核对全部本地历史时，可再次显式使用 `--full-reconcile`。新版本先在同级事务目录完成构建和校验，再发布。正常失败保留原档案；硬中断使用下文 `recover-export` 检查和恢复。它不是逐消息断点续跑，也不是全账号同步或常驻任务。
 
 说话人编号只在消息所在分片的 `Name2Id` 中解释；本人原生用户名按该账号既有用户名承诺匹配，不从账号目录后缀、昵称或其他数据库推断。主副账号、私聊和群聊共用此规则，消息 `serverId` 与 `nativeId.value` 始终以字符串返回，避免长整数精度丢失。
 
@@ -194,12 +194,12 @@ wechat-direct doctor --config "<path-to-accounts.json>"
 wechat-direct verify-export --output "<export-directory>"
 ```
 
-需要更多选项时先运行 `wechat-direct doctor --help` 或 `wechat-direct verify-export --help`。`doctor` 应用于确认 Windows、Python、配置入口和所需本地依赖；`verify-export` 只读检查 `sync-contact` 或 `sync-moments` 产生的 v1 导出，不接受 `preserve` 保全目录，也不会重写、补齐或修复任何文件。它们都只报告检查结果，不代替用户决定账号、对象或公开分享范围。
+需要更多选项时先运行 `wechat-direct doctor --help` 或 `wechat-direct verify-export --help`。`doctor` 应用于确认 Windows、Python、配置入口和所需本地依赖；`verify-export` 只读检查联系人档案、朋友圈快照、阅读包和保全包，验证文件哈希、大小、账号绑定及媒体关系。旧阅读包没有总清单时只报告其实际可验证范围，不把较弱的旧格式当成新格式完整验证。它不会重写、补齐或修复任何文件。它们都只报告检查结果，不代替用户决定账号、对象或公开分享范围。
 
 ## 故障与恢复边界
 
-- 完成态档案可以再次运行同一命令做增量刷新，或显式使用 `--full-reconcile` 重核当前本机可见历史。`sync-contact` 在普通增量与 `noChange` 快速返回前都会重新核对 manifest 自身哈希、manifest/state 绑定，以及 `context.md`、`ai-context.md`、`messages.jsonl`、已声明导出媒体与派生 WAV 的哈希、大小或记录数；任一不一致都会精确失败并保留原文件，不会静默覆盖未知内容。
-- 首次运行若在 `state.json` 提交前硬崩溃，目录会保留为没有 state 的半成品，并以 `sync_output_not_initialized` 精确失败。工具不会自动删除、覆盖或猜测接管这些未知内容；如需重做，应由用户保留或另行检查原目录后选择一个新的空输出目录。
+- 完成态档案可以再次运行同一命令做增量刷新，或显式使用 `--full-reconcile` 重核当前本机可见历史。`sync-contact` 在普通增量、完整重核与 `noChange` 返回前都会重新核对 manifest 自身哈希、manifest/state 绑定，以及 `context.md`、`ai-context.md`、`messages.jsonl`、已声明导出媒体与派生 WAV 的哈希、大小或记录数；任一不一致都会精确失败并保留原文件，不会静默覆盖未知内容。
+- 新版本运行中断时，未发布构建保留在精确同级 `<output>.wechat-transaction` 目录。旧版本留下、没有事务元数据的半成品仍以 `sync_output_not_initialized` 失败；不能借新恢复命令自动接管未知旧内容。
 - 遗留 `.sync.lock` 会以 `sync_already_running_or_stale_lock` 失败。工具无法仅凭锁文件证明原进程已结束，因此不会自动删除它。
 - `verify-export` 是只读验证，不会修复归档；本项目也不提供 restore/import（恢复/导入）回微信的能力。
 - 命令执行失败时，JSON 保留稳定的 `error`，并提供 `retryable` 与 `nextAction`。`retryable` 只说明原命令是否适合重试，不代表可以扩大账号、聊天或写入范围；已有 `.incomplete` 输出会保留，调用者可检查原文件或选择新的明确输出位置。
@@ -219,6 +219,63 @@ wechat-direct verify-export --output "<export-directory>"
 `sync-moments` 使用相同的 `ai-context.md`、`context.md`、`manifest.json`、`state.json` 和 `last-run.json`，并以 `moments.jsonl` 保存朋友圈结构记录。
 
 `preserve` 目录包含 `messages.json`、`manifest.json` 和按消息关系组织的 `media/`；语音 WAV 从同一 SILK 派生。`media-open` 只创建用户指定的单个媒体文件，并返回来源与输出哈希。
+
+## 0.2：可靠性、恢复与有界交付
+
+源数据库保持只读。数据库快照与表结构探测共用同一个 WAL 校验器：核对格式、页大小、头部与帧累计校验，只接收连续有效的已提交前缀；明文 SQLite 兼容路径同样合并已提交 WAL。检查失败不会执行源库 checkpoint 或修写。
+
+### 完整重核与定点媒体修复
+
+`--full-reconcile` 会先验证旧档案，再重新生成当前源中存在的消息和媒体；不会用记录自带的旧哈希重新认证被修改的正文。损坏档案保持原样；确认需要重新导出时，使用明确的新空目录，不覆盖旧内容。源中已消失的旧消息仍按既有档案语义保留，不声称已重新证明来源。
+
+只补齐一个已点名档案里的本地附件或 WAV 时使用：
+
+```powershell
+wechat-direct repair-media --account primary --contact "<contact-or-group>" --output "<archive-directory>"
+wechat-direct repair-media --account primary --contact "<contact-or-group>" --output "<archive-directory>" --message-id "<native-id>" --kind voice
+```
+
+它不重扫聊天历史、不访问远端 CDN，不改变已读游标；可复用已验证的 SILK 派生 WAV。没有可用来源时保留缺口，错误不会伪装成已补齐。语音解码超时、解释器失效、非法 WAV 均转为可解释缺口；原 SILK 与其他消息继续保留。
+
+### 按字节分页与长文本
+
+`context --byte-limit 65536` 可把 stdout JSON 控制在 32–512 KiB 范围内。结果过大时先缩小消息页并保留续查游标；单条长文本使用 `segmentedFields` 明确指出预览长度、总长度、原文哈希和续读入口，不静默删字：
+
+```powershell
+wechat-direct message-part --account primary --contact "<same-contact>" --cursor "<segmentedFields.cursor>"
+```
+
+按 `offset`、`nextOffset` 接续，直到 `continuation=null`。分段按 Unicode 字符边界切分，整体 SHA-256 可核对；源内容变化时明确拒绝旧分段，不拼接两个版本。阅读包和保全文件保留完整选定消息，字节预算只控制终端传输。极端大元数据无法放入预算时，提示改用明确的新目录 `export-context`，不会把缺页说成全部读完。
+
+### 归档事务与显式恢复
+
+联系人同步、朋友圈快照和定点媒体修复均在独立同级事务目录构建完整新版本，通过离线验证后再发布，最后才输出成功回执。原档案在普通构建失败后保持可用。该做法需要容纳一个暂存副本的磁盘空间；没有常驻服务或新中央数据库。
+
+发布使用两次目录改名，并非跨多个路径的全局原子操作。极端硬中断发生在两次改名之间时，原档案仍保存在该事务目录的 `previous` 中，可检查后恢复：
+
+```powershell
+wechat-direct recover-export --output "<exact-archive-directory>"
+wechat-direct recover-export --output "<exact-archive-directory>" --action rollback
+wechat-direct recover-export --output "<exact-archive-directory>" --action complete
+```
+
+默认只检查；`rollback` 撤销未发布的本次构建或恢复原版本，`complete` 只发布已经完成且重新验证通过的暂存版本，或清理已发布事务。正在运行的事务由操作系统锁保护；旧版未知 `.sync.lock`、不匹配目录、未知半成品不会自动删除。已发布新版本不能通过 rollback 偷偷删除，需先验证后用 complete 结束清理。恢复不导入微信、不重新读取账号内容。
+
+### 分能力诊断与临时明文
+
+```powershell
+wechat-direct doctor --environment-only
+wechat-direct temp-status --root "<task-temp-parent>"
+wechat-direct temp-status --root "<task-temp-parent>" --session "<exact-session>" --clean
+```
+
+`--environment-only` 不打开本地设置或账号配置；分别报告文本、普通图片、WXGF、语音 WAV、离线验证，以及 ffmpeg/ffprobe 和执行身份。`sourceAccess=not_tested` 不等于真实账号读取通过。SYSTEM 与登录用户的 PATH/解释器配置必须分别判断；不通过更换账号绕过来源权限。
+
+临时目录来自 `WECHAT_DIRECT_TEMP_ROOT`，否则使用调用方的 TEMP/TMP 设置。解密快照和音频中间文件只进入其下的 `wechat-direct-scratch`，带无正文的可重建标记与操作系统占用锁；正常退出删除。硬中断残留由精确 session 检查和显式清理，不能批量清理其他任务或未识别原件。它是临时明文生命周期管理，不承诺安全擦除或替代磁盘加密。
+
+### 安装与验证
+
+`constraints-verified.txt` 记录已验证的主要依赖组合，便于复现，不禁止未来兼容版本。Windows CI 同时验证该组合和当前依赖，使用合成消息、真实 SQLite WAL、人工加密页及故障注入，不携带真实账号、聊天、密钥或导出。Python 3.11 的语音解释器和 Python 3.14 主程序分别验收。主程序环境中的 `tools/smoke_runtime.py --voice-python <python311.exe> --require-voice --require-wxgf` 可用合成音频与图像验证真实解码链；安装验收应从源码目录之外调用，防止源码导入冒充安装成功。
 
 ## 许可证
 

@@ -9,9 +9,12 @@ readers or create a one-off preservation bundle.
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
+from functools import wraps
+from types import SimpleNamespace
 import base64
 import binascii
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import importlib.util
@@ -23,13 +26,19 @@ from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import unicodedata
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from wechat_source import DirectWeChatReader, WeChatDirectError
+from wechat_storage import (
+    StorageError,
+    ScratchDirectory,
+    archive_transaction,
+    recover_archive,
+    scratch_status,
+)
 
 
 LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -114,8 +123,8 @@ def _canonical_bytes(value: object) -> bytes:
     )
     # JSON Lines has one physical LF-delimited record.  Escape the two Unicode
     # line separators so readers that use ``splitlines()`` cannot split a body.
-    return text.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029").encode(
-        "utf-8"
+    return (
+        text.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029").encode("utf-8")
     )
 
 
@@ -147,8 +156,7 @@ def _read_config(path: Path) -> dict[str, dict[str, str]]:
                 len(commitment) != 71
                 or not commitment.startswith("sha256:")
                 or any(
-                    character not in "0123456789abcdef"
-                    for character in commitment[7:]
+                    character not in "0123456789abcdef" for character in commitment[7:]
                 )
                 for commitment in commitments
             )
@@ -188,15 +196,14 @@ def _verify_moments_self_identity(
 
 
 def _normalize_name(value: object) -> str:
-    return " ".join(
-        unicodedata.normalize("NFKC", str(value or "")).casefold().split()
-    )
+    return " ".join(unicodedata.normalize("NFKC", str(value or "")).casefold().split())
 
 
 def _contact_match_fields(contact: Mapping[str, Any]) -> tuple[str, ...]:
     builtin_names = (
         ("文件传输助手", "file transfer assistant", "file_transfer_assistant")
-        if str(contact.get("nativeId") or "").casefold() == "filehelper" else ()
+        if str(contact.get("nativeId") or "").casefold() == "filehelper"
+        else ()
     )
     return tuple(
         item
@@ -237,7 +244,7 @@ def _safe_contact(contact: Mapping[str, Any], account: str) -> dict[str, Any]:
 def _known_session_timestamp(value: object) -> int | None:
     try:
         timestamp = int(value)
-    except (TypeError, ValueError, OverflowError):
+    except TypeError, ValueError, OverflowError:
         return None
     return timestamp if timestamp > 0 else None
 
@@ -324,8 +331,7 @@ def _changes_account_result(
     return {
         "status": "success",
         "account": account,
-        "accountIdentityCommitment": "sha256:"
-        + reader.account_identity_commitment,
+        "accountIdentityCommitment": "sha256:" + reader.account_identity_commitment,
         "sourceSnapshotCutoffS": cutoff_s,
         "complete": True,
         "completeScope": "current_session_table_candidate_discovery",
@@ -447,9 +453,8 @@ def _resolve_contact(
             raise ProductError(
                 "contact_not_found"
                 if not candidates
-                else "contact_ambiguous:" + json.dumps(
-                    candidates, ensure_ascii=False, separators=(",", ":")
-                )
+                else "contact_ambiguous:"
+                + json.dumps(candidates, ensure_ascii=False, separators=(",", ":"))
             )
         selected_label, selected_contact = matches[0]
         selected_reader = readers.pop(selected_label)
@@ -573,7 +578,6 @@ def _resolve_moments_subject(
         raise
 
 
-
 def _parse_time(value: str | None, *, default: int) -> int:
     if not value:
         return default
@@ -612,9 +616,9 @@ def _sender_receipt(
     selected_native_id = str(
         selected_contact.get("nativeId") if selected_contact else ""
     ).casefold()
-    selected_is_group = selected_native_id.endswith("@chatroom") or selected_native_id.startswith(
-        "gh_"
-    )
+    selected_is_group = selected_native_id.endswith(
+        "@chatroom"
+    ) or selected_native_id.startswith("gh_")
     if contact is None and role == "other" and not selected_is_group:
         contact = selected_contact
     if role == "self":
@@ -694,8 +698,14 @@ def _select_window(
                 matches.append(index)
         if matches:
             anchor = (
-                min(matches, key=lambda index: abs(int(messages[index].get("createTime") or 0) - around_s))
-                if around_s is not None else matches[-1]
+                min(
+                    matches,
+                    key=lambda index: abs(
+                        int(messages[index].get("createTime") or 0) - around_s
+                    ),
+                )
+                if around_s is not None
+                else matches[-1]
             )
         if anchor is None:
             raise ProductError("message_text_anchor_not_found")
@@ -792,7 +802,17 @@ def _read_context_cursor(value: str | None) -> dict[str, Any] | None:
         if len(value) > 4096:
             raise ValueError
         decoded = json.loads(base64.b64decode(value, altchars=b"-_", validate=True))
-        expected_fields = {"v", "account", "identity", "contact", "since", "until", "contains", "around", "before"}
+        expected_fields = {
+            "v",
+            "account",
+            "identity",
+            "contact",
+            "since",
+            "until",
+            "contains",
+            "around",
+            "before",
+        }
         if isinstance(decoded, dict) and decoded.get("v") == 2:
             expected_fields.add("selfOnly")
         if (
@@ -804,7 +824,10 @@ def _read_context_cursor(value: str | None) -> dict[str, Any] | None:
             or any(not isinstance(decoded[key], str) for key in ("identity", "contact"))
             or any(type(decoded[key]) is not int for key in ("since", "until"))
             or decoded["since"] > decoded["until"]
-            or (decoded["contains"] is not None and not isinstance(decoded["contains"], str))
+            or (
+                decoded["contains"] is not None
+                and not isinstance(decoded["contains"], str)
+            )
             or (decoded["around"] is not None and type(decoded["around"]) is not int)
             or not isinstance(decoded["before"], list)
         ):
@@ -814,7 +837,7 @@ def _read_context_cursor(value: str | None) -> dict[str, Any] | None:
         raise ProductError("context_cursor_invalid") from exc
 
 
-def _context_result(args: argparse.Namespace) -> dict[str, Any]:
+def _context_result_raw(args: argparse.Namespace) -> dict[str, Any]:
     if not 1 <= int(args.scan_limit) <= MAX_SCAN_MESSAGES:
         raise ProductError("scan_limit_invalid")
     if not 1 <= int(args.return_limit) <= MAX_RETURN_MESSAGES:
@@ -828,10 +851,16 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
     self_only = bool(getattr(args, "self_only", None))
     if cursor is not None:
         cursor_self_only = cursor.get("selfOnly", False)
-        if getattr(args, "self_only", None) is not None and self_only != cursor_self_only:
+        if (
+            getattr(args, "self_only", None) is not None
+            and self_only != cursor_self_only
+        ):
             raise ProductError("context_cursor_query_mismatch")
         self_only = cursor_self_only
-        for supplied, expected in ((contains, cursor["contains"]), (around_s, cursor["around"])):
+        for supplied, expected in (
+            (contains, cursor["contains"]),
+            (around_s, cursor["around"]),
+        ):
             if supplied is not None and supplied != expected:
                 raise ProductError("context_cursor_query_mismatch")
         contains, around_s = cursor["contains"], cursor["around"]
@@ -844,7 +873,9 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
             raise ProductError("context_cursor_query_mismatch")
     else:
         span = int(args.lookback_days) * 86_400
-        end_default = min(cutoff_s, around_s + span) if around_s is not None else cutoff_s
+        end_default = (
+            min(cutoff_s, around_s + span) if around_s is not None else cutoff_s
+        )
         end_s = _parse_time(args.until, default=end_default)
         since_default = (around_s if around_s is not None else end_s) - span
         since_s = _parse_time(args.since, default=since_default)
@@ -873,7 +904,11 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
             fetch_options["around_s"] = around_s
         if self_only:
             fetch_options["self_only"] = True
-        fetch_limit = min(int(args.scan_limit), int(args.return_limit)) if around_s is not None else int(args.scan_limit)
+        fetch_limit = (
+            min(int(args.scan_limit), int(args.return_limit))
+            if around_s is not None
+            else int(args.scan_limit)
+        )
         fetched = reader.fetch_messages(
             str(contact["nativeId"]),
             since_s=since_s,
@@ -886,28 +921,53 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
         scanned = list(fetched.get("messages") or [])
         sync = fetched.get("sync") or {}
         scan_has_more = bool(sync.get("hasMore"))
-        match_count = sum(contains.casefold() in str(item.get("content") or "").casefold() for item in scanned) if contains else None
+        match_count = (
+            sum(
+                contains.casefold() in str(item.get("content") or "").casefold()
+                for item in scanned
+            )
+            if contains
+            else None
+        )
         content_gaps = sum(bool(item.get("contentGap")) for item in scanned)
         if contains and not match_count:
             selected, anchor_index = [], None
         else:
             selected, anchor_index = _select_window(
-                scanned, contains=contains, around_s=around_s,
+                scanned,
+                contains=contains,
+                around_s=around_s,
                 return_limit=int(args.return_limit),
             )
-        scanned_keys = [tuple(item["_pageKey"]) for item in scanned if item.get("_pageKey")]
-        selected_keys = [tuple(item["_pageKey"]) for item in selected if item.get("_pageKey")]
+        scanned_keys = [
+            tuple(item["_pageKey"]) for item in scanned if item.get("_pageKey")
+        ]
+        selected_keys = [
+            tuple(item["_pageKey"]) for item in selected if item.get("_pageKey")
+        ]
         next_key = min(selected_keys) if selected_keys else sync.get("nextBeforeKey")
-        omitted_older = bool(selected_keys and scanned_keys and min(selected_keys) > min(scanned_keys))
+        omitted_older = bool(
+            selected_keys and scanned_keys and min(selected_keys) > min(scanned_keys)
+        )
         has_more = scan_has_more or omitted_older
         next_cursor = None
         if has_more and next_key is not None:
-            next_cursor = base64.urlsafe_b64encode(_canonical_bytes({
-                "v": 2 if self_only else 1, "account": label, "identity": identity,
-                "contact": contact_binding, "since": since_s, "until": end_s,
-                "contains": contains, "around": around_s, "before": list(next_key),
-                **({"selfOnly": True} if self_only else {}),
-            })).decode("ascii")
+            next_cursor = base64.urlsafe_b64encode(
+                _canonical_bytes(
+                    {
+                        "v": 2 if self_only else 1,
+                        "account": label,
+                        "identity": identity,
+                        "contact": contact_binding,
+                        "since": since_s,
+                        "until": end_s,
+                        "contains": contains,
+                        "around": around_s,
+                        "before": list(next_key),
+                        **({"selfOnly": True} if self_only else {}),
+                    }
+                )
+            ).decode("ascii")
         contacts = {
             str(item["nativeId"]): item
             for item in _contact_directory(reader, str(contact["nativeId"]))
@@ -936,7 +996,7 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
         try:
             candidate_time = int(contact.get("lastTimestamp") or 0)
             latest_known_session_time = candidate_time or None
-        except (TypeError, ValueError, OverflowError):
+        except TypeError, ValueError, OverflowError:
             pass
         history_hint = None
         if not scanned and latest_known_session_time is not None:
@@ -962,7 +1022,9 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
                 if not media.get("openable"):
                     gaps.append(
                         {
-                            "kind": "media_not_opened" if media.get("materializable") else "media_not_openable",
+                            "kind": "media_not_opened"
+                            if media.get("materializable")
+                            else "media_not_openable",
                             "message": _message_native_id(message),
                             "mediaKind": key,
                             "reason": media.get("resolution_gap")
@@ -971,15 +1033,18 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
                         }
                     )
         result: dict[str, Any] = {
-            "status": "partial" if contains and not match_count and (scan_has_more or content_gaps) else "success",
+            "status": "partial"
+            if contains and not match_count and (scan_has_more or content_gaps)
+            else "success",
             "account": label,
-            "accountIdentityCommitment": "sha256:"
-            + reader.account_identity_commitment,
+            "accountIdentityCommitment": "sha256:" + reader.account_identity_commitment,
             "contact": _safe_contact(contact, label),
             "sourceSnapshotCutoffS": cutoff_s,
             "requestedWindow": {"sinceS": since_s, "untilS": end_s},
             "historyScope": "bounded_requested_window",
-            "selectionScope": "self_messages_and_unresolved_senders" if self_only else "all_senders",
+            "selectionScope": "self_messages_and_unresolved_senders"
+            if self_only
+            else "all_senders",
             "actualVisibleCutoffS": actual_cutoff,
             "scannedMessages": len(scanned),
             "returnedMessages": len(messages),
@@ -1003,30 +1068,238 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
                 "returnedAllScanned": len(selected) == len(scanned),
                 "unreadableContentCount": content_gaps,
                 "snapshotScope": "per_call_local_snapshot",
-                "senderScope": "self_messages_and_unresolved_senders" if self_only else "all_senders",
+                "senderScope": "self_messages_and_unresolved_senders"
+                if self_only
+                else "all_senders",
             },
-            "search": ({
-                "contains": contains,
-                "matchedInScan": match_count,
-                "status": "matched" if match_count else "not_found_in_page" if scan_has_more else "indeterminate_content_gaps" if content_gaps else "not_found_in_remaining_window" if cursor else "not_found_in_requested_window",
-                "searchableContent": "decoded_message_text",
-            } if contains else None),
-            "continuation": ({
-                "purpose": "continue_matching_contexts" if contains else "next_context_page",
-                "command": "context", "account": label,
-                "contact": args.contact, "cursor": next_cursor,
-            } if next_cursor else None),
+            "search": (
+                {
+                    "contains": contains,
+                    "matchedInScan": match_count,
+                    "status": "matched"
+                    if match_count
+                    else "not_found_in_page"
+                    if scan_has_more
+                    else "indeterminate_content_gaps"
+                    if content_gaps
+                    else "not_found_in_remaining_window"
+                    if cursor
+                    else "not_found_in_requested_window",
+                    "searchableContent": "decoded_message_text",
+                }
+                if contains
+                else None
+            ),
+            "continuation": (
+                {
+                    "purpose": "continue_matching_contexts"
+                    if contains
+                    else "next_context_page",
+                    "command": "context",
+                    "account": label,
+                    "contact": args.contact,
+                    "cursor": next_cursor,
+                }
+                if next_cursor
+                else None
+            ),
             "messages": messages,
             "quotedMessages": quote_targets,
             "mediaCounts": dict(sorted(media_counts.items())),
             "gaps": gaps,
         }
         result["manifestSha256"] = _sha256(_canonical_bytes(result))
-        if len(_canonical_bytes(result)) > MAX_OUTPUT_BYTES:
-            raise ProductError("context_output_too_large")
         return result
     finally:
         reader.close()
+
+
+def _part_cursor(value: dict[str, Any]) -> str:
+    return base64.urlsafe_b64encode(_canonical_bytes(value)).decode("ascii")
+
+
+def _context_result(args: argparse.Namespace) -> dict[str, Any]:
+    budget = int(getattr(args, "byte_limit", MAX_OUTPUT_BYTES))
+    if not 32 * 1024 <= budget <= MAX_OUTPUT_BYTES:
+        raise ProductError("context_byte_limit_invalid")
+    result = _context_result_raw(args)
+    if getattr(args, "_materializing", False):
+        return result
+    if len(_canonical_bytes(result)) <= budget:
+        return result
+    copied = argparse.Namespace()
+    vars(copied).update(vars(args))
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    copied.until = (
+        epoch + timedelta(seconds=result["requestedWindow"]["untilS"])
+    ).isoformat()
+    copied.since = (
+        epoch + timedelta(seconds=result["requestedWindow"]["sinceS"])
+    ).isoformat()
+    while len(_canonical_bytes(result)) > budget and copied.return_limit > 1:
+        copied.return_limit = max(1, copied.return_limit // 2)
+        result = _context_result_raw(copied)
+    if len(_canonical_bytes(result)) <= budget:
+        return result
+    query = {
+        key: getattr(copied, key, None)
+        for key in (
+            "account",
+            "contact",
+            "since",
+            "until",
+            "around",
+            "contains",
+            "cursor",
+            "lookback_days",
+            "scan_limit",
+            "return_limit",
+            "self_only",
+        )
+    }
+    query["account"] = result["account"]
+
+    def segment(value, path, descriptors, native):
+        if isinstance(value, dict):
+            return {
+                k: segment(v, [*path, k], descriptors, native) for k, v in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                segment(v, [*path, i], descriptors, native) for i, v in enumerate(value)
+            ]
+        if isinstance(value, str) and len(value.encode("utf-8")) > budget // 8:
+            preview = value[:2048]
+            continuation = {
+                "v": 1,
+                "identity": result["accountIdentityCommitment"],
+                "native": native,
+                "path": path,
+                "sha256": _sha256(value.encode("utf-8")),
+                "query": query,
+                "offset": len(preview),
+            }
+            descriptors.append(
+                {
+                    "path": path,
+                    "characters": len(value),
+                    "utf8Bytes": len(value.encode("utf-8")),
+                    "sha256": continuation["sha256"],
+                    "previewCharacters": len(preview),
+                    "command": "message-part",
+                    "cursor": _part_cursor(continuation),
+                }
+            )
+            return preview
+        return value
+
+    for field in ("messages", "quotedMessages"):
+        projected = []
+        for message in result.get(field) or []:
+            descriptors = []
+            item = segment(message, [], descriptors, message.get("nativeId"))
+            if descriptors:
+                item["segmentedFields"] = descriptors
+                result["status"] = "partial"
+            projected.append(item)
+        result[field] = projected
+    result["coverage"]["textDelivery"] = "explicit_segments_with_lossless_continuation"
+    result.pop("manifestSha256", None)
+    result["manifestSha256"] = _sha256(_canonical_bytes(result))
+    if len(_canonical_bytes(result)) > budget:
+        raise ProductError("context_metadata_too_large_use_export_context")
+    return result
+
+
+def command_message_part(args: argparse.Namespace) -> int:
+    try:
+        if len(args.cursor) > 32 * 1024:
+            raise ValueError
+        cursor = json.loads(
+            base64.b64decode(args.cursor, altchars=b"-_", validate=True)
+        )
+        if (
+            not isinstance(cursor, dict)
+            or set(cursor)
+            != {"v", "identity", "native", "path", "sha256", "query", "offset"}
+            or cursor["v"] != 1
+            or type(cursor["offset"]) is not int
+            or cursor["offset"] < 0
+            or not isinstance(cursor["path"], list)
+            or len(cursor["path"]) > 16
+            or any(type(key) not in (str, int) for key in cursor["path"])
+            or not _is_sha256(cursor["sha256"])
+        ):
+            raise ValueError
+        query = cursor["query"]
+        allowed = {
+            "account",
+            "contact",
+            "since",
+            "until",
+            "around",
+            "contains",
+            "cursor",
+            "lookback_days",
+            "scan_limit",
+            "return_limit",
+            "self_only",
+        }
+        if (
+            not isinstance(query, dict)
+            or set(query) != allowed
+            or query["account"] != args.account
+            or query["contact"] != args.contact
+        ):
+            raise ValueError
+        if not 1 <= args.limit <= 32768:
+            raise ValueError
+    except (ValueError, TypeError, KeyError, UnicodeError, binascii.Error) as exc:
+        raise ProductError("message_part_cursor_invalid") from exc
+    request = argparse.Namespace()
+    vars(request).update(query)
+    request.config = args.config
+    result = _context_result_raw(request)
+    if result["accountIdentityCommitment"] != cursor["identity"]:
+        raise ProductError("message_part_source_changed")
+    matches = [
+        m
+        for m in [*result["messages"], *result.get("quotedMessages", [])]
+        if m.get("nativeId") == cursor["native"]
+    ]
+    if len(matches) != 1:
+        raise ProductError("message_part_source_changed")
+    value = matches[0]
+    try:
+        for key in cursor["path"]:
+            value = value[key]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ProductError("message_part_source_changed") from exc
+    if (
+        not isinstance(value, str)
+        or _sha256(value.encode("utf-8")) != cursor["sha256"]
+        or cursor["offset"] > len(value)
+    ):
+        raise ProductError("message_part_source_changed")
+    start = cursor["offset"]
+    end = min(len(value), start + args.limit)
+    part = value[start:end]
+    receipt = {
+        "status": "success",
+        "nativeId": cursor["native"],
+        "path": cursor["path"],
+        "offset": start,
+        "nextOffset": end,
+        "characters": len(value),
+        "wholeSha256": cursor["sha256"],
+        "content": part,
+        "partSha256": _sha256(part.encode("utf-8")),
+        "continuation": _part_cursor({**cursor, "offset": end})
+        if end < len(value)
+        else None,
+    }
+    sys.stdout.buffer.write(_canonical_bytes(receipt))
+    return 0
 
 
 def command_context(args: argparse.Namespace) -> int:
@@ -1042,42 +1315,67 @@ def command_export_context(args: argparse.Namespace) -> int:
     if output.exists() or incomplete.exists():
         raise ProductError("reading_output_already_exists")
     started = time.perf_counter()
-    context = _context_result(args)
+    context = _complete_context(args)
     incomplete.mkdir(parents=True)
     try:
         totals: dict[str, int] = {}
         config = _read_config(_resolve_config_path(getattr(args, "config", None)))
-        with _reader(config[context["account"]], context["sourceSnapshotCutoffS"]) as reader:
-            if "sha256:" + reader.account_identity_commitment != context["accountIdentityCommitment"]:
+        with _reader(
+            config[context["account"]], context["sourceSnapshotCutoffS"]
+        ) as reader:
+            if (
+                "sha256:" + reader.account_identity_commitment
+                != context["accountIdentityCommitment"]
+            ):
                 raise ProductError("reading_account_changed_during_export")
             for field in ("messages", "quotedMessages"):
                 materialized = []
                 for message in context.get(field) or []:
-                    projected, counters = _sync_message_media(reader, message, incomplete, allow_remote=not getattr(args, "local_only", False))
+                    projected, counters = _sync_message_media(
+                        reader,
+                        message,
+                        incomplete,
+                        allow_remote=not getattr(args, "local_only", False),
+                    )
                     materialized.append(projected)
                     for key, value in counters.items():
                         totals[key] = totals.get(key, 0) + value
                     for media in projected.get("media_manifest") or []:
                         media.pop("locator", None)
                         if media.get("exportStatus") == "open_failed":
-                            context["gaps"].append({
-                                "kind": "media_export_failed", "message": projected.get("nativeId"),
-                                "mediaKind": media.get("kind"), "reason": media.get("exportGap"),
-                            })
+                            context["gaps"].append(
+                                {
+                                    "kind": "media_export_failed",
+                                    "message": projected.get("nativeId"),
+                                    "mediaKind": media.get("kind"),
+                                    "reason": media.get("exportGap"),
+                                }
+                            )
                 context[field] = materialized
-        context["gaps"] = [gap for gap in context["gaps"] if gap.get("kind") not in {"media_not_opened", "media_not_openable"}]
+        context["gaps"] = [
+            gap
+            for gap in context["gaps"]
+            if gap.get("kind") not in {"media_not_opened", "media_not_openable"}
+        ]
         for message in [*context["messages"], *context["quotedMessages"]]:
             for media in message.get("media_manifest") or []:
                 if media.get("exportStatus") != "available_local":
-                    context["gaps"].append({
-                        "kind": "media_unavailable", "message": message.get("nativeId"),
-                        "mediaKind": media.get("kind"),
-                        "reason": media.get("exportGap") or media.get("resolution_gap") or "not_available",
-                    })
+                    context["gaps"].append(
+                        {
+                            "kind": "media_unavailable",
+                            "message": message.get("nativeId"),
+                            "mediaKind": media.get("kind"),
+                            "reason": media.get("exportGap")
+                            or media.get("resolution_gap")
+                            or "not_available",
+                        }
+                    )
         context["format"] = "wechat-direct-reading-package.v1"
         context["mediaExport"] = totals
-        if totals.get("mediaUnavailable") or context["gaps"] or any(
-            item.get("contentGap") for item in context["messages"]
+        if (
+            totals.get("mediaUnavailable")
+            or context["gaps"]
+            or any(item.get("contentGap") for item in context["messages"])
         ):
             context["status"] = "partial"
         context.pop("manifestSha256", None)
@@ -1087,17 +1385,21 @@ def command_export_context(args: argparse.Namespace) -> int:
             from wechat_render import render_conversation_html
 
             html = render_conversation_html(
-                account=context["account"], contact=context["contact"],
-                messages=context["messages"], quoted_messages=context["quotedMessages"],
+                account=context["account"],
+                contact=context["contact"],
+                messages=context["messages"],
+                quoted_messages=context["quotedMessages"],
                 metadata={
                     "requestedWindow": context["requestedWindow"],
-                    "coverage": context["coverage"], "status": context["status"],
+                    "coverage": context["coverage"],
+                    "status": context["status"],
                     "sourceSnapshotCutoffS": context["sourceSnapshotCutoffS"],
                 },
             )
             _write_text_atomic(incomplete / "conversation.html", html)
         ai_context, ai_count = _bounded_contact_ai_context(
-            account=context["account"], contact=context["contact"],
+            account=context["account"],
+            contact=context["contact"],
             messages=context["messages"],
             quote_messages=[*context["messages"], *context["quotedMessages"]],
             scope_note=(
@@ -1108,20 +1410,53 @@ def command_export_context(args: argparse.Namespace) -> int:
             ),
         )
         _write_text_atomic(incomplete / "ai-context.md", ai_context)
+        files = []
+        for path in sorted(incomplete.rglob("*")):
+            if path.is_file():
+                digest, size = _file_sha256_and_size(path)
+                files.append(
+                    {
+                        "path": path.relative_to(incomplete).as_posix(),
+                        "sha256": digest,
+                        "bytes": size,
+                    }
+                )
+        package_manifest = {
+            "format": "wechat-direct-reading-package.v1",
+            "account": context["account"],
+            "accountIdentityCommitment": context["accountIdentityCommitment"],
+            "contact": context["contact"],
+            "contextManifestSha256": context["manifestSha256"],
+            "messageCount": len(context["messages"]),
+            "files": files,
+        }
+        package_manifest["manifestSha256"] = _sha256(_canonical_bytes(package_manifest))
+        _write_json_atomic(incomplete / "manifest.json", package_manifest)
         incomplete.replace(output)
     except Exception:
-        shutil.rmtree(incomplete, ignore_errors=True)
+        shutil.rmtree(incomplete)
         raise
-    sys.stdout.buffer.write(_canonical_bytes({
-        "status": context["status"], "format": context["format"],
-        "output": str(output),
-        **({"htmlPath": str(output / "conversation.html")} if getattr(args, "html", False) else {}),
-        "dataPath": str(output / "conversation.json"),
-        "aiPath": str(output / "ai-context.md"), "aiContextMessages": ai_count,
-        "messageCount": len(context["messages"]), "mediaExport": totals,
-        "hasMore": context["coverage"]["hasMore"],
-        "elapsedMs": round((time.perf_counter() - started) * 1000, 3),
-    }))
+    sys.stdout.buffer.write(
+        _canonical_bytes(
+            {
+                "status": context["status"],
+                "format": context["format"],
+                "output": str(output),
+                **(
+                    {"htmlPath": str(output / "conversation.html")}
+                    if getattr(args, "html", False)
+                    else {}
+                ),
+                "dataPath": str(output / "conversation.json"),
+                "aiPath": str(output / "ai-context.md"),
+                "aiContextMessages": ai_count,
+                "messageCount": len(context["messages"]),
+                "mediaExport": totals,
+                "hasMore": context["coverage"]["hasMore"],
+                "elapsedMs": round((time.perf_counter() - started) * 1000, 3),
+            }
+        )
+    )
     return 0
 
 
@@ -1174,8 +1509,7 @@ def command_moments(args: argparse.Namespace) -> int:
                         {
                             "kind": "moment_media_not_opened",
                             "momentNativeId": projected.get("nativeId"),
-                            "reason": media.get("open_status")
-                            or "not_openable",
+                            "reason": media.get("open_status") or "not_openable",
                         }
                     )
             moments.append(projected)
@@ -1204,8 +1538,7 @@ def command_moments(args: argparse.Namespace) -> int:
         result: dict[str, Any] = {
             "status": "success",
             "account": label,
-            "accountIdentityCommitment": "sha256:"
-            + reader.account_identity_commitment,
+            "accountIdentityCommitment": "sha256:" + reader.account_identity_commitment,
             "contact": _safe_contact(contact, label) if contact else None,
             "sourceSnapshotCutoffS": cutoff_s,
             "actualVisibleCutoffS": source.get("sourceVisibleCutoffS"),
@@ -1219,7 +1552,9 @@ def command_moments(args: argparse.Namespace) -> int:
             "targetCachedWindow": {
                 "sinceS": source.get("targetEarliestTimeS"),
                 "untilS": source.get("targetLatestTimeS"),
-            } if contact is not None else None,
+            }
+            if contact is not None
+            else None,
             "hasMoreCurrentCache": source.get("hasMoreCurrentCache"),
             "moments": moments,
             "gaps": gaps,
@@ -1257,7 +1592,7 @@ def command_media_open(args: argparse.Namespace) -> int:
         if args.voice_wav:
             if not _is_tencent_silk(data):
                 raise ProductError("wechat_voice_format_unsupported")
-            with tempfile.TemporaryDirectory(prefix="wechat-direct-voice-") as scratch:
+            with ScratchDirectory(prefix="wechat-direct-voice-") as scratch:
                 source = Path(scratch) / "voice.silk"
                 source.write_bytes(data)
                 _decode_voice_file(source, temporary)
@@ -1271,8 +1606,7 @@ def command_media_open(args: argparse.Namespace) -> int:
         receipt = {
             "status": "success",
             "account": args.account,
-            "accountIdentityCommitment": "sha256:"
-            + reader.account_identity_commitment,
+            "accountIdentityCommitment": "sha256:" + reader.account_identity_commitment,
             "kind": resolved.get("kind"),
             "format": "wav" if args.voice_wav else "original",
             "sourceBytes": len(data),
@@ -1291,7 +1625,7 @@ def command_media_open(args: argparse.Namespace) -> int:
 def _module_available(name: str) -> bool:
     try:
         return importlib.util.find_spec(name) is not None
-    except (ImportError, AttributeError, ValueError):
+    except ImportError, AttributeError, ValueError:
         return False
 
 
@@ -1310,7 +1644,7 @@ def _voice_interpreter_available() -> bool:
             timeout=5,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError, subprocess.TimeoutExpired:
         return False
     return completed.returncode == 0
 
@@ -1323,17 +1657,19 @@ def command_doctor(args: argparse.Namespace) -> int:
     windows_supported = sys.platform == "win32"
     if not windows_supported:
         errors.append("doctor_windows_required")
-    try:
-        _local_settings()
-    except ProductError:
-        errors.append("doctor_local_settings_invalid")
+    environment_only = bool(getattr(args, "environment_only", False))
+    if not environment_only:
+        try:
+            _local_settings()
+        except ProductError:
+            errors.append("doctor_local_settings_invalid")
 
     dependencies = {
         "cryptography": "available"
         if _module_available("cryptography")
         else "unavailable",
         "compression": "available"
-        if _module_available("compression")
+        if _module_available("compression.zstd")
         else "unavailable",
         "pillow": "available" if _module_available("PIL") else "unavailable",
     }
@@ -1347,39 +1683,58 @@ def command_doctor(args: argparse.Namespace) -> int:
         "sourceConfigFilesPresent": 0,
         "localStateFilesPresent": 0,
     }
-    try:
-        config = _read_config(_resolve_config_path(getattr(args, "config", None)))
-    except ProductError as exc:
-        error = str(exc)
-        configuration["status"] = (
-            "unavailable"
-            if error in {"wechat_account_config_unavailable", "wechat_localappdata_unavailable"}
-            else "invalid"
-        )
-        errors.append("doctor_configuration_" + configuration["status"])
+    if environment_only:
+        configuration["status"] = "not_checked"
     else:
-        source_present = sum(
-            Path(item["config_path"]).is_file() for item in config.values()
-        )
-        state_present = sum(
-            Path(item["local_state_path"]).is_file() for item in config.values()
-        )
-        configuration.update(
-            {
-                "status": "valid",
-                "configuredAccounts": len(config),
-                "sourceConfigFilesPresent": source_present,
-                "localStateFilesPresent": state_present,
-            }
-        )
-        if source_present != len(config):
-            errors.append("doctor_source_config_files_missing")
-        if state_present != len(config):
-            errors.append("doctor_local_state_files_missing")
+        try:
+            config = _read_config(_resolve_config_path(getattr(args, "config", None)))
+        except ProductError as exc:
+            error = str(exc)
+            configuration["status"] = (
+                "unavailable"
+                if error
+                in {
+                    "wechat_account_config_unavailable",
+                    "wechat_localappdata_unavailable",
+                }
+                else "invalid"
+            )
+            errors.append("doctor_configuration_" + configuration["status"])
+        else:
+            source_present = sum(
+                Path(item["config_path"]).is_file() for item in config.values()
+            )
+            state_present = sum(
+                Path(item["local_state_path"]).is_file() for item in config.values()
+            )
+            configuration.update(
+                {
+                    "status": "valid",
+                    "configuredAccounts": len(config),
+                    "sourceConfigFilesPresent": source_present,
+                    "localStateFilesPresent": state_present,
+                }
+            )
+            if source_present != len(config):
+                errors.append("doctor_source_config_files_missing")
+            if state_present != len(config):
+                errors.append("doctor_local_state_files_missing")
 
     voice_status = "available" if _voice_interpreter_available() else "unavailable"
     if voice_status != "available":
         warnings.append("doctor_voice_decoder_unavailable")
+    ffmpeg = shutil.which("ffmpeg") is not None
+    ffprobe = shutil.which("ffprobe") is not None
+    if not (ffmpeg and ffprobe):
+        warnings.append("doctor_wxgf_transcoder_unavailable")
+    capabilities = {
+        "text": dependencies["cryptography"] == "available"
+        and dependencies["compression"] == "available",
+        "images": dependencies["pillow"] == "available",
+        "wxgf": ffmpeg and ffprobe and dependencies["pillow"] == "available",
+        "voiceWav": voice_status == "available",
+        "offlineVerification": True,
+    }
     result = {
         "status": "success" if not errors else "failed",
         "format": "wechat-direct-doctor.v1",
@@ -1390,6 +1745,21 @@ def command_doctor(args: argparse.Namespace) -> int:
         "platform": {"windowsSupported": windows_supported},
         "dependencies": dependencies,
         "configuration": configuration,
+        "capabilities": {
+            key: "available" if value else "unavailable"
+            for key, value in capabilities.items()
+        },
+        "externalTools": {"ffmpeg": ffmpeg, "ffprobe": ffprobe},
+        "execution": {
+            "isSystem": os.environ.get("USERNAME", "").casefold() == "system",
+            "sourceAccess": "not_tested",
+            "environmentOnly": environment_only,
+        },
+        "temporaryStorage": {
+            "policy": "scoped_disposable_with_os_lease",
+            "explicitRoot": bool(os.environ.get("WECHAT_DIRECT_TEMP_ROOT")),
+            "bodyFreeInspection": True,
+        },
         "voiceDecoder": {"status": voice_status},
         "errors": sorted(set(errors)),
         "warnings": warnings,
@@ -1419,35 +1789,76 @@ def _is_tencent_silk(value: bytes) -> bool:
 
 
 def _decode_voice_file(source: Path, output: Path) -> None:
+    """An optional decoder failure never discards the original SILK asset."""
     if output.exists():
         raise ProductError("voice_decode_output_already_exists")
-    completed = subprocess.run(
-        [
-            *_voice_interpreter_command(),
-            os.fspath(VOICE_DECODER),
-            "--input",
-            os.fspath(source),
-            "--output",
-            os.fspath(output),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    if completed.returncode != 0 or not output.is_file():
-        output.unlink(missing_ok=True)
-        raise ProductError("wechat_voice_decode_failed")
+    # The subprocess can only leave partial files in its own disposable scratch,
+    # never at the caller's output or an existing recovery sidecar.
+    with ScratchDirectory(prefix="wechat-direct-decode-") as scratch:
+        decoded = Path(scratch) / "decoded.wav"
+        try:
+            completed = subprocess.run(
+                [
+                    *_voice_interpreter_command(),
+                    os.fspath(VOICE_DECODER),
+                    "--input",
+                    os.fspath(source),
+                    "--output",
+                    os.fspath(decoded),
+                ],
+                check=False,
+                capture_output=True,
+                timeout=120,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ProductError("wechat_voice_decode_timeout") from exc
+        except OSError as exc:
+            raise ProductError("wechat_voice_decoder_unavailable") from exc
+        if completed.returncode != 0 or not decoded.is_file():
+            raise ProductError("wechat_voice_decode_failed")
+        created_output = False
+        try:
+            import wave
+
+            with wave.open(os.fspath(decoded), "rb") as wav:
+                frames = wav.getnframes()
+                expected = frames * wav.getnchannels() * wav.getsampwidth()
+                if (
+                    frames <= 0
+                    or wav.getcomptype() != "NONE"
+                    or len(wav.readframes(frames)) != expected
+                ):
+                    raise ValueError("invalid PCM WAV")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with output.open("xb") as destination, decoded.open("rb") as source_wav:
+                created_output = True
+                shutil.copyfileobj(source_wav, destination)
+                destination.flush()
+                os.fsync(destination.fileno())
+        except FileExistsError as exc:
+            raise ProductError("voice_decode_output_already_exists") from exc
+        except (OSError, EOFError, ValueError, wave.Error) as exc:
+            if created_output:
+                output.unlink(missing_ok=True)
+            raise ProductError("wechat_voice_decode_failed") from exc
 
 
 def _write_bytes_atomic(path: Path, value: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".incomplete")
-    with temporary.open("wb") as stream:
-        stream.write(value)
-        stream.flush()
-        os.fsync(stream.fileno())
-    temporary.replace(path)
+    created = False
+    try:
+        with temporary.open("xb") as stream:
+            created = True
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    except Exception:
+        if created:
+            temporary.unlink(missing_ok=True)
+        raise
 
 
 def _write_json_atomic(path: Path, value: object) -> None:
@@ -1525,7 +1936,7 @@ def _verification_object(
         value = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         errors.add(prefix + "_unavailable")
-    except (OSError, json.JSONDecodeError):
+    except OSError, json.JSONDecodeError:
         errors.add(prefix + "_invalid")
     else:
         if isinstance(value, dict):
@@ -1544,7 +1955,7 @@ def _canonical_export_root(value: object) -> Path | None:
         if not root.is_dir():
             return None
         resolved = root.resolve(strict=True)
-    except (OSError, RuntimeError, TypeError, ValueError):
+    except OSError, RuntimeError, TypeError, ValueError:
         return None
     return resolved if resolved.is_dir() else None
 
@@ -1553,14 +1964,16 @@ def _contained_export_path(root: Path, value: object) -> Path | None:
     if not isinstance(value, str) or not value or "\\" in value or ":" in value:
         return None
     relative = PurePosixPath(value)
-    if relative.is_absolute() or not relative.parts or any(
-        part in {"", ".", ".."} for part in relative.parts
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
     ):
         return None
     try:
         resolved = root.joinpath(*relative.parts).resolve(strict=False)
         resolved.relative_to(root)
-    except (OSError, RuntimeError, ValueError):
+    except OSError, RuntimeError, ValueError:
         return None
     return resolved
 
@@ -1618,7 +2031,7 @@ def _verify_export_records(
                     continue
                 try:
                     record = json.loads(line.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
+                except UnicodeDecodeError, json.JSONDecodeError:
                     errors.add("export_records_jsonl_invalid")
                     continue
                 if not isinstance(record, Mapping):
@@ -1657,10 +2070,13 @@ def _verify_export_records(
                         errors=errors,
                     )
                     relation = derived.get("derivedFromSha256")
+                    # File availability and the declared derivation link are
+                    # independent: a missing original may still be repairable.
+                    declared_source = media_sha256 or media.get("sha256")
                     relation_valid = (
-                        media_sha256 is not None
+                        _is_sha256(declared_source)
                         and _is_sha256(relation)
-                        and relation == media_sha256
+                        and relation == declared_source
                     )
                     if not relation_valid:
                         errors.add("export_derived_media_relation_mismatch")
@@ -1701,10 +2117,182 @@ def _verify_declared_file(
         errors.add(size_error)
 
 
-def command_verify_export(args: argparse.Namespace) -> int:
+def _verify_portable_package(root: Path, manifest: dict | None) -> dict[str, Any]:
+    errors: set[str] = set()
+    counters = {"recordCount": 0, "mediaFilesChecked": 0}
+    kind = manifest.get("format") if manifest else "wechat-direct-reading-package.v1"
+    context_name = (
+        "messages.json"
+        if kind == "wechat-direct-preservation.v1"
+        else "conversation.json"
+    )
+    context = _verification_object(
+        _contained_export_path(root, context_name), errors, "export_context"
+    )
+    declared: dict[str, dict] = {}
+    if manifest is not None:
+        body = dict(manifest)
+        digest = body.pop("manifestSha256", None)
+        if digest != _sha256(_canonical_bytes(body)):
+            errors.add("export_manifest_sha256_mismatch")
+        if not isinstance(manifest.get("files"), list):
+            errors.add("export_files_invalid")
+        for item in manifest.get("files") or []:
+            if not isinstance(item, dict):
+                errors.add("export_file_invalid")
+                continue
+            name = item.get("path")
+            if not isinstance(name, str) or name in declared:
+                errors.add("export_file_duplicate_or_invalid")
+                continue
+            declared[name] = item
+            _verify_declared_file(
+                root,
+                relative_path=name,
+                declared_hash=item.get("sha256"),
+                declared_size=item.get("bytes"),
+                path_error="export_file_path_invalid",
+                unavailable_error="export_file_unavailable",
+                hash_error="export_file_sha256_mismatch",
+                size_error="export_file_size_mismatch",
+                errors=errors,
+            )
+        if context_name not in declared or (
+            kind == "wechat-direct-reading-package.v1"
+            and "ai-context.md" not in declared
+        ):
+            errors.add("export_required_file_undeclared")
+    if context is not None:
+        body = dict(context)
+        digest = body.pop("manifestSha256", None)
+        if not _is_sha256(digest) or digest != _sha256(_canonical_bytes(body)):
+            errors.add("export_context_sha256_mismatch")
+        if manifest is not None:
+            if any(
+                manifest.get(k) != context.get(k)
+                for k in ("account", "accountIdentityCommitment", "contact")
+            ):
+                errors.add("export_context_binding_mismatch")
+            if manifest.get("contextManifestSha256") != digest:
+                errors.add("export_context_manifest_mismatch")
+        messages = context.get("messages")
+        quotes = context.get("quotedMessages", [])
+        if not isinstance(messages, list) or not isinstance(quotes, list):
+            errors.add("export_messages_invalid")
+            messages, quotes = [], []
+        counters["recordCount"] = len(messages)
+        if context.get("returnedMessages") != len(messages) or (
+            manifest and manifest.get("messageCount") != len(messages)
+        ):
+            errors.add("export_record_count_mismatch")
+        all_messages = messages + quotes
+        for message in all_messages:
+            if not isinstance(message, dict):
+                errors.add("export_message_invalid")
+                continue
+            for media in message.get("media_manifest") or []:
+                if not isinstance(media, dict):
+                    errors.add("export_media_invalid")
+                    continue
+                if media.get("exportedPath"):
+                    _verify_exported_media(
+                        root, media, errors=errors, path_key="exportedPath"
+                    )
+                    counters["mediaFilesChecked"] += 1
+                    if manifest and media["exportedPath"] not in declared:
+                        errors.add("export_media_undeclared")
+                    wav = media.get("derivedVoiceWav")
+                    if wav:
+                        _verify_exported_media(
+                            root, wav, errors=errors, path_key="path"
+                        )
+                        counters["mediaFilesChecked"] += 1
+                        if wav.get("derivedFromSha256") != media.get("sha256"):
+                            errors.add("export_voice_source_mismatch")
+                        if manifest and wav.get("path") not in declared:
+                            errors.add("export_media_undeclared")
+        if kind == "wechat-direct-preservation.v1" and manifest:
+            originals = []
+            for item in manifest.get("mediaFiles") or []:
+                if not isinstance(item, dict):
+                    errors.add("export_media_relation_invalid")
+                    continue
+                if item.get("path") not in declared or any(
+                    item.get(k) != declared.get(item.get("path"), {}).get(k)
+                    for k in ("bytes", "sha256")
+                ):
+                    errors.add("export_media_relation_invalid")
+                candidates = [
+                    m
+                    for m in all_messages
+                    if isinstance(m, dict)
+                    and m.get("nativeId") == item.get("messageNativeId")
+                ]
+                if not any(
+                    any(
+                        x.get("kind") == item.get("kind")
+                        and x.get("mediaId") == item.get("mediaId")
+                        for x in m.get("media_manifest", [])
+                    )
+                    for m in candidates
+                ):
+                    errors.add("export_media_message_mismatch")
+                originals.append(item)
+                counters["mediaFilesChecked"] += 1
+            for item in manifest.get("derivedFiles") or []:
+                if not isinstance(item, dict):
+                    errors.add("export_media_relation_invalid")
+                    continue
+                sources = [
+                    original
+                    for original in originals
+                    if original.get("sha256") == item.get("derivedFromSha256")
+                    and original.get("messageNativeId") == item.get("messageNativeId")
+                    and item.get("path") in original.get("derivedPaths", [])
+                ]
+                if item.get("path") not in declared or not sources:
+                    errors.add("export_voice_source_mismatch")
+                if any(
+                    item.get(k) != declared.get(item.get("path"), {}).get(k)
+                    for k in ("bytes", "sha256")
+                ):
+                    errors.add("export_media_relation_invalid")
+                counters["mediaFilesChecked"] += 1
+    return {
+        "status": "failed" if errors else "success",
+        "format": kind,
+        **counters,
+        "verificationScope": "declared_files_and_relations"
+        if manifest
+        else "legacy_conversation_and_declared_media_only",
+        "errors": sorted(errors),
+    }
+
+
+def _verify_export_result(output: object) -> dict[str, Any]:
     """Verify one existing v1 export without opening config or source data."""
 
-    root = _canonical_export_root(args.output)
+    root = _canonical_export_root(output)
+    if root is not None:
+        candidate_path = _contained_export_path(root, "manifest.json")
+        try:
+            candidate = (
+                _read_json(candidate_path) if candidate_path is not None else None
+            )
+        except ProductError:
+            candidate = None
+        if candidate and candidate.get("format") in {
+            "wechat-direct-reading-package.v1",
+            "wechat-direct-preservation.v1",
+        }:
+            return _verify_portable_package(root, candidate)
+        if (
+            candidate_path is not None
+            and candidate is None
+            and not (root / "manifest.json").exists()
+            and (root / "conversation.json").is_file()
+        ):
+            return _verify_portable_package(root, None)
     counters = {"recordCount": 0, "mediaFilesChecked": 0}
     errors: set[str] = set()
     result: dict[str, Any] = {
@@ -1764,7 +2352,8 @@ def command_verify_export(args: argparse.Namespace) -> int:
                     if any(
                         key not in state
                         or key not in manifest
-                        or _canonical_bytes(state[key]) != _canonical_bytes(manifest[key])
+                        or _canonical_bytes(state[key])
+                        != _canonical_bytes(manifest[key])
                         for key in (
                             "account",
                             "accountIdentityCommitment",
@@ -1780,7 +2369,11 @@ def command_verify_export(args: argparse.Namespace) -> int:
                     if format_value == "wechat-direct-contact-export.v1"
                     else "momentsPath"
                 )
-                if archive_path != "context.md" or ai_path != "ai-context.md" or records_path != specification["recordsPath"]:
+                if (
+                    archive_path != "context.md"
+                    or ai_path != "ai-context.md"
+                    or records_path != specification["recordsPath"]
+                ):
                     errors.add("export_layout_invalid")
                 _verify_declared_file(
                     root,
@@ -1826,8 +2419,79 @@ def command_verify_export(args: argparse.Namespace) -> int:
     result.update(counters)
     result["errors"] = sorted(errors)
     result["status"] = "success" if not errors else "failed"
+    return result
+
+
+def command_verify_export(args: argparse.Namespace) -> int:
+    result = _verify_export_result(args.output)
     sys.stdout.buffer.write(_canonical_bytes(result))
     return 0 if result["status"] == "success" else 2
+
+
+def _verified_archive(output: Path) -> None:
+    result = _verify_export_result(output)
+    if result["status"] != "success":
+        raise ProductError("archive_verification_failed:" + ",".join(result["errors"]))
+
+
+def _transactional_archive(function):
+    @wraps(function)
+    def invoke(args):
+        output = (
+            Path(args.output)
+            if args.output
+            else (
+                _default_moments_export_path(
+                    str(args.account),
+                    args.contact,
+                    self_requested=bool(getattr(args, "self", False)),
+                )
+                if function.__name__ == "command_sync_moments"
+                else _default_contact_export_path(str(args.account), str(args.contact))
+            )
+        )
+        output = output.absolute()
+        stream = SimpleNamespace(buffer=io.BytesIO())
+        copied = argparse.Namespace()
+        vars(copied).update(vars(args))
+        try:
+            with archive_transaction(output, _verified_archive) as stage:
+                copied.output = str(stage)
+                with redirect_stdout(stream):
+                    code = function(copied)
+                if code not in (0, None):
+                    raise ProductError("archive_operation_failed")
+                try:
+                    receipt = json.loads(stream.buffer.getvalue())
+                except (ValueError, UnicodeError) as exc:
+                    raise ProductError("archive_result_invalid") from exc
+                receipt["output"] = str(output)
+                receipt["publication"] = "verified_staged_directory"
+                _write_json_atomic(stage / "last-run.json", receipt)
+            sys.stdout.buffer.write(_canonical_bytes(receipt))
+            return 0
+        except StorageError as exc:
+            raise ProductError(str(exc)) from exc
+
+    return invoke
+
+
+def command_recover_export(args: argparse.Namespace) -> int:
+    try:
+        result = recover_archive(Path(args.output), args.action, _verified_archive)
+    except StorageError as exc:
+        raise ProductError(str(exc)) from exc
+    sys.stdout.buffer.write(_canonical_bytes(result))
+    return 0
+
+
+def command_scratch(args: argparse.Namespace) -> int:
+    try:
+        result = scratch_status(Path(args.root), session=args.session, clean=args.clean)
+    except StorageError as exc:
+        raise ProductError(str(exc)) from exc
+    sys.stdout.buffer.write(_canonical_bytes(result))
+    return 0
 
 
 def _media_extension(payload: bytes, kind: object) -> str:
@@ -1854,7 +2518,7 @@ def _media_extension(payload: bytes, kind: object) -> str:
 def _local_time_label(value: object) -> tuple[str, str]:
     try:
         timestamp = int(value)
-    except (TypeError, ValueError, OverflowError):
+    except TypeError, ValueError, OverflowError:
         return "时间不确定", "??:??:??"
     current = datetime.fromtimestamp(timestamp, LOCAL_TIMEZONE)
     return current.strftime("%Y-%m-%d"), current.strftime("%H:%M:%S")
@@ -1936,7 +2600,9 @@ def _media_context_lines(
             if kind in {"image", "emoji"}:
                 lines.append(f"  ![{label}]({normalized})")
                 if int(media.get("frameCount") or 1) > 1:
-                    lines.append(f"  [动图，共 {media['frameCount']} 帧；判断动作时需查看连续帧，不能只看首帧。]")
+                    lines.append(
+                        f"  [动图，共 {media['frameCount']} 帧；判断动作时需查看连续帧，不能只看首帧。]"
+                    )
             elif kind == "voice":
                 lines.append(f"  [语音（可播放，按需转写）]({normalized})")
             else:
@@ -1962,9 +2628,15 @@ def _contact_ai_context(
     scope_note: str | None = None,
 ) -> str:
     name = str(contact.get("displayName") or contact.get("nickname") or "联系人")
-    first = next((item.get("createTime") for item in messages if item.get("createTime")), None)
+    first = next(
+        (item.get("createTime") for item in messages if item.get("createTime")), None
+    )
     last = next(
-        (item.get("createTime") for item in reversed(messages) if item.get("createTime")),
+        (
+            item.get("createTime")
+            for item in reversed(messages)
+            if item.get("createTime")
+        ),
         None,
     )
     first_date, first_time = _local_time_label(first)
@@ -1973,7 +2645,8 @@ def _contact_ai_context(
         f"# 微信对话：{name}",
         "",
         f"账号：{'主号' if account == 'primary' else '副号'}｜消息：{len(messages)}｜可见范围：{first_date} {first_time} — {last_date} {last_time}",
-        scope_note or (
+        scope_note
+        or (
             "这是全量本地档案；不要整份送入模型。日常先读 ai-context.md，"
             "需要更早内容时只搜索并读取本文件的命中附近。"
             if full_archive
@@ -2064,7 +2737,8 @@ def _message_export_key(message: Mapping[str, Any]) -> str:
 
 
 def _remap_legacy_local_sender_keys(
-    merged: dict[str, dict[str, Any]], candidates: list[dict[str, Any]],
+    merged: dict[str, dict[str, Any]],
+    candidates: list[dict[str, Any]],
 ) -> None:
     """Match old local-only records without using their incorrect sender names."""
 
@@ -2072,14 +2746,20 @@ def _remap_legacy_local_sender_keys(
         identity = message.get("nativeId") or {}
         if identity.get("kind") != "local" or not identity.get("value"):
             return None
-        return (str(identity["value"]), str(message.get("createTime")),
-                str(message.get("sortSeq")))
+        return (
+            str(identity["value"]),
+            str(message.get("createTime")),
+            str(message.get("sortSeq")),
+        )
 
     old_keys: dict[tuple[str, str, str], list[str]] = {}
     new_keys: dict[tuple[str, str, str], list[str]] = {}
     for key, message in merged.items():
         basis = local_basis(message)
-        if basis is not None and message.get("senderIdentityVersion") != SENDER_IDENTITY_VERSION:
+        if (
+            basis is not None
+            and message.get("senderIdentityVersion") != SENDER_IDENTITY_VERSION
+        ):
             old_keys.setdefault(basis, []).append(key)
     for message in candidates:
         basis = local_basis(message)
@@ -2138,7 +2818,9 @@ def _sync_message_media(
         media = dict(source_media)
         counters["mediaOccurrences"] += 1
         locator = media.get("locator")
-        can_materialize = media.get("materializable") and (allow_remote or not media.get("requiresNetwork"))
+        can_materialize = media.get("materializable") and (
+            allow_remote or not media.get("requiresNetwork")
+        )
         if not locator or not (media.get("openable") or can_materialize):
             counters["mediaUnavailable"] += 1
             projected_media.append(media)
@@ -2151,14 +2833,23 @@ def _sync_message_media(
             )
             if hasattr(reader, "resolve_locator"):
                 resolved = reader.resolve_locator(str(locator))
-                for field in ("fileName", "mimeType", "quality", "materializationSource"):
+                for field in (
+                    "fileName",
+                    "mimeType",
+                    "quality",
+                    "materializationSource",
+                ):
                     if resolved.get(field) is not None:
                         media[field] = resolved[field]
             if media.get("kind") in {"image", "emoji"}:
                 from PIL import Image
 
                 with Image.open(io.BytesIO(payload)) as visual:
-                    media.update(width=visual.width, height=visual.height, frameCount=getattr(visual, "n_frames", 1))
+                    media.update(
+                        width=visual.width,
+                        height=visual.height,
+                        frameCount=getattr(visual, "n_frames", 1),
+                    )
         except Exception as exc:
             counters["mediaUnavailable"] += 1
             media["exportStatus"] = "open_failed"
@@ -2170,7 +2861,11 @@ def _sync_message_media(
         if extension == ".bin" and media.get("kind") == "file":
             filename = str(media.get("fileName") or "").replace("\\", "/")
             declared_extension = PurePosixPath(filename).suffix
-            if declared_extension and len(declared_extension) <= 20 and declared_extension[1:].isalnum():
+            if (
+                declared_extension
+                and len(declared_extension) <= 20
+                and declared_extension[1:].isalnum()
+            ):
                 extension = declared_extension.lower()
         relative = Path("media") / digest[:2] / (digest + extension)
         target = output / relative
@@ -2191,12 +2886,15 @@ def _sync_message_media(
                 "exportedPath": relative.as_posix(),
                 "bytes": len(payload),
                 "sha256": "sha256:" + digest,
-                "mimeType": media.get("mimeType") or mimetypes.guess_type(relative.as_posix())[0] or "application/octet-stream",
+                "mimeType": media.get("mimeType")
+                or mimetypes.guess_type(relative.as_posix())[0]
+                or "application/octet-stream",
             }
         )
         media.pop("materializable", None)
         media.pop("requiresNetwork", None)
         media.pop("resolution_gap", None)
+        media.pop("exportGap", None)
         if media.get("kind") == "voice" and _is_tencent_silk(payload):
             wav_relative = Path("media") / digest[:2] / (digest + ".wav")
             wav_target = output / wav_relative
@@ -2215,6 +2913,7 @@ def _sync_message_media(
                     else:
                         counters["voiceWavCreated"] += 1
             if wav_target.is_file():
+                media.pop("voiceWavGap", None)
                 wav = wav_target.read_bytes()
                 media["derivedVoiceWav"] = {
                     "path": wav_relative.as_posix(),
@@ -2330,6 +3029,7 @@ def _verify_contact_fast_path_archive(
             raise ProductError(error_prefix + "_size_mismatch")
 
 
+@_transactional_archive
 def command_sync_contact(args: argparse.Namespace) -> int:
     started = time.perf_counter()
     cutoff_s = int(time.time())
@@ -2393,7 +3093,11 @@ def command_sync_contact(args: argparse.Namespace) -> int:
                 or existing_state.get("contactNativeId") != contact_native_id
             ):
                 raise ProductError("sync_identity_mismatch")
-            mode = "full_reconcile" if getattr(args, "full_reconcile", False) else "incremental"
+            mode = (
+                "full_reconcile"
+                if getattr(args, "full_reconcile", False)
+                else "incremental"
+            )
             manifest_path = output / "manifest.json"
             state_has_legacy_senders = (
                 existing_state.get("senderIdentityVersion") != SENDER_IDENTITY_VERSION
@@ -2401,30 +3105,23 @@ def command_sync_contact(args: argparse.Namespace) -> int:
             try:
                 manifest = _read_json(manifest_path)
             except ProductError as exc:
-                if mode != "full_reconcile" or state_has_legacy_senders:
-                    raise ProductError("sync_manifest_invalid") from exc
-                manifest = None
+                raise ProductError("sync_manifest_invalid") from exc
+            if manifest is None:
+                raise ProductError("sync_manifest_invalid")
             legacy_senders = state_has_legacy_senders or (
-                manifest is not None
-                and manifest.get("senderIdentityVersion") != SENDER_IDENTITY_VERSION
+                manifest.get("senderIdentityVersion") != SENDER_IDENTITY_VERSION
             )
-            if mode != "full_reconcile" or legacy_senders:
-                if manifest is None:
-                    raise ProductError("sync_manifest_invalid")
-                _verify_contact_fast_path_archive(
-                    output,
-                    manifest,
-                    existing_state,
-                )
-                if legacy_senders and mode != "full_reconcile":
-                    mode = "sender_identity_reconcile"
+            # Full recheck is not permission to trust damaged old records or to
+            # recertify their stored hashes. Recovery uses a separate destination.
+            _verify_contact_fast_path_archive(output, manifest, existing_state)
+            if legacy_senders and mode != "full_reconcile":
+                mode = "sender_identity_reconcile"
             prior_sort = existing_state.get("sortSeqWatermark")
             prior_time = int(existing_state.get("lastCreateTimeS") or 0)
             replay_floor = existing_state.get("sortSeqReplayFloor")
-            source_catalog_unchanged = (
-                existing_state.get("messageSourceCatalogSha256")
-                == source_fingerprint.get("messageSourceCatalogSha256")
-            )
+            source_catalog_unchanged = existing_state.get(
+                "messageSourceCatalogSha256"
+            ) == source_fingerprint.get("messageSourceCatalogSha256")
             if mode in {"full_reconcile", "sender_identity_reconcile"}:
                 since_s = None
                 fetch_sort_cursor = None
@@ -2449,7 +3146,8 @@ def command_sync_contact(args: argparse.Namespace) -> int:
         if (
             existing_state is not None
             and mode == "incremental"
-            and existing_state.get("sourceFingerprint") == source_fingerprint.get("sha256")
+            and existing_state.get("sourceFingerprint")
+            == source_fingerprint.get("sha256")
         ):
             verified_fingerprint = reader.contact_source_fingerprint(contact_native_id)
             if verified_fingerprint.get("sha256") != source_fingerprint.get("sha256"):
@@ -2497,9 +3195,7 @@ def command_sync_contact(args: argparse.Namespace) -> int:
                     "historicalMutationCoverage": manifest.get(
                         "historicalMutationCoverage"
                     ),
-                    "incrementalCursorMode": manifest.get(
-                        "incrementalCursorMode"
-                    ),
+                    "incrementalCursorMode": manifest.get("incrementalCursorMode"),
                     "undatedIncrementalCoverage": manifest.get(
                         "undatedIncrementalCoverage"
                     ),
@@ -2532,15 +3228,11 @@ def command_sync_contact(args: argparse.Namespace) -> int:
             limit=None,
             exact_media_lookup=True,
         )
-        if (
-            reader.contact_source_fingerprint(contact_native_id).get("sha256")
-            != source_fingerprint.get("sha256")
-        ):
+        if reader.contact_source_fingerprint(contact_native_id).get(
+            "sha256"
+        ) != source_fingerprint.get("sha256"):
             raise ProductError("source_changed_during_sync_retry")
-        contacts = {
-            str(item["nativeId"]): item
-            for item in contact_directory
-        }
+        contacts = {str(item["nativeId"]): item for item in contact_directory}
         candidates = [
             _message_receipt(
                 item,
@@ -2567,12 +3259,19 @@ def command_sync_contact(args: argparse.Namespace) -> int:
             key = _message_export_key(candidate)
             previous = merged.get(key)
             needs_media_retry = previous is not None and any(
-                media.get("openable")
-                and media.get("exportStatus") != "available_local"
+                (media.get("openable") or media.get("materializable"))
+                and (
+                    media.get("exportStatus") != "available_local"
+                    or (
+                        media.get("kind") == "voice"
+                        and not media.get("derivedVoiceWav")
+                    )
+                )
                 for media in previous.get("media_manifest") or []
             )
             if (
-                previous is not None
+                mode not in {"full_reconcile", "sender_identity_reconcile"}
+                and previous is not None
                 and previous.get("messageSha256") == candidate.get("messageSha256")
                 and not needs_media_retry
             ):
@@ -2586,30 +3285,48 @@ def command_sync_contact(args: argparse.Namespace) -> int:
                 updated_count += 1
             merged[key] = projected
         for previous in merged.values():
-            if (
-                previous.get("senderIdentityVersion") != SENDER_IDENTITY_VERSION
-                and not previous.get("senderIdentityRecheckGap")
+            if previous.get(
+                "senderIdentityVersion"
+            ) != SENDER_IDENTITY_VERSION and not previous.get(
+                "senderIdentityRecheckGap"
             ):
                 # Preserve the archived body and old attribution as evidence;
                 # an unavailable source cannot certify that old attribution.
                 previous["previousSenderAttribution"] = {
                     key: previous.get(key)
-                    for key in ("senderRole", "senderUsername", "direction", "isSend", "sender")
+                    for key in (
+                        "senderRole",
+                        "senderUsername",
+                        "direction",
+                        "isSend",
+                        "sender",
+                    )
                 }
                 previous.pop("senderUsername", None)
                 if previous.get("serverId") is not None:
                     previous["serverId"] = str(previous["serverId"])
                 previous.update(senderRole="unknown", direction="unknown", isSend=None)
-                previous["sender"] = {"role": "unknown", "nativeId": None,
-                                      "displayName": "身份未重核"}
+                previous["sender"] = {
+                    "role": "unknown",
+                    "nativeId": None,
+                    "displayName": "身份未重核",
+                }
                 previous["senderIdentityRecheckGap"] = "source_message_unavailable"
-                previous["messageSha256"] = _sha256(_canonical_bytes({
-                    key: value for key, value in previous.items()
-                    if key not in {"nativeId", "messageSha256", "sender", "_pageKey"}
-                }))
+                previous["messageSha256"] = _sha256(
+                    _canonical_bytes(
+                        {
+                            key: value
+                            for key, value in previous.items()
+                            if key
+                            not in {"nativeId", "messageSha256", "sender", "_pageKey"}
+                        }
+                    )
+                )
                 updated_count += 1
         ordered = _ordered_messages(merged)
-        unrechecked_senders = sum(bool(item.get("senderIdentityRecheckGap")) for item in ordered)
+        unrechecked_senders = sum(
+            bool(item.get("senderIdentityRecheckGap")) for item in ordered
+        )
         metadata_changed = existing_state is not None and existing_state.get(
             "contact"
         ) != _safe_contact(contact, label)
@@ -2640,9 +3357,7 @@ def command_sync_contact(args: argparse.Namespace) -> int:
             )
             _write_text_atomic(ai_context_path, ai_context)
         sort_values = [
-            int(item["sortSeq"])
-            for item in ordered
-            if item.get("sortSeq") is not None
+            int(item["sortSeq"]) for item in ordered if item.get("sortSeq") is not None
         ]
         time_values = [
             int(item["createTime"])
@@ -2659,14 +3374,13 @@ def command_sync_contact(args: argparse.Namespace) -> int:
                 or int(item.get("createTime") or 0) >= overlap_start
             )
         ]
-        sort_cursor_eligible = (
-            int(source_fingerprint.get("messageSourceCount") or 0) == 1
-            and (
-                mode in {"full", "full_reconcile", "sender_identity_reconcile"}
-                or (
-                    bool(existing_state and existing_state.get("sortCursorEligible"))
-                    and source_catalog_unchanged
-                )
+        sort_cursor_eligible = int(
+            source_fingerprint.get("messageSourceCount") or 0
+        ) == 1 and (
+            mode in {"full", "full_reconcile", "sender_identity_reconcile"}
+            or (
+                bool(existing_state and existing_state.get("sortCursorEligible"))
+                and source_catalog_unchanged
             )
         )
         unknown_senders = sum(
@@ -2794,9 +3508,7 @@ def command_sync_contact(args: argparse.Namespace) -> int:
             "manifestSha256": manifest["manifestSha256"],
             "historicalMutationCoverage": manifest["historicalMutationCoverage"],
             "incrementalCursorMode": manifest["incrementalCursorMode"],
-            "undatedIncrementalCoverage": manifest[
-                "undatedIncrementalCoverage"
-            ],
+            "undatedIncrementalCoverage": manifest["undatedIncrementalCoverage"],
             "historicalMediaRefreshCoverage": manifest[
                 "historicalMediaRefreshCoverage"
             ],
@@ -2853,7 +3565,11 @@ def _moments_ai_context(
             current_day = day
         current_contact = moment.get("contact")
         speaker = (
-            str(current_contact.get("displayName") or moment.get("nickname") or "身份未确定")
+            str(
+                current_contact.get("displayName")
+                or moment.get("nickname")
+                or "身份未确定"
+            )
             if isinstance(current_contact, Mapping)
             else str(moment.get("nickname") or "身份未确定")
         )
@@ -2911,6 +3627,7 @@ def _default_moments_export_path(
     return _default_export_root() / "moments" / account / leaf
 
 
+@_transactional_archive
 def command_sync_moments(args: argparse.Namespace) -> int:
     started = time.perf_counter()
     cutoff_s = int(time.time())
@@ -2938,6 +3655,8 @@ def command_sync_moments(args: argparse.Namespace) -> int:
     existing_state = _read_json(state_path)
     if existing_state is None and output.exists() and any(output.iterdir()):
         raise ProductError("sync_output_not_initialized")
+    if existing_state is not None:
+        _verified_archive(output)
     contact: dict[str, Any] | None = None
     if existing_state is not None:
         label = str(existing_state.get("account") or "")
@@ -2954,8 +3673,7 @@ def command_sync_moments(args: argparse.Namespace) -> int:
             if (
                 contact is None
                 or not contact.get("isSelf")
-                or str(contact.get("nativeId") or "")
-                != reader.moments_self_native_id
+                or str(contact.get("nativeId") or "") != reader.moments_self_native_id
             ):
                 reader.close()
                 raise ProductError("sync_identity_mismatch")
@@ -3002,7 +3720,8 @@ def command_sync_moments(args: argparse.Namespace) -> int:
         manifest_path = output / "manifest.json"
         if (
             existing_state is not None
-            and existing_state.get("sourceFingerprint") == source_fingerprint.get("sha256")
+            and existing_state.get("sourceFingerprint")
+            == source_fingerprint.get("sha256")
             and records_path.is_file()
             and context_path.is_file()
             and ai_context_path.is_file()
@@ -3013,11 +3732,10 @@ def command_sync_moments(args: argparse.Namespace) -> int:
             manifest = _read_json(manifest_path)
             if manifest is None:
                 raise ProductError("sync_manifest_invalid")
-            if (
-                manifest.get("sourceFingerprint")
-                != existing_state.get("sourceFingerprint")
-                or int(manifest.get("preservedMomentCount") or 0)
-                != int(existing_state.get("preservedMomentCount") or 0)
+            if manifest.get("sourceFingerprint") != existing_state.get(
+                "sourceFingerprint"
+            ) or int(manifest.get("preservedMomentCount") or 0) != int(
+                existing_state.get("preservedMomentCount") or 0
             ):
                 raise ProductError("sync_manifest_state_mismatch")
             receipt = {
@@ -3072,9 +3790,8 @@ def command_sync_moments(args: argparse.Namespace) -> int:
             username=contact_native_id,
             limit=None,
         )
-        if (
-            reader.moments_source_fingerprint().get("sha256")
-            != source_fingerprint.get("sha256")
+        if reader.moments_source_fingerprint().get("sha256") != source_fingerprint.get(
+            "sha256"
         ):
             raise ProductError("source_changed_during_sync_retry")
         contacts = {
@@ -3245,7 +3962,7 @@ def command_preserve(args: argparse.Namespace) -> int:
     output = Path(args.output)
     if output.exists():
         raise ProductError("preservation_output_already_exists")
-    context = _context_result(args)
+    context = _complete_context(args)
     incomplete = output.with_name(output.name + ".incomplete")
     if incomplete.exists():
         raise ProductError("preservation_incomplete_output_exists")
@@ -3257,15 +3974,24 @@ def command_preserve(args: argparse.Namespace) -> int:
         media_directory = incomplete / "media"
         config = _read_config(_resolve_config_path(getattr(args, "config", None)))
         with _reader(config[str(context["account"])], int(time.time())) as reader:
+            if (
+                "sha256:" + reader.account_identity_commitment
+                != context["accountIdentityCommitment"]
+            ):
+                raise ProductError("reading_account_changed_during_export")
             occurrence = 0
-            for message in context["messages"]:
+            for message in [*context["messages"], *context.get("quotedMessages", [])]:
                 native_id = message.get("nativeId") or {}
                 native_label = _safe_filename(
                     f"{native_id.get('kind')}-{native_id.get('value')}"
                 )
                 for media in message.get("media_manifest") or []:
-                    can_materialize = media.get("materializable") and not media.get("requiresNetwork")
-                    if not media.get("locator") or not (media.get("openable") or can_materialize):
+                    can_materialize = media.get("materializable") and not media.get(
+                        "requiresNetwork"
+                    )
+                    if not media.get("locator") or not (
+                        media.get("openable") or can_materialize
+                    ):
                         continue
                     occurrence += 1
                     try:
@@ -3280,13 +4006,22 @@ def command_preserve(args: argparse.Namespace) -> int:
                             }
                         )
                         continue
-                    media.update(openable=True, open_status="openable", processing_state="available")
+                    media.update(
+                        openable=True,
+                        open_status="openable",
+                        processing_state="available",
+                    )
                     media.pop("materializable", None)
                     media.pop("requiresNetwork", None)
                     media.pop("resolution_gap", None)
                     context["gaps"] = [
-                        gap for gap in context["gaps"]
-                        if not (gap.get("kind") == "media_not_opened" and gap.get("message") == native_id and gap.get("mediaKind") == media.get("kind"))
+                        gap
+                        for gap in context["gaps"]
+                        if not (
+                            gap.get("kind") == "media_not_opened"
+                            and gap.get("message") == native_id
+                            and gap.get("mediaKind") == media.get("kind")
+                        )
                     ]
                     media_directory.mkdir(exist_ok=True)
                     extension = _media_extension(payload, media.get("kind"))
@@ -3307,9 +4042,7 @@ def command_preserve(args: argparse.Namespace) -> int:
                         "messageNativeId": native_id,
                         "mediaId": media.get("mediaId"),
                         "kind": media.get("kind"),
-                        "locatorSha256": _sha256(
-                            str(media["locator"]).encode("utf-8")
-                        ),
+                        "locatorSha256": _sha256(str(media["locator"]).encode("utf-8")),
                         "derivedPaths": [],
                     }
                     media_files.append(record)
@@ -3344,9 +4077,7 @@ def command_preserve(args: argparse.Namespace) -> int:
                                 "messageNativeId": native_id,
                                 "kind": "voice_wav",
                             }
-                            record["derivedPaths"].append(
-                                decoded_relative.as_posix()
-                            )
+                            record["derivedPaths"].append(decoded_relative.as_posix())
                             derived_files.append(decoded_record)
                             files.append(
                                 {
@@ -3371,9 +4102,7 @@ def command_preserve(args: argparse.Namespace) -> int:
             "format": "wechat-direct-preservation.v1",
             "createdAtS": int(time.time()),
             "account": context["account"],
-            "accountIdentityCommitment": context[
-                "accountIdentityCommitment"
-            ],
+            "accountIdentityCommitment": context["accountIdentityCommitment"],
             "contact": context["contact"],
             "requestedWindow": context["requestedWindow"],
             "actualVisibleCutoffS": context["actualVisibleCutoffS"],
@@ -3388,7 +4117,7 @@ def command_preserve(args: argparse.Namespace) -> int:
         _write_json(incomplete / "manifest.json", manifest)
         incomplete.replace(output)
     except Exception:
-        shutil.rmtree(incomplete, ignore_errors=True)
+        shutil.rmtree(incomplete)
         raise
     sys.stdout.buffer.write(
         _canonical_bytes(
@@ -3402,25 +4131,197 @@ def command_preserve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _complete_context(args: argparse.Namespace) -> dict[str, Any]:
+    copied = argparse.Namespace()
+    vars(copied).update(vars(args))
+    copied._materializing = True
+    return _context_result(copied)
+
+
+@_transactional_archive
+def command_repair_media(args: argparse.Namespace) -> int:
+    output = Path(args.output)
+    manifest = _read_json(output / "manifest.json")
+    state = _read_json(output / "state.json")
+    if (
+        not manifest
+        or not state
+        or manifest.get("format") != "wechat-direct-contact-export.v1"
+    ):
+        raise ProductError("repair_requires_contact_archive")
+    old_check = _verify_export_result(output)
+    allowed = {"export_media_unavailable"}
+    if set(old_check["errors"]) - allowed:
+        raise ProductError(
+            "archive_verification_failed:" + ",".join(old_check["errors"])
+        )
+    if state.get("account") != args.account or _normalize_name(
+        args.contact
+    ) not in _contact_match_fields(state.get("contact") or {}):
+        raise ProductError("sync_identity_mismatch")
+    config = _read_config(_resolve_config_path(getattr(args, "config", None)))
+    rows = _read_jsonl(output / "messages.jsonl")
+    target_id = getattr(args, "message_id", None)
+    selected = [
+        row
+        for row in rows
+        if not target_id
+        or str((row.get("nativeId") or {}).get("value")) == target_id
+        or _message_export_key(row) == target_id
+    ]
+    if target_id and len(selected) != 1:
+        raise ProductError("repair_message_not_unique")
+    totals: dict[str, int] = {}
+    attempted = 0
+    with _reader(config[args.account], int(time.time())) as reader:
+        if "sha256:" + reader.account_identity_commitment != state.get(
+            "accountIdentityCommitment"
+        ):
+            raise ProductError("sync_identity_mismatch")
+        for row in selected:
+            updated = []
+            for media in row.get("media_manifest") or []:
+                original = _contained_export_path(output, media.get("exportedPath"))
+                original_valid = original is not None and _file_sha256_and_size(
+                    original
+                ) == (media.get("sha256"), media.get("bytes"))
+                wav = media.get("derivedVoiceWav")
+                wav_path = (
+                    _contained_export_path(output, wav.get("path"))
+                    if isinstance(wav, dict)
+                    else None
+                )
+                wav_valid = wav_path is not None and _file_sha256_and_size(
+                    wav_path
+                ) == (wav.get("sha256"), wav.get("bytes"))
+                needs_retry = not original_valid or (
+                    media.get("kind") == "voice" and not wav_valid
+                )
+                if not needs_retry or (args.kind and media.get("kind") != args.kind):
+                    updated.append(media)
+                    continue
+                attempted += 1
+                pending = dict(media)
+                if original_valid:
+                    payload = original.read_bytes()
+                    local_reader = SimpleNamespace(
+                        open_locator=lambda *_args, _payload=payload, **_kwargs: (
+                            _payload
+                        )
+                    )
+                    pending.update(
+                        openable=True,
+                        locator=pending.get("locator") or "verified-archived-original",
+                    )
+                else:
+                    local_reader = reader
+                if not wav_valid:
+                    pending.pop("derivedVoiceWav", None)
+                projected, counts = _sync_message_media(
+                    local_reader, {"media_manifest": [pending]}, output
+                )
+                updated.extend(projected["media_manifest"])
+                for key, value in counts.items():
+                    totals[key] = totals.get(key, 0) + value
+            if updated:
+                row["media_manifest"] = updated
+    _write_jsonl_atomic(output / "messages.jsonl", rows)
+    full = _contact_ai_context(
+        account=args.account, contact=state["contact"], messages=rows, full_archive=True
+    )
+    ai, count = _bounded_contact_ai_context(
+        account=args.account, contact=state["contact"], messages=rows
+    )
+    _write_text_atomic(output / "context.md", full)
+    _write_text_atomic(output / "ai-context.md", ai)
+    manifest.update(
+        messagesSha256=_sha256((output / "messages.jsonl").read_bytes()),
+        archiveSha256=_sha256(full.encode("utf-8")),
+        archiveBytes=len(full.encode("utf-8")),
+        aiDefaultSha256=_sha256(ai.encode("utf-8")),
+        aiDefaultBytes=len(ai.encode("utf-8")),
+        aiDefaultMessageCount=count,
+        unavailableMediaCount=sum(
+            m.get("exportStatus") != "available_local"
+            for row in rows
+            for m in row.get("media_manifest", [])
+        ),
+    )
+    manifest.pop("manifestSha256", None)
+    manifest["manifestSha256"] = _sha256(_canonical_bytes(manifest))
+    _write_json_atomic(output / "manifest.json", manifest)
+    gaps = sum(
+        bool(m.get("voiceWavGap")) or m.get("exportStatus") != "available_local"
+        for row in rows
+        for m in row.get("media_manifest", [])
+    )
+    receipt = {
+        "status": "partial" if gaps else "success",
+        "mode": "media_repair",
+        "attemptedMedia": attempted,
+        "remainingGaps": gaps,
+        "historyRescanned": False,
+        "networkUsed": False,
+        "output": str(output),
+        "manifestSha256": manifest["manifestSha256"],
+        **totals,
+    }
+    _write_json_atomic(output / "last-run.json", receipt)
+    sys.stdout.buffer.write(_canonical_bytes(receipt))
+    return 0
+
+
 def _add_config_argument(command: argparse.ArgumentParser) -> None:
     command.add_argument("--config")
 
 
 def _add_context_arguments(command: argparse.ArgumentParser) -> None:
     _add_config_argument(command)
-    command.add_argument(
-        "--account", choices=("auto", *ACCOUNT_LABELS), default="auto"
-    )
+    command.add_argument("--account", choices=("auto", *ACCOUNT_LABELS), default="auto")
     command.add_argument("--contact", required=True)
-    command.add_argument("--since", help="inclusive ISO date/time; naive values use Asia/Shanghai")
-    command.add_argument("--until", help="inclusive ISO date/time; fixed across continuation pages")
-    command.add_argument("--around", help="select messages nearest this ISO date/time within the requested window")
-    command.add_argument("--contains", help="match decoded text in this page; follow continuation while status is partial")
-    command.add_argument("--self-only", action="store_true", default=None, help="page through native self messages and unresolved senders; quoted targets remain available, use ordinary --around context for other replies")
-    command.add_argument("--cursor", help="opaque continuation.cursor from the same account, contact and query")
+    command.add_argument(
+        "--since", help="inclusive ISO date/time; naive values use Asia/Shanghai"
+    )
+    command.add_argument(
+        "--until", help="inclusive ISO date/time; fixed across continuation pages"
+    )
+    command.add_argument(
+        "--around",
+        help="select messages nearest this ISO date/time within the requested window",
+    )
+    command.add_argument(
+        "--contains",
+        help="match decoded text in this page; follow continuation while status is partial",
+    )
+    command.add_argument(
+        "--self-only",
+        action="store_true",
+        default=None,
+        help="page through native self messages and unresolved senders; quoted targets remain available, use ordinary --around context for other replies",
+    )
+    command.add_argument(
+        "--cursor",
+        help="opaque continuation.cursor from the same account, contact and query",
+    )
+    command.add_argument(
+        "--byte-limit",
+        type=int,
+        default=MAX_OUTPUT_BYTES,
+        help="stdout JSON budget, 32768-524288 bytes; files retain full selected text",
+    )
     command.add_argument("--lookback-days", type=int, default=7)
-    command.add_argument("--scan-limit", type=int, default=120, help="maximum messages examined per page, 1-500 (default: 120)")
-    command.add_argument("--return-limit", type=int, default=24, help="maximum context messages returned, 1-80 (default: 24)")
+    command.add_argument(
+        "--scan-limit",
+        type=int,
+        default=120,
+        help="maximum messages examined per page, 1-500 (default: 120)",
+    )
+    command.add_argument(
+        "--return-limit",
+        type=int,
+        default=24,
+        help="maximum context messages returned, 1-80 (default: 24)",
+    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -3441,9 +4342,7 @@ def parser() -> argparse.ArgumentParser:
         help="discover complete current local session candidates since a time",
     )
     _add_config_argument(changes)
-    changes.add_argument(
-        "--account", choices=(*ACCOUNT_LABELS, "both"), required=True
-    )
+    changes.add_argument("--account", choices=(*ACCOUNT_LABELS, "both"), required=True)
     changes.add_argument("--since", required=True, help="inclusive ISO date/time")
     changes.add_argument(
         "--until", help="inclusive ISO date/time; defaults to this call's fixed cutoff"
@@ -3451,18 +4350,36 @@ def parser() -> argparse.ArgumentParser:
     changes.set_defaults(handler=command_changes)
 
     reading = commands.add_parser(
-        "export-context", help="materialize one ordered conversation page and its local media for AI or other projects"
+        "export-context",
+        help="materialize one ordered conversation page and its local media for AI or other projects",
     )
     _add_context_arguments(reading)
-    reading.add_argument("--output", required=True, help="new reading-package directory; existing content is preserved")
-    reading.add_argument("--html", action="store_true", help="also create an optional offline HTML view; not required for AI consumption")
-    reading.add_argument("--local-only", action="store_true", help="materialize only existing local media; never request native emoji CDN bytes")
+    reading.add_argument(
+        "--output",
+        required=True,
+        help="new reading-package directory; existing content is preserved",
+    )
+    reading.add_argument(
+        "--html",
+        action="store_true",
+        help="also create an optional offline HTML view; not required for AI consumption",
+    )
+    reading.add_argument(
+        "--local-only",
+        action="store_true",
+        help="materialize only existing local media; never request native emoji CDN bytes",
+    )
     reading.set_defaults(handler=command_export_context)
 
     doctor = commands.add_parser(
         "doctor", help="check local readiness without reading WeChat message bodies"
     )
     _add_config_argument(doctor)
+    doctor.add_argument(
+        "--environment-only",
+        action="store_true",
+        help="do not open settings or account configuration",
+    )
     doctor.set_defaults(handler=command_doctor)
 
     verify_export = commands.add_parser(
@@ -3538,7 +4455,11 @@ def parser() -> argparse.ArgumentParser:
     media.add_argument("--account", choices=ACCOUNT_LABELS, required=True)
     media.add_argument("--locator", required=True)
     media.add_argument("--output", required=True)
-    media.add_argument("--local-only", action="store_true", help="do not request an exact native emoji CDN item when local bytes are unavailable")
+    media.add_argument(
+        "--local-only",
+        action="store_true",
+        help="do not request an exact native emoji CDN item when local bytes are unavailable",
+    )
     media.add_argument(
         "--voice-wav",
         action="store_true",
@@ -3555,6 +4476,50 @@ def parser() -> argparse.ArgumentParser:
     _add_context_arguments(preserve)
     preserve.add_argument("--output", required=True)
     preserve.set_defaults(handler=command_preserve)
+    part = commands.add_parser(
+        "message-part",
+        help="continue one long text field without silently dropping bytes",
+    )
+    _add_config_argument(part)
+    part.add_argument("--account", choices=ACCOUNT_LABELS, required=True)
+    part.add_argument("--contact", required=True)
+    part.add_argument("--cursor", required=True)
+    part.add_argument(
+        "--limit", type=int, default=16384, help="Unicode characters, maximum 32768"
+    )
+    part.set_defaults(handler=command_message_part)
+    repair = commands.add_parser(
+        "repair-media",
+        help="retry missing local media and WAVs in one named archive, without rescanning history",
+    )
+    _add_config_argument(repair)
+    repair.add_argument("--account", choices=ACCOUNT_LABELS, required=True)
+    repair.add_argument("--contact", required=True)
+    repair.add_argument("--output", required=True)
+    repair.add_argument("--message-id")
+    repair.add_argument("--kind", choices=("image", "emoji", "voice", "video", "file"))
+    repair.set_defaults(handler=command_repair_media)
+    recovery = commands.add_parser(
+        "recover-export",
+        help="inspect or recover one interrupted archive publication, offline",
+    )
+    recovery.add_argument("--output", required=True)
+    recovery.add_argument(
+        "--action", choices=("inspect", "rollback", "complete"), default="inspect"
+    )
+    recovery.set_defaults(handler=command_recover_export)
+    scratch = commands.add_parser(
+        "temp-status",
+        help="inspect disposable scratch metadata or clean one exact inactive session",
+    )
+    scratch.add_argument(
+        "--root",
+        required=True,
+        help="parent configured as WECHAT_DIRECT_TEMP_ROOT or task TEMP",
+    )
+    scratch.add_argument("--session")
+    scratch.add_argument("--clean", action="store_true")
+    scratch.set_defaults(handler=command_scratch)
     return root
 
 
@@ -3563,21 +4528,60 @@ def _failure_details(exc: Exception) -> dict[str, Any]:
 
     reason = str(exc)
     retryable = False
-    if reason == "source_changed_during_sync_retry" or type(exc).__name__ == "SnapshotCopyError":
+    if (
+        reason == "source_changed_during_sync_retry"
+        or type(exc).__name__ == "SnapshotCopyError"
+    ):
         action = "retry_same_command"
         retryable = True
-    elif reason.startswith("context_cursor_") or reason == "message_page_cursor_invalid":
+    elif (
+        reason.startswith("context_cursor_") or reason == "message_page_cursor_invalid"
+    ):
         action = "restart_context_without_cursor"
     elif reason in {
-        "time_value_invalid", "time_window_reversed", "scan_limit_invalid",
-        "return_limit_invalid", "lookback_days_invalid",
-        "context_anchor_outside_requested_window", "moments_limit_invalid",
-        "moments_time_window_reversed", "changes_until_after_snapshot_cutoff",
+        "time_value_invalid",
+        "time_window_reversed",
+        "scan_limit_invalid",
+        "return_limit_invalid",
+        "lookback_days_invalid",
+        "context_anchor_outside_requested_window",
+        "moments_limit_invalid",
+        "moments_time_window_reversed",
+        "changes_until_after_snapshot_cutoff",
     }:
         action = "correct_query_arguments"
+    elif reason in {
+        "archive_recovery_required",
+        "archive_staged_not_ready",
+        "archive_recovery_state_ambiguous",
+    }:
+        action = "inspect_recover_export_for_this_exact_output"
+    elif reason == "archive_already_published_use_complete":
+        action = "verify_output_then_recover_export_complete"
+    elif reason in {"archive_operation_running", "archive_changed_during_transaction"}:
+        action = "wait_for_existing_operation_then_retry_same_output"
+        retryable = True
+    elif reason.startswith("message_part_"):
+        action = "reread_context_and_use_new_segment_cursor"
+    elif reason in {
+        "context_byte_limit_invalid",
+        "scratch_exact_session_required",
+        "scratch_session_invalid",
+    }:
+        action = "correct_query_arguments"
+    elif reason == "context_metadata_too_large_use_export_context":
+        action = "export_context_to_an_explicit_new_directory"
+    elif reason.startswith("archive_verification_failed"):
+        action = "verify_existing_export_before_rebuilding"
+    elif reason.startswith("repair_"):
+        action = "check_exact_contact_archive_and_media_selection"
     elif reason == "contact_not_found":
         action = "check_exact_contact_and_account"
-    elif reason in {"media_output_incomplete_exists", "voice_decode_output_already_exists", "reading_output_already_exists"}:
+    elif reason in {
+        "media_output_incomplete_exists",
+        "voice_decode_output_already_exists",
+        "reading_output_already_exists",
+    }:
         action = "inspect_existing_output_or_choose_new_output"
     elif reason == "reading_account_changed_during_export":
         action = "check_configured_local_reader"
@@ -3585,7 +4589,9 @@ def _failure_details(exc: Exception) -> dict[str, Any]:
         action = "inspect_incomplete_export_or_choose_empty_output"
     elif reason == "sync_already_running_or_stale_lock":
         action = "inspect_export_lock_and_running_process"
-    elif (reason.startswith("sync_") and "mismatch" in reason) or reason.startswith("export_"):
+    elif (reason.startswith("sync_") and "mismatch" in reason) or reason.startswith(
+        "export_"
+    ):
         action = "verify_existing_export_before_rebuilding"
     elif reason in {"session_database_unavailable", "contact_database_unavailable"}:
         action = "check_selected_account_local_database"
@@ -3599,9 +4605,12 @@ def _failure_details(exc: Exception) -> dict[str, Any]:
         action = "inspect_error_before_retrying"
     result: dict[str, Any] = {"retryable": retryable, "nextAction": action}
     if isinstance(exc, WeChatDirectError) and reason in {
-        "session_database_unavailable", "contact_database_unavailable",
-        "message_identity_is_conflicting", "incremental_time_index_unavailable",
-        "incremental_sort_seq_index_unavailable", "bounded_context_sort_index_unavailable",
+        "session_database_unavailable",
+        "contact_database_unavailable",
+        "message_identity_is_conflicting",
+        "incremental_time_index_unavailable",
+        "incremental_sort_seq_index_unavailable",
+        "bounded_context_sort_index_unavailable",
         "sort_seq_cursor_regressed_requires_full_reconcile",
     }:
         result["reason"] = reason
@@ -3625,9 +4634,13 @@ def main(argv: list[str] | None = None) -> int:
             payload = {
                 "status": "failed",
                 "error": message
-                if isinstance(exc, ProductError) or (
-                    isinstance(exc, ValueError) and message in {
-                        "message_page_cursor_invalid", "moments_limit_invalid",
+                if isinstance(exc, (ProductError, StorageError))
+                or (
+                    isinstance(exc, ValueError)
+                    and message
+                    in {
+                        "message_page_cursor_invalid",
+                        "moments_limit_invalid",
                         "moments_time_window_reversed",
                     }
                 )

@@ -249,7 +249,16 @@ def recover_archive(output: Path, action: str, verify: Callable[[Path], None]) -
             raise StorageError("archive_original_unavailable")
     _no_links(tx)
     shutil.rmtree(tx)
-    return {**result, "recovered": True, "transactionPresent": False}
+    return {
+        **result,
+        "recovered": True,
+        "observedPhase": result.get("phase"),
+        "phase": "completed" if action == "complete" else "rolled_back",
+        "transactionPresent": tx.exists(),
+        "outputPresent": output.is_dir(),
+        "stagedPresent": stage.is_dir(),
+        "previousPresent": previous.is_dir(),
+    }
 
 
 class ScratchDirectory:

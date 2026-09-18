@@ -1307,6 +1307,81 @@ def command_context(args: argparse.Namespace) -> int:
     return 0
 
 
+def _finalize_package_delivery(context: dict[str, Any]) -> None:
+    """Separate successful package creation from missing selected content.
+
+    Count every media occurrence, including references outside the message page.
+    Source lookup hints are replaced by the actual materialization outcome.
+    """
+    messages = [*context.get("messages", []), *context.get("quotedMessages", [])]
+    media_items = [
+        media for message in messages for media in message.get("media_manifest") or []
+    ]
+    gaps = [
+        gap
+        for gap in context.get("gaps", [])
+        if gap.get("kind")
+        not in {
+            "media_not_opened",
+            "media_not_openable",
+            "media_unavailable",
+            "voice_decode_failed",
+        }
+    ]
+    for message in messages:
+        for media in message.get("media_manifest") or []:
+            identity = {
+                "message": message.get("nativeId"),
+                "mediaId": media.get("mediaId"),
+                "mediaKind": media.get("kind"),
+            }
+            if media.get("exportStatus") != "available_local":
+                gaps.append(
+                    {
+                        "kind": "media_unavailable",
+                        **identity,
+                        "reason": media.get("exportGap")
+                        or media.get("resolution_gap")
+                        or "not_available",
+                    }
+                )
+            if media.get("voiceWavGap"):
+                gaps.append(
+                    {
+                        "kind": "voice_decode_failed",
+                        **identity,
+                        "reason": media["voiceWavGap"],
+                    }
+                )
+    context["gaps"] = gaps
+    context["status"] = (
+        "partial"
+        if context.get("status") == "partial"
+        or gaps
+        or any(message.get("contentGap") for message in messages)
+        else "success"
+    )
+    gap_kinds: dict[str, int] = {}
+    for gap in gaps:
+        kind = str(gap.get("kind") or "unspecified")
+        gap_kinds[kind] = gap_kinds.get(kind, 0) + 1
+    available = sum(
+        media.get("exportStatus") == "available_local" for media in media_items
+    )
+    context["delivery"] = {
+        "messageCount": len(context.get("messages", [])),
+        "quotedMessageCount": len(context.get("quotedMessages", [])),
+        "mediaOccurrences": len(media_items),
+        "mediaAvailable": available,
+        "mediaUnavailable": len(media_items) - available,
+        "voiceWavUnavailable": sum(
+            bool(media.get("voiceWavGap")) for media in media_items
+        ),
+        "hasMore": bool(context.get("coverage", {}).get("hasMore")),
+        "gapKinds": dict(sorted(gap_kinds.items())),
+    }
+
+
 def command_export_context(args: argparse.Namespace) -> int:
     """Materialize one selected page as a portable, ordered reading package."""
 
@@ -1352,24 +1427,7 @@ def command_export_context(args: argparse.Namespace) -> int:
                                 }
                             )
                 context[field] = materialized
-        context["gaps"] = [
-            gap
-            for gap in context["gaps"]
-            if gap.get("kind") not in {"media_not_opened", "media_not_openable"}
-        ]
-        for message in [*context["messages"], *context["quotedMessages"]]:
-            for media in message.get("media_manifest") or []:
-                if media.get("exportStatus") != "available_local":
-                    context["gaps"].append(
-                        {
-                            "kind": "media_unavailable",
-                            "message": message.get("nativeId"),
-                            "mediaKind": media.get("kind"),
-                            "reason": media.get("exportGap")
-                            or media.get("resolution_gap")
-                            or "not_available",
-                        }
-                    )
+        _finalize_package_delivery(context)
         context["format"] = "wechat-direct-reading-package.v1"
         context["mediaExport"] = totals
         if (
@@ -1440,6 +1498,8 @@ def command_export_context(args: argparse.Namespace) -> int:
         _canonical_bytes(
             {
                 "status": context["status"],
+                "packageCreated": True,
+                "delivery": context["delivery"],
                 "format": context["format"],
                 "output": str(output),
                 **(
@@ -3992,11 +4052,15 @@ def command_preserve(args: argparse.Namespace) -> int:
                     if not media.get("locator") or not (
                         media.get("openable") or can_materialize
                     ):
+                        media["exportStatus"] = "unavailable"
                         continue
                     occurrence += 1
                     try:
                         payload = reader.open_locator(str(media["locator"]))
                     except Exception as exc:
+                        media.update(
+                            exportStatus="open_failed", exportGap=type(exc).__name__
+                        )
                         context["gaps"].append(
                             {
                                 "kind": "preservation_media_open_failed",
@@ -4045,6 +4109,12 @@ def command_preserve(args: argparse.Namespace) -> int:
                         "locatorSha256": _sha256(str(media["locator"]).encode("utf-8")),
                         "derivedPaths": [],
                     }
+                    media.update(
+                        exportStatus="available_local",
+                        exportedPath=record["path"],
+                        bytes=record["bytes"],
+                        sha256=record["sha256"],
+                    )
                     media_files.append(record)
                     files.append(
                         {
@@ -4059,6 +4129,7 @@ def command_preserve(args: argparse.Namespace) -> int:
                         try:
                             _decode_voice_file(target, decoded_target)
                         except ProductError as exc:
+                            media["voiceWavGap"] = str(exc)
                             context["gaps"].append(
                                 {
                                     "kind": "voice_decode_failed",
@@ -4078,6 +4149,16 @@ def command_preserve(args: argparse.Namespace) -> int:
                                 "kind": "voice_wav",
                             }
                             record["derivedPaths"].append(decoded_relative.as_posix())
+                            media.pop("voiceWavGap", None)
+                            media["derivedVoiceWav"] = {
+                                key: decoded_record[key]
+                                for key in (
+                                    "path",
+                                    "bytes",
+                                    "sha256",
+                                    "derivedFromSha256",
+                                )
+                            }
                             derived_files.append(decoded_record)
                             files.append(
                                 {
@@ -4087,6 +4168,7 @@ def command_preserve(args: argparse.Namespace) -> int:
                                 }
                             )
 
+        _finalize_package_delivery(context)
         context.pop("manifestSha256", None)
         context["manifestSha256"] = _sha256(_canonical_bytes(context))
         _write_json(incomplete / "messages.json", context)
@@ -4100,6 +4182,8 @@ def command_preserve(args: argparse.Namespace) -> int:
         )
         manifest = {
             "format": "wechat-direct-preservation.v1",
+            "status": context["status"],
+            "delivery": context["delivery"],
             "createdAtS": int(time.time()),
             "account": context["account"],
             "accountIdentityCommitment": context["accountIdentityCommitment"],
@@ -4122,7 +4206,12 @@ def command_preserve(args: argparse.Namespace) -> int:
     sys.stdout.buffer.write(
         _canonical_bytes(
             {
-                "status": "success",
+                "status": context["status"],
+                "format": "wechat-direct-preservation.v1",
+                "packageCreated": True,
+                "delivery": context["delivery"],
+                "hasMore": context["delivery"]["hasMore"],
+                "messageCount": context["delivery"]["messageCount"],
                 "output": os.fspath(output.resolve()),
                 "manifestSha256": manifest["manifestSha256"],
             }

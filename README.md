@@ -10,6 +10,14 @@ WeChatDirect 主要供 AI 调用，是一个 Windows-only 的本地工具：从�
 
 本项目与 Tencent 或 WeChat 没有关联。只应读取本人设备上、本人有权访问的数据；不要用它绕过账号、设备或他人的访问边界。
 
+## 0.2.1：交付完整性回执
+
+`recover-export` 执行 `complete` 或 `rollback` 后，目录存在性字段反映实际操作后的状态；`phase` 为 `completed` 或 `rolled_back`，`observedPhase` 保留操作前阶段。检查模式不修改归档。
+
+`preserve` 和 `export-context` 的 `packageCreated=true` 只表示阅读包或保全包已经生成；`status=partial` 表示选中的消息、引用附件或派生 WAV 仍存在明确缺口，不等于命令执行失败。已生成的部分包仍返回退出码 0，并可用 `verify-export` 验证其现有内容和文件关系。`verify-export` 通过不证明源聊天完整，也不代表所有附件都在本机缓存中。
+
+两种包的 `delivery` 统一报告消息数、引用消息数、媒体出现次数、实际可读与不可读媒体数、缺失 WAV 数、缺口类别及 `hasMore`。每一次引用附件出现都计入统计；SILK 成功但 WAV 失败时保留原件并明确报告。消费方不要仅凭退出码 0 或“包已生成”认定内容完整；`hasMore=true` 时仍须沿游标读取后续页。
+
 ## 先了解边界
 
 - 主 CLI 只支持 Windows，要求 Python 3.14 或更高版本。

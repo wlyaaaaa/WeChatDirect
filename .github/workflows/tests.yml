@@ -24,6 +24,8 @@ jobs:
           python-version: '3.11'
       - name: Install optional native voice codec
         run: python -m pip install pilk==0.2.4
+      - name: Install WXGF decoder tools
+        run: choco install ffmpeg --yes --no-progress
       - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
@@ -42,4 +44,4 @@ jobs:
           WECHAT_DIRECT_VOICE_PYTHON: ${{ steps.voice.outputs.python-path }}
         run: |
           Set-Location $env:RUNNER_TEMP
-          python -B "$env:GITHUB_WORKSPACE/tools/smoke_runtime.py" --require-voice
+          python -B "$env:GITHUB_WORKSPACE/tools/smoke_runtime.py" --require-voice --require-wxgf

@@ -178,6 +178,7 @@ class PortableVerificationTests(unittest.TestCase):
             stream = SimpleNamespace(buffer=io.BytesIO())
             with (
                 patch.object(cli, "_context_result", return_value=context),
+                patch.object(cli, "_resolve_config_path", return_value=Path("synthetic")),
                 patch.object(cli, "_read_config", return_value={"primary": {}}),
                 patch.object(cli, "_reader", return_value=ReadingReader()),
                 patch.object(cli.sys, "stdout", stream),
@@ -235,6 +236,7 @@ class TargetedMediaTests(unittest.TestCase):
                 )
                 stream = SimpleNamespace(buffer=io.BytesIO())
                 with (
+                    patch.object(cli, "_resolve_config_path", return_value=Path("synthetic")),
                     patch.object(cli, "_read_config", return_value={"primary": {}}),
                     patch.object(cli, "_reader", return_value=closing(PendingReader())),
                     patch.object(
@@ -293,6 +295,7 @@ class RuntimeAndPagingTests(unittest.TestCase):
         args = paging.ContextPagingTests()._fetch_args(return_limit=1, scan_limit=1)
         args.byte_limit = 32768
         with (
+            patch.object(cli, "_resolve_config_path", return_value=Path("synthetic")),
             patch.object(
                 cli, "_read_config", return_value={"primary": {}, "secondary": {}}
             ),
@@ -342,6 +345,7 @@ class RuntimeAndPagingTests(unittest.TestCase):
         self.addCleanup(fixture.close)
         args = paging.ContextPagingTests()._fetch_args(return_limit=1, scan_limit=1)
         with (
+            patch.object(cli, "_resolve_config_path", return_value=Path("synthetic")),
             patch.object(cli, "_read_config", return_value={"primary": {}}),
             patch.object(
                 cli,

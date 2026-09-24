@@ -23,6 +23,7 @@ import json
 import mimetypes
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import subprocess
 import sys
@@ -31,7 +32,11 @@ import unicodedata
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
-from wechat_source import DirectWeChatReader, WeChatDirectError
+from wechat_source import (
+    DirectWeChatReader,
+    WeChatDirectError,
+    load_direct_source_identity,
+)
 from wechat_storage import (
     StorageError,
     ScratchDirectory,
@@ -60,6 +65,15 @@ SENDER_IDENTITY_VERSION = "message-shard-name2id-v1"
 
 class ProductError(RuntimeError):
     """A bounded, user-actionable product failure."""
+
+
+class _ArchiveNeedsTransaction(Exception):
+    """A read-only probe found work that needs a staged archive."""
+
+
+class ReceiptArgumentParser(argparse.ArgumentParser):
+    def error(self, _message: str) -> None:
+        raise ProductError("cli_arguments_invalid")
 
 
 def _local_appdata_directory() -> Path:
@@ -137,11 +151,14 @@ def _read_config(path: Path) -> dict[str, dict[str, str]]:
         value = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ProductError("wechat_account_config_unavailable") from exc
-    if not isinstance(value, Mapping) or set(value) != set(ACCOUNT_LABELS):
+    if (
+        not isinstance(value, Mapping)
+        or not value
+        or not set(value).issubset(ACCOUNT_LABELS)
+    ):
         raise ProductError("wechat_account_config_invalid")
     result: dict[str, dict[str, str]] = {}
-    for label in ACCOUNT_LABELS:
-        item = value.get(label)
+    for label, item in value.items():
         if not isinstance(item, Mapping):
             raise ProductError("wechat_account_config_invalid")
         config_path = str(item.get("config_path") or "")
@@ -169,6 +186,35 @@ def _read_config(path: Path) -> dict[str, dict[str, str]]:
             "expected_moments_author_sha256": expected_moments,
         }
     return result
+
+
+def _account_config(config: Mapping[str, dict[str, str]], label: str) -> dict[str, str]:
+    try:
+        return config[label]
+    except KeyError as exc:
+        raise ProductError("wechat_account_not_configured") from exc
+
+
+def command_identity_commitments(args: argparse.Namespace) -> int:
+    """Print only commitments from one existing protected source carrier."""
+
+    _root, _key, identity = load_direct_source_identity(
+        args.config_path, args.local_state_path
+    )
+    suffix = re.fullmatch(r"(.+)_([0-9a-fA-F]{4})", identity)
+    moments_author = suffix.group(1) if suffix else identity
+    sys.stdout.buffer.write(
+        _canonical_bytes(
+            {
+                "status": "success",
+                "expected_source_identity_sha256": _sha256(identity.encode("utf-8")),
+                "expected_moments_author_sha256": _sha256(
+                    moments_author.encode("utf-8")
+                ),
+            }
+        )
+    )
+    return 0
 
 
 def _reader(account: Mapping[str, str], cutoff_s: int) -> DirectWeChatReader:
@@ -364,10 +410,10 @@ def command_changes(args: argparse.Namespace) -> int:
         raise ProductError("changes_until_after_snapshot_cutoff")
 
     config = _read_config(_resolve_config_path(getattr(args, "config", None)))
-    selected_accounts = ACCOUNT_LABELS if args.account == "both" else (args.account,)
+    selected_accounts = tuple(config) if args.account == "both" else (args.account,)
     accounts: dict[str, dict[str, Any]] = {}
     for label in selected_accounts:
-        reader = _reader(config[label], cutoff_s)
+        reader = _reader(_account_config(config, label), cutoff_s)
         try:
             accounts[label] = _changes_account_result(
                 reader,
@@ -438,12 +484,12 @@ def _resolve_contact(
     normalized = _normalize_name(query)
     if not normalized:
         raise ProductError("contact_name_required")
-    labels = ACCOUNT_LABELS if account == "auto" else (account,)
+    labels = tuple(config) if account == "auto" else (account,)
     readers: dict[str, DirectWeChatReader] = {}
     matches: list[tuple[str, dict[str, Any]]] = []
     try:
         for label in labels:
-            reader = _reader(config[label], cutoff_s)
+            reader = _reader(_account_config(config, label), cutoff_s)
             readers[label] = reader
             for contact in reader.list_contacts():
                 if normalized in _contact_match_fields(contact):
@@ -485,10 +531,11 @@ def _resolve_moments_subject(
         raise ProductError("moments_explicit_account_required")
     if self_requested and query:
         raise ProductError("moments_subject_selector_conflict")
-    reader = _reader(config[account], cutoff_s)
+    selected = _account_config(config, account)
+    reader = _reader(selected, cutoff_s)
     try:
         if self_requested:
-            _verify_moments_self_identity(config[account], reader)
+            _verify_moments_self_identity(selected, reader)
             return (
                 account,
                 reader,
@@ -1396,7 +1443,7 @@ def command_export_context(args: argparse.Namespace) -> int:
         totals: dict[str, int] = {}
         config = _read_config(_resolve_config_path(getattr(args, "config", None)))
         with _reader(
-            config[context["account"]], context["sourceSnapshotCutoffS"]
+            _account_config(config, context["account"]), context["sourceSnapshotCutoffS"]
         ) as reader:
             if (
                 "sha256:" + reader.account_identity_commitment
@@ -1637,17 +1684,17 @@ def command_media_open(args: argparse.Namespace) -> int:
         raise ProductError("media_output_incomplete_exists")
     cutoff_s = int(time.time())
     config = _read_config(_resolve_config_path(getattr(args, "config", None)))
-    account = config[args.account]
+    account = _account_config(config, args.account)
     with _reader(account, cutoff_s) as reader:
         resolved = reader.resolve_locator(args.locator)
+        if args.voice_wav and resolved.get("kind") != "voice":
+            raise ProductError("media_is_not_voice")
         data = (
             reader.open_locator(args.locator, allow_remote=True)
             if resolved.get("materializable") and not getattr(args, "local_only", False)
             else reader.open_locator(args.locator)
         )
         resolved = reader.resolve_locator(args.locator)
-        if args.voice_wav and resolved.get("kind") != "voice":
-            raise ProductError("media_is_not_voice")
         output.parent.mkdir(parents=True, exist_ok=True)
         if args.voice_wav:
             if not _is_tencent_silk(data):
@@ -1661,7 +1708,16 @@ def command_media_open(args: argparse.Namespace) -> int:
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
-        temporary.replace(output)
+        try:
+            if os.name == "nt":
+                # Windows rename is exclusive, including on FAT/exFAT targets.
+                temporary.rename(output)
+            else:
+                os.link(temporary, output)
+        except FileExistsError as exc:
+            temporary.unlink(missing_ok=True)
+            raise ProductError("media_output_already_exists") from exc
+        temporary.unlink(missing_ok=True)
         output_data = output.read_bytes()
         receipt = {
             "status": "success",
@@ -2514,20 +2570,56 @@ def _transactional_archive(function):
         stream = SimpleNamespace(buffer=io.BytesIO())
         copied = argparse.Namespace()
         vars(copied).update(vars(args))
+        can_probe = function.__name__ in {
+            "command_sync_contact",
+            "command_sync_moments",
+        }
+
+        def probe(_existing: Path) -> dict[str, Any] | None:
+            if not (output / "state.json").is_file():
+                return None
+            probe_args = argparse.Namespace()
+            vars(probe_args).update(vars(args))
+            probe_args.output = str(output)
+            probe_args._fast_path_only = True
+            probe_stream = SimpleNamespace(buffer=io.BytesIO())
+            try:
+                with redirect_stdout(probe_stream):
+                    code = function(probe_args)
+            except _ArchiveNeedsTransaction:
+                return None
+            if code not in (0, None):
+                raise ProductError("archive_operation_failed")
+            try:
+                receipt = json.loads(probe_stream.buffer.getvalue())
+            except (ValueError, UnicodeError) as exc:
+                raise ProductError("archive_result_invalid") from exc
+            if receipt.get("noChange") is not True:
+                raise ProductError("archive_result_invalid")
+            return receipt
+
         try:
-            with archive_transaction(output, _verified_archive) as stage:
-                copied.output = str(stage)
-                with redirect_stdout(stream):
-                    code = function(copied)
-                if code not in (0, None):
-                    raise ProductError("archive_operation_failed")
-                try:
-                    receipt = json.loads(stream.buffer.getvalue())
-                except (ValueError, UnicodeError) as exc:
-                    raise ProductError("archive_result_invalid") from exc
-                receipt["output"] = str(output)
-                receipt["publication"] = "verified_staged_directory"
-                _write_json_atomic(stage / "last-run.json", receipt)
+            with archive_transaction(
+                output, _verified_archive, probe=probe if can_probe else None
+            ) as stage:
+                if isinstance(stage, dict):
+                    receipt = stage
+                    receipt["output"] = str(output)
+                    receipt["publication"] = "verified_existing_directory"
+                    _write_json_atomic(output / "last-run.json", receipt)
+                else:
+                    copied.output = str(stage)
+                    with redirect_stdout(stream):
+                        code = function(copied)
+                    if code not in (0, None):
+                        raise ProductError("archive_operation_failed")
+                    try:
+                        receipt = json.loads(stream.buffer.getvalue())
+                    except (ValueError, UnicodeError) as exc:
+                        raise ProductError("archive_result_invalid") from exc
+                    receipt["output"] = str(output)
+                    receipt["publication"] = "verified_staged_directory"
+                    _write_json_atomic(stage / "last-run.json", receipt)
             sys.stdout.buffer.write(_canonical_bytes(receipt))
             return 0
         except StorageError as exc:
@@ -3123,7 +3215,7 @@ def command_sync_contact(args: argparse.Namespace) -> int:
         label = str(existing_state.get("account") or "")
         if label not in ACCOUNT_LABELS or args.account not in ("auto", label):
             raise ProductError("sync_identity_mismatch")
-        reader = _reader(config[label], cutoff_s)
+        reader = _reader(_account_config(config, label), cutoff_s)
         stored_contact = existing_state.get("contact")
         if not isinstance(stored_contact, Mapping):
             reader.close()
@@ -3263,9 +3355,12 @@ def command_sync_contact(args: argparse.Namespace) -> int:
                         "historicalMediaRefreshCoverage"
                     ),
                 }
-                _write_json_atomic(output / "last-run.json", receipt)
+                if not getattr(args, "_fast_path_only", False):
+                    _write_json_atomic(output / "last-run.json", receipt)
                 sys.stdout.buffer.write(_canonical_bytes(receipt))
                 return 0
+        if getattr(args, "_fast_path_only", False):
+            raise _ArchiveNeedsTransaction()
         end_s = cutoff_s
         if since_s is not None and since_s > end_s:
             raise ProductError("time_window_reversed")
@@ -3722,14 +3817,15 @@ def command_sync_moments(args: argparse.Namespace) -> int:
         label = str(existing_state.get("account") or "")
         if label not in ACCOUNT_LABELS or args.account != label:
             raise ProductError("sync_identity_mismatch")
-        reader = _reader(config[label], cutoff_s)
+        selected = _account_config(config, label)
+        reader = _reader(selected, cutoff_s)
         stored_contact = existing_state.get("contact")
         if stored_contact is not None and not isinstance(stored_contact, Mapping):
             reader.close()
             raise ProductError("sync_state_invalid")
         contact = dict(stored_contact) if isinstance(stored_contact, Mapping) else None
         if self_requested:
-            _verify_moments_self_identity(config[label], reader)
+            _verify_moments_self_identity(selected, reader)
             if (
                 contact is None
                 or not contact.get("isSelf")
@@ -3756,7 +3852,7 @@ def command_sync_moments(args: argparse.Namespace) -> int:
         )
     else:
         label = str(args.account)
-        reader = _reader(config[label], cutoff_s)
+        reader = _reader(_account_config(config, label), cutoff_s)
     lock: Path | None = None
     try:
         lock = _sync_lock(output)
@@ -3825,9 +3921,12 @@ def command_sync_moments(args: argparse.Namespace) -> int:
                 "sourceFingerprintFiles": source_fingerprint.get("fileCount"),
                 "manifestSha256": manifest.get("manifestSha256"),
             }
-            _write_json_atomic(output / "last-run.json", receipt)
+            if not getattr(args, "_fast_path_only", False):
+                _write_json_atomic(output / "last-run.json", receipt)
             sys.stdout.buffer.write(_canonical_bytes(receipt))
             return 0
+        if getattr(args, "_fast_path_only", False):
+            raise _ArchiveNeedsTransaction()
         contact_directory = [
             item
             for item in reader.list_contacts(include_unregistered=True)
@@ -4033,7 +4132,7 @@ def command_preserve(args: argparse.Namespace) -> int:
         derived_files: list[dict[str, Any]] = []
         media_directory = incomplete / "media"
         config = _read_config(_resolve_config_path(getattr(args, "config", None)))
-        with _reader(config[str(context["account"])], int(time.time())) as reader:
+        with _reader(_account_config(config, str(context["account"])), int(time.time())) as reader:
             if (
                 "sha256:" + reader.account_identity_commitment
                 != context["accountIdentityCommitment"]
@@ -4262,7 +4361,7 @@ def command_repair_media(args: argparse.Namespace) -> int:
         raise ProductError("repair_message_not_unique")
     totals: dict[str, int] = {}
     attempted = 0
-    with _reader(config[args.account], int(time.time())) as reader:
+    with _reader(_account_config(config, args.account), int(time.time())) as reader:
         if "sha256:" + reader.account_identity_commitment != state.get(
             "accountIdentityCommitment"
         ):
@@ -4414,13 +4513,22 @@ def _add_context_arguments(command: argparse.ArgumentParser) -> None:
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(
+    root = ReceiptArgumentParser(
         description=(
             "Read ordered local WeChat context and materialize precisely bound "
             "media for downstream AI and other projects."
         )
     )
-    commands = root.add_subparsers(dest="command", required=True)
+    commands = root.add_subparsers(
+        dest="command", required=True, parser_class=ReceiptArgumentParser
+    )
+    commitments = commands.add_parser(
+        "identity-commitments",
+        help="derive account and Moments SHA-256 commitments from one existing protected source carrier",
+    )
+    commitments.add_argument("--config-path", required=True)
+    commitments.add_argument("--local-state-path", required=True)
+    commitments.set_defaults(handler=command_identity_commitments)
 
     context = commands.add_parser("context", help="read one bounded chat context")
     _add_context_arguments(context)
@@ -4650,9 +4758,13 @@ def _failure_details(exc: Exception) -> dict[str, Any]:
     elif reason in {"archive_operation_running", "archive_changed_during_transaction"}:
         action = "wait_for_existing_operation_then_retry_same_output"
         retryable = True
+    elif reason == "archive_output_in_use":
+        action = "close_archive_readers_and_retry_same_output"
+        retryable = True
     elif reason.startswith("message_part_"):
         action = "reread_context_and_use_new_segment_cursor"
     elif reason in {
+        "cli_arguments_invalid",
         "context_byte_limit_invalid",
         "scratch_exact_session_required",
         "scratch_session_invalid",
@@ -4666,7 +4778,10 @@ def _failure_details(exc: Exception) -> dict[str, Any]:
         action = "check_exact_contact_archive_and_media_selection"
     elif reason == "contact_not_found":
         action = "check_exact_contact_and_account"
+    elif reason == "wechat_account_not_configured":
+        action = "choose_configured_account_or_add_requested_slot"
     elif reason in {
+        "media_output_already_exists",
         "media_output_incomplete_exists",
         "voice_decode_output_already_exists",
         "reading_output_already_exists",
@@ -4707,9 +4822,21 @@ def _failure_details(exc: Exception) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
     try:
+        args = parser().parse_args(argv)
         return int(args.handler(args))
+    except KeyboardInterrupt:
+        sys.stdout.buffer.write(
+            _canonical_bytes(
+                {
+                    "status": "failed",
+                    "error": "operation_interrupted",
+                    "retryable": False,
+                    "nextAction": "inspect_interrupted_operation_and_output",
+                }
+            )
+        )
+        return 130
     except Exception as exc:
         message = str(exc)
         if message.startswith("contact_ambiguous:"):

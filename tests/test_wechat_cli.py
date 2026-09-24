@@ -1001,7 +1001,7 @@ class WeChatCliTests(unittest.TestCase):
             self.assertEqual(receipt["newMessages"], 1)
             self.assertEqual(receipt["totalMessages"], 3)
             self.assertIsNone(created[0].fetch_calls[0]["since_sort_seq"])
-            self.assertIsNotNone(created[1].fetch_calls[0]["since_sort_seq"])
+            self.assertIsNotNone(created[-1].fetch_calls[0]["since_sort_seq"])
             records = wechat_cli._read_jsonl(destination / "messages.jsonl")
             self.assertEqual([item["serverId"] for item in records], ["10", "11", "12"])
 

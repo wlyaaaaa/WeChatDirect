@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -18,6 +19,61 @@ def _sha256(value: bytes) -> str:
 
 
 class PublicCommandTests(unittest.TestCase):
+    def test_one_configured_account_and_missing_explicit_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._write_config(Path(temporary))
+            config = json.loads(path.read_text(encoding="utf-8"))
+            config.pop("secondary")
+            path.write_text(json.dumps(config), encoding="utf-8")
+            configured = wechat_cli._read_config(path)
+            self.assertEqual(list(configured), ["primary"])
+
+            class Reader:
+                def list_contacts(self):
+                    return [{"nativeId": "synthetic", "displayName": "Synthetic"}]
+
+                def close(self):
+                    return None
+
+            with mock.patch.object(wechat_cli, "_reader", return_value=Reader()):
+                label, reader, _contact = wechat_cli._resolve_contact(
+                    configured, account="auto", query="Synthetic", cutoff_s=1
+                )
+            self.assertEqual(label, "primary")
+            reader.close()
+            with self.assertRaisesRegex(
+                wechat_cli.ProductError, "wechat_account_not_configured"
+            ):
+                wechat_cli._account_config(configured, "secondary")
+
+    def test_identity_helper_emits_only_commitments(self) -> None:
+        args = argparse.Namespace(config_path="synthetic", local_state_path="state")
+        with mock.patch.object(
+            wechat_cli,
+            "load_direct_source_identity",
+            return_value=(Path("synthetic"), "private-key", "wxid-private_AB12"),
+        ):
+            code, receipt = self._capture(
+                wechat_cli.command_identity_commitments, args
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            receipt["expected_source_identity_sha256"],
+            _sha256(b"wxid-private_AB12"),
+        )
+        self.assertEqual(
+            receipt["expected_moments_author_sha256"],
+            _sha256(b"wxid-private"),
+        )
+        self.assertNotIn("private-key", json.dumps(receipt))
+        self.assertNotIn("wxid-private", json.dumps(receipt))
+
+    def test_invalid_cli_arguments_have_json_failure_receipt(self) -> None:
+        code, receipt = self._capture(wechat_cli.main, ["media-open"])
+        self.assertEqual(code, 2)
+        self.assertEqual(receipt["error"], "cli_arguments_invalid")
+        self.assertEqual(receipt["nextAction"], "correct_query_arguments")
+
     def _capture(self, function, args: argparse.Namespace) -> tuple[int, dict]:
         stream = io.BytesIO()
         stdout = SimpleNamespace(buffer=stream)

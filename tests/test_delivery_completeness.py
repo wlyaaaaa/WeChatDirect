@@ -82,6 +82,7 @@ class DeliveryCompletenessTests(unittest.TestCase):
         args = cli.parser().parse_args(argv)
         with (
             patch.object(cli, "_complete_context", return_value=deepcopy(data)),
+            patch.object(cli, "_resolve_config_path", return_value=Path("synthetic")),
             patch.object(cli, "_read_config", return_value={"primary": {}}),
             patch.object(cli, "_reader", return_value=Reader()),
             patch.object(cli.sys, "stdout", stdout),

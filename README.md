@@ -10,6 +10,10 @@ WeChatDirect 主要供 AI 调用，是一个 Windows-only 的本地工具：从�
 
 本项目与 Tencent 或 WeChat 没有关联。只应读取本人设备上、本人有权访问的数据；不要用它绕过账号、设备或他人的访问边界。
 
+## 0.2.2：配置与归档审计修复
+
+配置可只含一个有效账号槽位，并可用 `identity-commitments` 从已有本地受保护载体生成两项身份承诺。完整加密数据库与加密 WAL 的合成读取进入回归；来源未变的联系人和朋友圈档案仍核验完整性，但不再复制和重新发布整树。媒体输出发布避免覆盖并发创建的目标，命令参数失败输出结构化 JSON；Windows CI 同时要求语音和 WXGF 合成转码。
+
 ## 0.2.1：交付完整性回执
 
 `recover-export` 执行 `complete` 或 `rollback` 后，目录存在性字段反映实际操作后的状态；`phase` 为 `completed` 或 `rolled_back`，`observedPhase` 保留操作前阶段。检查模式不修改归档。
@@ -72,7 +76,7 @@ py -3.11 -m pip install pilk
 
 `.wechatdirect.local.json` 只允许两个键：`config` 和 `export_root`。可复制 `local-settings.example.json` 后填入本机值；该文件只应留在本机，不要提交或分享。
 
-`accounts.example.json` 只展示结构和占位符。真实配置需要为两个隔离槽位分别填写：
+`accounts.example.json` 只展示结构和占位符。真实配置至少填写一个槽位；键名只允许 `primary`、`secondary`，两者均可配置。`auto` 和 `changes --account both` 只检查已配置槽位，显式点名缺失槽位返回 `wechat_account_not_configured`，不会转到另一账号。每个已配置槽位须填写：
 
 - `config_path`：加密账号配置载体的位置；
 - `local_state_path`：该账号的本地状态位置；
@@ -81,11 +85,21 @@ py -3.11 -m pip install pilk
 
 示例中的路径和 `sha256:<...>` 都不是可用值，必须替换为自己的实际值。配置不保存微信密钥明文；仍应使用仅当前 Windows 用户可读的 ACL，并把本地配置、数据库路径、身份承诺、消息和媒体视为敏感资料。不要把真实配置、导出目录或终端回执发布到公开仓库。
 
+`config_path` 指向已有的本地来源配置 JSON，而不是 `accounts.json`。它至少含 `dbPath`（账号目录或其父目录）、`decryptKey`（64 位十六进制数据库主密钥）和 `myWxid`（原生账号 ID）；可选的 `wxidConfigs.<myWxid>.imageAesKey/imageXorKey` 用于图片。上述字符串可为明文或 `safe:` 加 base64 封装；封装内容为 `v10`、12 字节 nonce 和 AES-GCM 密文。`local_state_path` 指向同一来源配置使用的 Chromium 风格 `Local State` JSON，其 `os_crypt.encrypted_key` 是 base64 编码、以 `DPAPI` 开头的受 Windows 当前用户保护的密钥。两份载体必须属于同一账号与 Windows 用户。WeChatDirect 读取已有载体，不生成数据库密钥或这些载体；项目没有核实可公开指定的生成程序及版本，因此不要用昵称、其他账号文件或任意导出工具的相似字段替代。
+
+已有这两份载体时，可在原本有权读取它们的 Windows 用户下计算配置承诺；命令只输出两个 SHA-256 值，不输出原生 ID 或密钥：
+
+```powershell
+wechat-direct identity-commitments --config-path "<source-config.json>" --local-state-path "<Local State>"
+```
+
+把输出的 `expected_source_identity_sha256` 和 `expected_moments_author_sha256` 分别填入该槽位。前者是 UTF-8 编码 `myWxid` 的 SHA-256；后者先严格去掉原生 ID 末尾的 `_` 加四位十六进制存储后缀（若存在），再取 UTF-8 SHA-256。运行时仍会独立校验来源身份，不会因能计算承诺就自动信任或改写配置。
+
 图片解码按当前来源身份从同一配置载体的 `wxidConfigs` 读取 `imageAesKey`、`imageXorKey`，缺少账号专属项时才使用身份一致的当前顶层项；沿用原有 DPAPI/safe 解封流程，仅在进程内使用。不会从昵称或配置目录名猜账号，不要求重新粘贴已保存的密钥，也不把密钥写入阅读包、终端或 Git。媒体字段缺失不影响普通文字读取。
 
 ## 命令
 
-下面的 `primary`、`secondary` 是示例配置中的隔离槽位名，不代表真实账号；`<contact>`、`<group>`、`<locator>` 和 `<output>` 都必须替换为当前结果中的值。除特别说明外，输出是 stdout 上的一份 JSON 回执或结果。
+下面的 `primary`、`secondary` 是示例配置中的隔离槽位名，不代表真实账号；`<contact>`、`<group>`、`<locator>` 和 `<output>` 都必须替换为当前结果中的值。除 `--help` 的帮助文本外，正常完成和可由 Python 捕获的命令/参数失败会在 stdout 输出一份 JSON 回执或结果；进程被强制终止时不能保证回执。
 
 ### `context`：读取一段聊天上下文
 
@@ -147,7 +161,7 @@ wechat-direct sync-contact --account primary --contact "<contact-or-group>"
 wechat-direct sync-contact --account primary --contact "<contact-or-group>" --full-reconcile
 ```
 
-第一次只在全新空目录中为点名对象建立本机可见档案。已有匹配 `manifest.json` 和 `state.json` 的完成态档案时，重复同一命令才会使用来源指纹、游标和有界重叠窗口增量刷新；需要重新核对全部本地历史时，可再次显式使用 `--full-reconcile`。新版本先在同级事务目录完成构建和校验，再发布。正常失败保留原档案；硬中断使用下文 `recover-export` 检查和恢复。它不是逐消息断点续跑，也不是全账号同步或常驻任务。
+第一次只在全新空目录中为点名对象建立本机可见档案。已有匹配 `manifest.json` 和 `state.json` 的完成态档案时，重复同一命令才会使用来源指纹、游标和有界重叠窗口增量刷新；需要重新核对全部本地历史时，可再次显式使用 `--full-reconcile`。来源未变时仍核验已有档案、媒体和并发变化，但跳过整树复制、暂存副本验证和目录改名；有变化时先在同级事务目录完成构建和校验，再发布。正常失败保留原档案；硬中断使用下文 `recover-export` 检查和恢复。它不是逐消息断点续跑，也不是全账号同步或常驻任务。
 
 说话人编号只在消息所在分片的 `Name2Id` 中解释；本人原生用户名按该账号既有用户名承诺匹配，不从账号目录后缀、昵称或其他数据库推断。主副账号、私聊和群聊共用此规则，消息 `serverId` 与 `nativeId.value` 始终以字符串返回，避免长整数精度丢失。
 
@@ -183,7 +197,7 @@ wechat-direct media-open --account primary --locator "<voice-locator>" --output 
 wechat-direct media-open --account primary --locator "<media-locator>" --output "<output-file>" --local-only
 ```
 
-目标输出必须不存在。图片会交付标准可读格式，表情保留静态或动画；语音普通调用保留 SILK，`--voice-wav` 使用上文的 Python 3.11 + `pilk` 派生 WAV。stdout 回执给出实际类型、质量、来源、字节数和 SHA-256。
+目标输出必须不存在，包括发布前被另一进程创建的情况。图片会交付标准可读格式，表情保留静态或动画；语音普通调用保留 SILK，`--voice-wav` 使用上文的 Python 3.11 + `pilk` 派生 WAV。stdout 回执给出实际类型、质量、来源、字节数和 SHA-256。
 
 ### `preserve`：保全一个明确的聊天窗口
 
@@ -283,7 +297,7 @@ wechat-direct temp-status --root "<task-temp-parent>" --session "<exact-session>
 
 ### 安装与验证
 
-`constraints-verified.txt` 记录已验证的主要依赖组合，便于复现，不禁止未来兼容版本。 静态检查规则由 `pyproject.toml` 显式固定为项目既有的 E4/E7/E9/F 正确性检查，不依赖 Ruff 版本的默认规则集合；新工具默认风格要求不自动变成业务验收要求。Windows CI 同时验证该组合和当前依赖，使用合成消息、真实 SQLite WAL、人工加密页及故障注入，不携带真实账号、聊天、密钥或导出。Python 3.11 的语音解释器和 Python 3.14 主程序分别验收。主程序环境中的 `tools/smoke_runtime.py --voice-python <python311.exe> --require-voice --require-wxgf` 可用合成音频与图像验证真实解码链；安装验收应从源码目录之外调用，防止源码导入冒充安装成功。
+`constraints-verified.txt` 记录已验证的主要依赖组合，便于复现，不禁止未来兼容版本。静态检查规则由 `pyproject.toml` 显式固定为项目既有的 E4/E7/E9/F 正确性检查，不依赖 Ruff 版本的默认规则集合；新工具默认风格要求不自动变成业务验收要求。Windows CI 同时验证该组合和当前依赖，使用合成消息、完整加密 SQLite 数据库及加密 WAL、真实 SQLite WAL、人工加密页和故障注入，不携带真实账号、聊天、密钥或导出。CI 现在安装 ffmpeg，并同时要求合成语音与 WXGF 转码 smoke 通过。主程序环境中的 `tools/smoke_runtime.py --voice-python <python311.exe> --require-voice --require-wxgf` 可用合成音频与图像验证真实解码链；安装验收应从源码目录之外调用，防止源码导入冒充安装成功。
 
 ## 许可证
 

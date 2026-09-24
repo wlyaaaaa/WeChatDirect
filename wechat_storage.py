@@ -105,7 +105,12 @@ def _target_key(output: Path) -> str:
 
 
 @contextmanager
-def archive_transaction(output: Path, verify: Callable[[Path], None]) -> Iterator[Path]:
+def archive_transaction(
+    output: Path,
+    verify: Callable[[Path], None],
+    *,
+    probe: Callable[[Path], dict | None] | None = None,
+) -> Iterator[Path | dict]:
     """Stage a replacement, verify it, then publish with a recoverable old copy.
 
     The two directory renames are not a filesystem-wide atomic transaction.
@@ -137,6 +142,17 @@ def archive_transaction(output: Path, verify: Callable[[Path], None]) -> Iterato
             _json(tx / "transaction.json", metadata)
             before = _tree_signature(output)
             try:
+                if probe is not None and output.exists():
+                    unchanged = probe(output)
+                    if unchanged is not None:
+                        if (
+                            _tree_signature(output) != before
+                            or (output / ".sync.lock").exists()
+                        ):
+                            raise StorageError("archive_changed_during_transaction")
+                        cleanup = True
+                        yield unchanged
+                        return
                 if output.exists():
                     shutil.copytree(output, stage)
                 else:
@@ -151,12 +167,17 @@ def archive_transaction(output: Path, verify: Callable[[Path], None]) -> Iterato
                 metadata["phase"] = "ready"
                 _json(tx / "transaction.json", metadata)
                 if output.exists():
-                    output.rename(previous)
+                    try:
+                        output.rename(previous)
+                    except PermissionError as exc:
+                        raise StorageError("archive_output_in_use") from exc
                 try:
                     stage.rename(output)
-                except Exception:
+                except Exception as exc:
                     if previous.exists() and not output.exists():
                         previous.rename(output)
+                    if isinstance(exc, PermissionError):
+                        raise StorageError("archive_output_in_use") from exc
                     raise
                 metadata["phase"] = "published"
                 _json(tx / "transaction.json", metadata)
@@ -296,10 +317,6 @@ class ScratchDirectory:
         self._lease.__exit__(None, None, None)
         self._closed = True
         shutil.rmtree(self.name)
-        try:
-            Path(self.name).parent.rmdir()
-        except OSError:
-            pass
 
 
 def scratch_status(

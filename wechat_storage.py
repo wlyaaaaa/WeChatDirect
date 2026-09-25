@@ -74,24 +74,110 @@ def exclusive_file(path: Path, *, create: bool = True) -> Iterator[None]:
                 fcntl.flock(stream, fcntl.LOCK_UN)
 
 
-def _content_fingerprint(path: Path) -> str:
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+@contextmanager
+def _output_access() -> Iterator[None]:
+    """Report a sharing violation from another process as one stable code."""
+    try:
+        yield
+    except PermissionError as exc:
+        raise StorageError("archive_output_in_use") from exc
+
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    class _FileBasicInfo(ctypes.Structure):
+        _fields_ = [
+            ("CreationTime", ctypes.c_int64),
+            ("LastAccessTime", ctypes.c_int64),
+            ("LastWriteTime", ctypes.c_int64),
+            ("ChangeTime", ctypes.c_int64),
+            ("FileAttributes", wintypes.DWORD),
+        ]
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.CreateFileW.restype = wintypes.HANDLE
+    _kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    _kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    _kernel32.GetFileInformationByHandleEx.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _INVALID_HANDLE = wintypes.HANDLE(-1).value
+
+    def _change_time(path: Path, _stat: os.stat_result) -> int:
+        # Windows st_ctime is the creation time, so a rewrite that restores
+        # its write time would be invisible. NTFS ChangeTime is not settable
+        # through os.utime and is read without opening the file's data.
+        handle = _kernel32.CreateFileW(
+            str(path),
+            0x80,  # FILE_READ_ATTRIBUTES
+            0x7,  # share read, write and delete
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS (directories)
+            None,
+        )
+        if handle == _INVALID_HANDLE:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            info = _FileBasicInfo()
+            if not _kernel32.GetFileInformationByHandleEx(
+                handle, 0, ctypes.byref(info), ctypes.sizeof(info)
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return info.ChangeTime
+        finally:
+            _kernel32.CloseHandle(handle)
+
+else:
+
+    def _change_time(_path: Path, stat: os.stat_result) -> int:
+        return stat.st_ctime_ns
 
 
 def _tree_signature(root: Path) -> list[tuple]:
+    """Detect concurrent archive edits from metadata alone.
+
+    Size, write time and the filesystem change time move on any rewrite,
+    including one that restores the previous write time, so an unchanged
+    archive is confirmed without reading and hashing every file.
+    """
     if not root.exists():
         return []
     _no_links(root)
-    return sorted(
-        (
-            p.relative_to(root).as_posix(),
-            p.stat().st_size,
-            p.stat().st_mtime_ns,
-            _content_fingerprint(p) if p.is_file() else None,
+    entries = []
+    for p in root.rglob("*"):
+        stat = p.stat()
+        entries.append(
+            (
+                p.relative_to(root).as_posix(),
+                p.is_file(),
+                stat.st_size,
+                stat.st_mtime_ns,
+                _change_time(p, stat),
+            )
         )
-        for p in root.rglob("*")
-    )
+    return sorted(entries)
+
+
+def _copy_file(source: str, target: str) -> object:
+    # copytree folds per-file OSErrors into one text-only shutil.Error; raise
+    # the stable code before that loses the sharing-violation type.
+    with _output_access():
+        return shutil.copy2(source, target)
 
 
 def transaction_path(output: Path) -> Path:
@@ -129,7 +215,7 @@ def archive_transaction(
     except FileExistsError as exc:
         raise StorageError("archive_recovery_required") from exc
     stage, previous = tx / "stage", tx / "previous"
-    cleanup = False
+    cleanup = failed = False
     try:
         with exclusive_file(tx / "lease"):
             metadata = {
@@ -140,29 +226,29 @@ def archive_transaction(
                 "hadOriginal": output.exists(),
             }
             _json(tx / "transaction.json", metadata)
-            before = _tree_signature(output)
             try:
+                with _output_access():
+                    before = _tree_signature(output)
                 if probe is not None and output.exists():
                     unchanged = probe(output)
                     if unchanged is not None:
-                        if (
-                            _tree_signature(output) != before
-                            or (output / ".sync.lock").exists()
-                        ):
+                        with _output_access():
+                            after = _tree_signature(output)
+                        if after != before or (output / ".sync.lock").exists():
                             raise StorageError("archive_changed_during_transaction")
                         cleanup = True
                         yield unchanged
                         return
                 if output.exists():
-                    shutil.copytree(output, stage)
+                    with _output_access():
+                        shutil.copytree(output, stage, copy_function=_copy_file)
                 else:
                     stage.mkdir()
                 yield stage
-                verify(stage)
-                if (
-                    _tree_signature(output) != before
-                    or (output / ".sync.lock").exists()
-                ):
+                with _output_access():
+                    verify(stage)
+                    after = _tree_signature(output)
+                if after != before or (output / ".sync.lock").exists():
                     raise StorageError("archive_changed_during_transaction")
                 metadata["phase"] = "ready"
                 _json(tx / "transaction.json", metadata)
@@ -183,6 +269,7 @@ def archive_transaction(
                 _json(tx / "transaction.json", metadata)
                 cleanup = True
             except Exception:
+                failed = True
                 # Do not discard the only complete original if rollback itself fails.
                 if previous.exists() and not output.exists():
                     previous.rename(output)
@@ -195,7 +282,14 @@ def archive_transaction(
     finally:
         if cleanup:
             _no_links(tx)
-            shutil.rmtree(tx)
+            try:
+                shutil.rmtree(tx)
+            except PermissionError as exc:
+                # A held file in the replaced copy leaves the journal in place
+                # for recover-export. Keep an earlier failure as the reported
+                # cause instead of masking it with this cleanup error.
+                if not failed:
+                    raise StorageError("archive_output_in_use") from exc
 
 
 def recover_archive(output: Path, action: str, verify: Callable[[Path], None]) -> dict:
@@ -231,7 +325,7 @@ def recover_archive(output: Path, action: str, verify: Callable[[Path], None]) -
         return result
     if action not in {"rollback", "complete"}:
         raise StorageError("archive_recovery_action_invalid")
-    with exclusive_file(tx / "lease"):
+    with exclusive_file(tx / "lease"), _output_access():
         if action == "complete":
             if stage.is_dir():
                 if metadata.get("phase") != "ready":
@@ -269,7 +363,8 @@ def recover_archive(output: Path, action: str, verify: Callable[[Path], None]) -
         elif metadata.get("hadOriginal") and not output.is_dir():
             raise StorageError("archive_original_unavailable")
     _no_links(tx)
-    shutil.rmtree(tx)
+    with _output_access():
+        shutil.rmtree(tx)
     return {
         **result,
         "recovered": True,

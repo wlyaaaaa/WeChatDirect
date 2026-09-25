@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import isolation  # noqa: F401
+
 from copy import deepcopy
 from contextlib import closing
 import io

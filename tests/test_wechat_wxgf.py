@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import isolation  # noqa: F401
+
 import subprocess
 import unittest
 from unittest.mock import patch

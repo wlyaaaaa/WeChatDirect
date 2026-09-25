@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import isolation  # noqa: F401
+
 import argparse
 import hashlib
 import io

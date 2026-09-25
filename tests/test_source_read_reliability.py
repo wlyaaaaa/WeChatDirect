@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import isolation  # noqa: F401
+
 import json
 from pathlib import Path
 import sqlite3

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import isolation  # noqa: F401
+
 import os
 from pathlib import Path
 import tempfile

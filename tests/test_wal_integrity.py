@@ -1,6 +1,9 @@
 """Synthetic SQLCipher pages and real SQLite WALs; no account data required."""
 
 from __future__ import annotations
+
+import isolation  # noqa: F401
+
 import hashlib
 import hmac
 import sqlite3

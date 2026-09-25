@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import isolation  # noqa: F401
+
 import unittest
 
 from wechat_render import render_conversation_html

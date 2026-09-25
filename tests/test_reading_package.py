@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import isolation  # noqa: F401
+
 import base64
 from copy import deepcopy
 import hashlib

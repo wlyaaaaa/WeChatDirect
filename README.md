@@ -297,7 +297,7 @@ wechat-direct temp-status --root "<task-temp-parent>" --session "<exact-session>
 
 ### 安装与验证
 
-`constraints-verified.txt` 记录已验证的主要依赖组合，便于复现，不禁止未来兼容版本。静态检查规则由 `pyproject.toml` 显式固定为项目既有的 E4/E7/E9/F 正确性检查，不依赖 Ruff 版本的默认规则集合；新工具默认风格要求不自动变成业务验收要求。Windows CI 同时验证该组合和当前依赖，使用合成消息、完整加密 SQLite 数据库及加密 WAL、真实 SQLite WAL、人工加密页和故障注入，不携带真实账号、聊天、密钥或导出。CI 现在安装 ffmpeg，并同时要求合成语音与 WXGF 转码 smoke 通过。主程序环境中的 `tools/smoke_runtime.py --voice-python <python311.exe> --require-voice --require-wxgf` 可用合成音频与图像验证真实解码链；安装验收应从源码目录之外调用，防止源码导入冒充安装成功。
+`constraints-verified.txt` 记录已验证的主要依赖组合，便于复现，不禁止未来兼容版本。静态检查规则由 `pyproject.toml` 显式固定为项目既有的 E4/E7/E9/F 正确性检查，不依赖 Ruff 版本的默认规则集合；新工具默认风格要求不自动变成业务验收要求。Windows CI 同时验证该组合和当前依赖，使用合成消息、完整加密 SQLite 数据库及加密 WAL、真实 SQLite WAL、人工加密页和故障注入，不携带真实账号、聊天、密钥或导出。每个测试模块先导入 `tests/isolation.py`，统一屏蔽本机 `.wechatdirect.local.json`、真实 `%LOCALAPPDATA%` 和全部 `WECHAT_DIRECT_*` 环境变量，测试结果不随开发机设置变化。CI 现在安装 ffmpeg，并同时要求合成语音与 WXGF 转码 smoke 通过。主程序环境中的 `tools/smoke_runtime.py --voice-python <python311.exe> --require-voice --require-wxgf` 可用合成音频与图像验证真实解码链；安装验收应从源码目录之外调用，防止源码导入冒充安装成功。
 
 ## 许可证
 

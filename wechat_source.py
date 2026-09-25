@@ -41,17 +41,6 @@ MAX_DECOMPRESSED_MESSAGE_BYTES = 4 * 1024 * 1024
 MAX_MESSAGE_SCHEMA_PROBE_PAGES_PER_SHARD = 4_096
 MAX_MESSAGE_SCHEMA_PROBE_WAL_FRAMES = 131_072
 MESSAGE_FETCH_PAGE_SIZE = 512
-# A group cursor is primarily a per-shard physical rowid receipt.  Re-reading a
-# small tail protects against a source row being amended shortly after it first
-# appeared, without turning normal group increments back into history scans.
-GROUP_ANCHOR_TAIL_ROWS = 256
-# This receipt is deliberately opaque: it lets a later bounded group delta
-# classify the ambiguous native statuses without retaining a raw sender id in
-# the durable session cursor.  It is a source-local compatibility receipt, not
-# a general identity service.
-# Frozen legacy wire identifier. Existing v1 state depends on these exact bytes;
-# the name does not imply a runtime dependency on another project or service.
-GROUP_SELF_SENDER_RECEIPT_ALGORITHM = "pkb.wechat.group-self-sender.v1"
 
 
 class WeChatDirectError(RuntimeError):
@@ -613,7 +602,7 @@ def _sqlite_schema_message_tables_once(
     source: Path,
     master_hex: str,
     *,
-    wanted_tables: frozenset[str] | None,
+    wanted_tables: frozenset[str],
 ) -> tuple[set[str], int]:
     size = source.stat().st_size
     if size == 0 or size % PAGE_SIZE:
@@ -757,9 +746,7 @@ def _sqlite_schema_message_tables_once(
                         or re.fullmatch(r"Msg_[0-9a-f]{32}", record_name) is None
                     ):
                         continue
-                    if wanted_tables is None:
-                        table_names.add(record_name)
-                    elif record_name in wanted_tables:
+                    if record_name in wanted_tables:
                         table_names.add(record_name)
                         if table_names == wanted_tables:
                             return table_names, len(pages)
@@ -805,35 +792,6 @@ def _sqlite_schema_contains_table(
             return result
     raise SnapshotCopyError(
         "message shard changed throughout bounded schema probe retries"
-    ) from last_error
-
-
-def _sqlite_schema_message_table_catalog(
-    source: Path,
-    *,
-    master_hex: str,
-) -> tuple[frozenset[str], int]:
-    """Enumerate one shard's message tables through a stable schema-only read."""
-
-    wal = source.with_name(source.name + "-wal")
-    last_error: SnapshotCopyError | None = None
-    for _attempt in range(3):
-        before = (_file_signature(source), _file_signature(wal))
-        try:
-            tables, pages_read = _sqlite_schema_message_tables_once(
-                source,
-                master_hex,
-                wanted_tables=None,
-            )
-        except SnapshotCopyError as exc:
-            last_error = exc
-            if before == (_file_signature(source), _file_signature(wal)):
-                raise
-            continue
-        if before == (_file_signature(source), _file_signature(wal)):
-            return frozenset(tables), pages_read
-    raise SnapshotCopyError(
-        "message shard changed throughout bounded schema catalog retries"
     ) from last_error
 
 
@@ -1307,19 +1265,6 @@ def _message_content_projection(
     return content, payload_texts, compressed_gap
 
 
-def _quote_identity(value: object) -> str | None:
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        value = bytes(value).decode("utf-8", errors="ignore")
-    if not isinstance(value, str) or "refermsg" not in value:
-        return None
-    match = re.search(
-        r"<refermsg>.*?<(?:svrid|msgid|newmsgid)>(?:<!\[CDATA\[)?([^<\]]+)",
-        value,
-        re.S,
-    )
-    return match.group(1).strip() if match else None
-
-
 def _quote_identities(value: object) -> set[str]:
     """Return every readable native quote id without choosing a winner."""
 
@@ -1677,78 +1622,6 @@ class DirectWeChatReader:
             "message shards changed throughout bounded catalog retries"
         )
 
-    def prepare_message_catalog(
-        self, session_native_ids: Iterable[str]
-    ) -> dict[str, tuple[Path, ...]]:
-        """Cache all requested ``Msg_<md5>`` origins with one schema pass/shard.
-
-        Complete source runs know their session set up front.  Cataloguing those
-        hashes once prevents every session from re-reading the encrypted schema
-        pages of every message shard.  Ordinary one-session readers keep using
-        ``_message_sources_for_table`` and its sparse probe unchanged.
-        """
-
-        requested_tables: set[str] = set()
-        for session_native_id in session_native_ids:
-            if not isinstance(session_native_id, str) or not session_native_id:
-                raise ValueError("message_catalog_session_identity_invalid")
-            requested_tables.add(
-                "Msg_"
-                + hashlib.md5(
-                    session_native_id.encode("utf-8"), usedforsecurity=False
-                ).hexdigest()
-            )
-        missing_tables = {
-            table
-            for table in requested_tables
-            if table not in self._message_table_sources_cache
-        }
-        if not missing_tables:
-            return {
-                table: self._message_table_sources_cache[table]
-                for table in sorted(requested_tables)
-            }
-
-        for _attempt in range(3):
-            candidates = self._message_database_sources()
-            before = {
-                source: (
-                    _file_signature(source),
-                    _file_signature(source.with_name(source.name + "-wal")),
-                )
-                for source in candidates
-            }
-            sources_by_table = {table: [] for table in missing_tables}
-            probe_pages: dict[Path, int] = {}
-            for source in candidates:
-                tables, pages_read = _sqlite_schema_message_table_catalog(
-                    source,
-                    master_hex=self._master_hex,
-                )
-                probe_pages[source] = pages_read
-                for table in tables & missing_tables:
-                    sources_by_table[table].append(source)
-            after_candidates = self._message_database_sources()
-            after = {
-                source: (
-                    _file_signature(source),
-                    _file_signature(source.with_name(source.name + "-wal")),
-                )
-                for source in after_candidates
-            }
-            if candidates != after_candidates or before != after:
-                continue
-            for table, sources in sources_by_table.items():
-                self._message_table_sources_cache[table] = tuple(sources)
-            self._message_schema_probe_pages.update(probe_pages)
-            return {
-                table: self._message_table_sources_cache[table]
-                for table in sorted(requested_tables)
-            }
-        raise SnapshotCopyError(
-            "message shards changed throughout bounded bulk catalog retries"
-        )
-
     def _message_connections(
         self, table: str | None = None
     ) -> list[tuple[Path, sqlite3.Connection]]:
@@ -1823,100 +1696,6 @@ class DirectWeChatReader:
             calibrated = next(iter(counts))
         self._message_self_sender_cache[cache_key] = calibrated
         return calibrated
-
-    @staticmethod
-    def _opaque_sha256_commitment(*parts: str) -> str:
-        return "sha256:" + hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _is_opaque_sha256_commitment(value: object) -> bool:
-        return (
-            isinstance(value, str)
-            and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
-        )
-
-    def _group_self_sender_receipt(
-        self,
-        *,
-        shard_key: str,
-        calibrated_sender: str | None,
-    ) -> dict[str, str | None]:
-        """Build an opaque, shard-bound sender calibration receipt.
-
-        ``calibrated_sender`` never leaves this reader.  ``None`` is a
-        deliberate unproven state: known native directions can still progress,
-        while a later ambiguous native status fails closed rather than causing
-        a fresh all-history calibration during a normal increment.
-        """
-
-        account_commitment = "sha256:" + self.account_identity_commitment
-        sender_commitment = (
-            self._opaque_sha256_commitment(
-                GROUP_SELF_SENDER_RECEIPT_ALGORITHM,
-                account_commitment,
-                shard_key,
-                calibrated_sender,
-            )
-            if calibrated_sender is not None
-            else None
-        )
-        receipt_commitment = self._opaque_sha256_commitment(
-            GROUP_SELF_SENDER_RECEIPT_ALGORITHM,
-            account_commitment,
-            shard_key,
-            sender_commitment or "unproven",
-        )
-        return {
-            "algorithm": GROUP_SELF_SENDER_RECEIPT_ALGORITHM,
-            "accountIdentityCommitment": account_commitment,
-            "selfSenderCommitment": sender_commitment,
-            "receiptCommitment": receipt_commitment,
-        }
-
-    def _validated_group_self_sender_receipt(
-        self,
-        *,
-        shard_key: str,
-        value: object,
-    ) -> dict[str, str | None] | None:
-        """Return an exact opaque receipt or ``None`` on any drift/tampering."""
-
-        if not isinstance(value, Mapping) or set(value) != {
-            "algorithm",
-            "accountIdentityCommitment",
-            "selfSenderCommitment",
-            "receiptCommitment",
-        }:
-            return None
-        algorithm = value.get("algorithm")
-        account_commitment = value.get("accountIdentityCommitment")
-        sender_commitment = value.get("selfSenderCommitment")
-        receipt_commitment = value.get("receiptCommitment")
-        expected_account = "sha256:" + self.account_identity_commitment
-        if (
-            algorithm != GROUP_SELF_SENDER_RECEIPT_ALGORITHM
-            or account_commitment != expected_account
-            or not self._is_opaque_sha256_commitment(receipt_commitment)
-            or (
-                sender_commitment is not None
-                and not self._is_opaque_sha256_commitment(sender_commitment)
-            )
-        ):
-            return None
-        expected_receipt = self._opaque_sha256_commitment(
-            GROUP_SELF_SENDER_RECEIPT_ALGORITHM,
-            expected_account,
-            shard_key,
-            sender_commitment or "unproven",
-        )
-        if not hmac.compare_digest(str(receipt_commitment), expected_receipt):
-            return None
-        return {
-            "algorithm": GROUP_SELF_SENDER_RECEIPT_ALGORITHM,
-            "accountIdentityCommitment": expected_account,
-            "selfSenderCommitment": sender_commitment,
-            "receiptCommitment": expected_receipt,
-        }
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """List all local sessions, including hidden groups, for source truth.
@@ -3828,9 +3607,6 @@ class DirectWeChatReader:
         *,
         message_table: str | None = None,
         session_native_id: str | None = None,
-        strict_group_projection: bool = False,
-        group_shard_key: str | None = None,
-        group_self_sender_receipt: Mapping[str, Any] | None = None,
     ) -> tuple[int | None, str, str | None, bool]:
         base_type = _base_message_type(row["local_type"])
         # Native app subtype 62 is the generated pat event, not prose authored
@@ -3842,34 +3618,7 @@ class DirectWeChatReader:
         except TypeError, ValueError, OverflowError:
             native_status = None
         if (
-            strict_group_projection
-            and base_type != 10000
-            and native_status in _CALIBRATED_MESSAGE_STATUSES
-        ):
-            sender_key = _valid_sender_key(row["real_sender_id"])
-            sender_commitment = (
-                group_self_sender_receipt.get("selfSenderCommitment")
-                if group_self_sender_receipt is not None
-                else None
-            )
-            if (
-                sender_key is None
-                or group_shard_key is None
-                or sender_commitment is None
-            ):
-                return base_type, "unknown", "unknown", None
-            candidate = self._opaque_sha256_commitment(
-                GROUP_SELF_SENDER_RECEIPT_ALGORITHM,
-                "sha256:" + self.account_identity_commitment,
-                group_shard_key,
-                sender_key,
-            )
-            if hmac.compare_digest(str(sender_commitment), candidate):
-                return base_type, "self", "outgoing", True
-            return base_type, "other", "incoming", False
-        if (
-            not strict_group_projection
-            and session_native_id is not None
+            session_native_id is not None
             and session_native_id.casefold().endswith("@openim")
             and base_type != 10000
         ):
@@ -3901,11 +3650,7 @@ class DirectWeChatReader:
                 # conversations on every fresh reader.
                 message_table=message_table,
             )
-            if (
-                not strict_group_projection
-                and base_type != 10000
-                and native_status in _CALIBRATED_MESSAGE_STATUSES
-            )
+            if base_type != 10000 and native_status in _CALIBRATED_MESSAGE_STATUSES
             else None
         )
         # Message shards can carry statuses that are not the formal
@@ -3916,8 +3661,7 @@ class DirectWeChatReader:
         # fills the rows that calibration cannot reach.  No content,
         # chronology, or majority inference enters this decision.
         if (
-            not strict_group_projection
-            and base_type != 10000
+            base_type != 10000
             and native_status
             not in {_OUTGOING_MESSAGE_STATUS, _INCOMING_MESSAGE_STATUS}
             and not (
@@ -3950,35 +3694,6 @@ class DirectWeChatReader:
         )
         return base_type, sender_role, direction, is_send
 
-    @staticmethod
-    def _row_structured_quote_resolution(
-        row: sqlite3.Row,
-    ) -> tuple[str | None, bool]:
-        """Resolve native quote IDs only when all readable fields agree.
-
-        Metadata-only selector rows lack ``message_content``; selected full rows
-        include it, so the same resolver catches a body-vs-metadata conflict
-        before a durable relation can be emitted.
-        """
-
-        if _base_message_type(row["local_type"]) != 49:
-            return None, False
-        identities: set[str] = set()
-        for column in (
-            "message_content",
-            "source",
-            "packed_info_data",
-            "origin_source",
-        ):
-            try:
-                value = row[column]
-            except IndexError, KeyError:
-                continue
-            identities.update(_quote_identities(_readable_payload_text(value)))
-        if len(identities) == 1:
-            return next(iter(identities)), False
-        return None, len(identities) > 1
-
     def _message_from_row(
         self,
         *,
@@ -3988,10 +3703,7 @@ class DirectWeChatReader:
         message_table: str,
         connection: sqlite3.Connection,
         sender_index: Mapping[int, str],
-        strict_group_projection: bool = False,
         exact_media_lookup: bool = False,
-        group_shard_key: str | None = None,
-        group_self_sender_receipt: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build one public reader message only after its row was selected."""
 
@@ -4006,9 +3718,6 @@ class DirectWeChatReader:
             row,
             message_table=message_table,
             session_native_id=session_native_id,
-            strict_group_projection=strict_group_projection,
-            group_shard_key=group_shard_key,
-            group_self_sender_receipt=group_self_sender_receipt,
         )
         sender = (
             sender_index.get(sender_key)
@@ -4056,21 +3765,12 @@ class DirectWeChatReader:
                 if base_type not in _TYPE_NAMES
                 else "message_content_unparsed"
             )
-        if strict_group_projection:
-            quote_id, quote_conflict = self._row_structured_quote_resolution(row)
-            if quote_conflict:
-                raise DirectSchemaError(
-                    "group projection structured quote is conflicting"
-                )
-        else:
-            quote_identities: set[str] = set()
-            for text in payload_texts:
-                quote_identities.update(_quote_identities(text))
-            quote_id = (
-                next(iter(quote_identities)) if len(quote_identities) == 1 else None
-            )
-            if len(quote_identities) > 1:
-                message["quoteGap"] = "quote_identity_conflict"
+        quote_identities: set[str] = set()
+        for text in payload_texts:
+            quote_identities.update(_quote_identities(text))
+        quote_id = next(iter(quote_identities)) if len(quote_identities) == 1 else None
+        if len(quote_identities) > 1:
+            message["quoteGap"] = "quote_identity_conflict"
         if quote_id:
             message["quote"] = {"platformMessageId": quote_id}
         media = self._media_entries(
@@ -4079,13 +3779,11 @@ class DirectWeChatReader:
             message_source,
             message_table,
             payload_texts,
-            exact_lookup_only=(strict_group_projection or exact_media_lookup),
+            exact_lookup_only=exact_media_lookup,
         )
         if media:
             message["media_manifest"] = media
-        if (
-            strict_group_projection or server_id in (None, 0, "0")
-        ) and local_id not in (None, 0, "0"):
+        if server_id in (None, 0, "0") and local_id not in (None, 0, "0"):
             # The source's local id remains the stable output identity even if
             # a later native amendment fills in SERVERID.  SERVERID is still
             # used internally for reply/quote resolution and cross-shard
@@ -4104,136 +3802,11 @@ class DirectWeChatReader:
                 )
         return message
 
-    @staticmethod
-    def _group_projection_rowid(row: sqlite3.Row) -> int | None:
-        """Return the exact physical row locator needed for a selected message."""
-
-        try:
-            rowid = int(row["_rowid"])
-        except KeyError, TypeError, ValueError, OverflowError:
-            return None
-        return rowid if rowid > 0 else None
-
-    @staticmethod
-    def _fetch_group_projection_row(
-        *,
-        connection: sqlite3.Connection,
-        table: str,
-        rowid: int,
-        status_expr: str,
-        origin_expr: str,
-    ) -> sqlite3.Row:
-        """Read one previously selected group row, including body and media fields."""
-
-        quoted_table = _quote_identifier(table)
-        try:
-            row = connection.execute(
-                "SELECT local_id, local_type, server_id, real_sender_id, create_time, "
-                "message_content, source, packed_info_data, compress_content, sort_seq, "
-                f"{status_expr} AS status, {origin_expr} AS origin_source "
-                f"FROM {quoted_table} WHERE rowid=? LIMIT 1",
-                (rowid,),
-            ).fetchone()
-        except sqlite3.DatabaseError as exc:
-            raise DirectSchemaError("selected group row could not be re-read") from exc
-        if row is None:
-            raise DirectSchemaError("selected group row disappeared from snapshot")
-        return row
-
     def _group_projection_shard_key(self, source: Path, table: str) -> str:
         relative = source.relative_to(self._storage).as_posix()
         return (
             "sha256:"
             + hashlib.sha256(f"{relative}\0{table}".encode("utf-8")).hexdigest()
-        )
-
-    def _group_projection_shards(self, session_native_id: str) -> list[dict[str, Any]]:
-        """Return a stable, metadata-only catalog for one group message table."""
-
-        table = (
-            "Msg_"
-            + hashlib.md5(
-                session_native_id.encode("utf-8"), usedforsecurity=False
-            ).hexdigest()
-        )
-        quoted_table = _quote_identifier(table)
-        shards: list[dict[str, Any]] = []
-        for source, connection in self._message_connections(table):
-            columns = {
-                str(column[1])
-                for column in connection.execute(f"PRAGMA table_info({quoted_table})")
-            }
-            if not {"server_id", "local_id", "local_type", "create_time"} <= columns:
-                raise DirectSchemaError("group projection message schema is incomplete")
-            server_index = self._index_with_leading_columns(
-                connection, table, ("server_id",)
-            )
-            shards.append(
-                {
-                    "key": self._group_projection_shard_key(source, table),
-                    "source": source,
-                    "connection": connection,
-                    "table": table,
-                    "session_native_id": session_native_id,
-                    "status_expr": "status" if "status" in columns else "NULL",
-                    "origin_expr": (
-                        "origin_source" if "origin_source" in columns else "NULL"
-                    ),
-                    "server_index": server_index,
-                }
-            )
-        if not shards and self._session_is_registered(session_native_id):
-            raise SessionMessageDatabaseMissingError(
-                "session message database is missing"
-            )
-        return sorted(shards, key=lambda item: str(item["key"]))
-
-    @staticmethod
-    def _group_projection_record(
-        shard: Mapping[str, Any], row: sqlite3.Row
-    ) -> dict[str, Any]:
-        rowid = DirectWeChatReader._group_projection_rowid(row)
-        if rowid is None:
-            raise DirectSchemaError(
-                "group projection row lacks a stable physical locator"
-            )
-        return {"shard": shard, "row": row, "rowid": rowid}
-
-    def _group_record_identity(
-        self, shard: Mapping[str, Any], row: sqlite3.Row
-    ) -> tuple[str, str] | None:
-        """Return a source-local identity without merging local ids across shards."""
-
-        identity = self._message_row_identity(row)
-        if identity is None or identity[0] == "server":
-            return identity
-        return "local", f"{shard['key']}\0{identity[1]}"
-
-    def _group_message_sender_role(
-        self, shard: Mapping[str, Any], row: sqlite3.Row
-    ) -> tuple[int | None, str, str | None, bool]:
-        return self._message_row_sender_role(
-            shard["source"],
-            shard["connection"],
-            row,
-            strict_group_projection=True,
-            group_shard_key=str(shard["key"]),
-            group_self_sender_receipt=shard.get("self_sender_receipt"),
-        )
-
-    def _group_record_signature(self, record: Mapping[str, Any]) -> tuple[Any, ...]:
-        shard = record["shard"]
-        row = record["row"]
-        base_type, sender_role, _, _ = self._group_message_sender_role(shard, row)
-        quote_id, quote_conflict = self._row_structured_quote_resolution(row)
-        return (
-            self._group_record_identity(shard, row),
-            base_type,
-            sender_role,
-            row["status"],
-            row["create_time"],
-            quote_id,
-            quote_conflict,
         )
 
     @staticmethod
@@ -4273,873 +3846,6 @@ class DirectWeChatReader:
                 for item in media
             ]
         return result
-
-    def _group_record_exact_signature(
-        self, record: Mapping[str, Any]
-    ) -> tuple[Any, ...]:
-        """Boundedly compare duplicate server rows before choosing a shard copy."""
-
-        shard = record["shard"]
-        row = self._fetch_group_projection_row(
-            connection=shard["connection"],
-            table=shard["table"],
-            rowid=int(record["rowid"]),
-            status_expr=shard["status_expr"],
-            origin_expr=shard["origin_expr"],
-        )
-        if self._group_record_identity(shard, row) != self._group_record_identity(
-            shard, record["row"]
-        ):
-            raise DirectSchemaError("selected group row identity changed")
-        exact_record = {"shard": shard, "row": row, "rowid": record["rowid"]}
-        # The raw field digests below identify storage divergence.  Hashing the
-        # reader's own final projected shape additionally covers the fields the
-        # caller would actually observe (including media locator/open-status)
-        # without retaining a duplicate body or media payload in memory.
-        exact_output = self._message_from_row(
-            row=row,
-            session_native_id=str(shard["session_native_id"]),
-            message_source=shard["source"],
-            message_table=str(shard["table"]),
-            connection=shard["connection"],
-            sender_index={},
-            strict_group_projection=True,
-            group_shard_key=str(shard["key"]),
-            group_self_sender_receipt=shard.get("self_sender_receipt"),
-        )
-        return (
-            self._group_record_signature(exact_record),
-            self._group_exact_field_digest(
-                json.dumps(
-                    self._group_canonical_semantic_output(exact_output),
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            ),
-            *(
-                self._group_exact_field_digest(row[column])
-                for column in (
-                    "local_type",
-                    "server_id",
-                    "real_sender_id",
-                    "create_time",
-                    "message_content",
-                    "source",
-                    "packed_info_data",
-                    "compress_content",
-                    "sort_seq",
-                    "status",
-                    "origin_source",
-                )
-            ),
-        )
-
-    def _iter_group_projection_metadata_pages(
-        self,
-        shard: Mapping[str, Any],
-        *,
-        start_rowid: int,
-        end_rowid: int,
-        page_size: int,
-    ) -> Iterator[list[sqlite3.Row]]:
-        quoted_table = _quote_identifier(str(shard["table"]))
-        try:
-            cursor = shard["connection"].execute(
-                "SELECT rowid AS _rowid, local_id, local_type, server_id, "
-                "real_sender_id, create_time, source, packed_info_data, sort_seq, "
-                f"{shard['status_expr']} AS status, "
-                f"{shard['origin_expr']} AS origin_source "
-                f"FROM {quoted_table} WHERE rowid>? AND rowid<=? ORDER BY rowid ASC",
-                (int(start_rowid), int(end_rowid)),
-            )
-        except sqlite3.DatabaseError as exc:
-            raise DirectSchemaError(
-                "group projection rowid cursor is unavailable"
-            ) from exc
-        yield from _iter_cursor_pages(cursor, page_size=page_size)
-
-    def _exact_group_server_records(
-        self,
-        shards: Sequence[Mapping[str, Any]],
-        server_ids: Iterable[str],
-    ) -> tuple[dict[str, dict[str, Any]], set[str]]:
-        """Find exact group targets across all current shards without scanning."""
-
-        wanted = sorted({str(value) for value in server_ids if str(value).strip()})
-        if not wanted:
-            return {}, set()
-        raw: dict[str, list[dict[str, Any]]] = {}
-        for shard in shards:
-            index_name = shard.get("server_index")
-            if not isinstance(index_name, str) or not index_name:
-                raise DirectSchemaError(
-                    "group projection server lookup index is unavailable"
-                )
-            quoted_table = _quote_identifier(str(shard["table"]))
-            quoted_index = _quote_identifier(index_name)
-            for offset in range(0, len(wanted), 500):
-                batch = wanted[offset : offset + 500]
-                placeholders = ",".join("?" for _ in batch)
-                try:
-                    rows = shard["connection"].execute(
-                        "SELECT rowid AS _rowid, local_id, local_type, server_id, "
-                        "real_sender_id, create_time, source, packed_info_data, sort_seq, "
-                        f"{shard['status_expr']} AS status, "
-                        f"{shard['origin_expr']} AS origin_source "
-                        f"FROM {quoted_table} INDEXED BY {quoted_index} "
-                        f"WHERE server_id IN ({placeholders})",
-                        batch,
-                    )
-                except sqlite3.DatabaseError as exc:
-                    raise DirectSchemaError(
-                        "group projection exact server lookup failed"
-                    ) from exc
-                for row in rows:
-                    identity = self._message_row_identity(row)
-                    if identity is None or identity[0] != "server":
-                        continue
-                    raw.setdefault(identity[1], []).append(
-                        self._group_projection_record(shard, row)
-                    )
-        result: dict[str, dict[str, Any]] = {}
-        conflicts: set[str] = set()
-        for server_id, records in raw.items():
-            signatures = {self._group_record_signature(record) for record in records}
-            if len(signatures) != 1:
-                conflicts.add(server_id)
-                continue
-            if len(records) > 1:
-                try:
-                    exact_signatures = {
-                        self._group_record_exact_signature(record) for record in records
-                    }
-                except DirectSchemaError:
-                    conflicts.add(server_id)
-                    continue
-                if len(exact_signatures) != 1:
-                    conflicts.add(server_id)
-                    continue
-            result[server_id] = min(
-                records,
-                key=lambda record: (
-                    str(record["shard"]["key"]),
-                    int(record["rowid"]),
-                ),
-            )
-        return result, conflicts
-
-    def fetch_group_anchor_projection(
-        self,
-        session_native_id: str,
-        *,
-        end_s: int,
-        page_size: int = 512,
-        prior_shard_rowid_highs: Mapping[str, Any] | None = None,
-        prior_shard_self_sender_receipts: Mapping[str, Any] | None = None,
-        initialized: bool = False,
-        full_reconcile: bool = False,
-        tail_rows: int = GROUP_ANCHOR_TAIL_ROWS,
-    ) -> dict[str, Any]:
-        """Read one group as a closed, rowid-cursor projection.
-
-        The first successful initialization may read the complete native group.
-        Thereafter each shard is read from its persisted rowid cursor minus a
-        fixed tail.  Reply/quote targets outside that bounded delta are resolved
-        with an indexed exact ``server_id`` lookup across the group's shards.
-        No normal increment loads a historical self map, sender calibration, or
-        resource/voice index.  An initialized increment instead consumes the
-        shard-bound opaque sender receipts produced by its first full scan.
-        """
-
-        if not session_native_id.casefold().endswith("@chatroom"):
-            raise DirectSchemaError("group projection requires a chatroom session")
-        if not isinstance(full_reconcile, bool):
-            raise ValueError("group_projection_full_reconcile_invalid")
-        # A fixed rowid tail cannot prove that an old already-committed row was
-        # amended.  Callers must explicitly request this source-local full
-        # pass; ordinary deltas never quietly claim that coverage.
-        if full_reconcile:
-            initialized = False
-            prior_shard_rowid_highs = None
-            prior_shard_self_sender_receipts = None
-        page_size = int(page_size)
-        tail_rows = int(tail_rows)
-        if page_size < 1 or page_size > 512:
-            raise ValueError("group_projection_page_size_invalid")
-        if tail_rows < 0 or tail_rows > 4_096:
-            raise ValueError("group_projection_tail_rows_invalid")
-
-        shards = self._group_projection_shards(session_native_id)
-        normalized_prior: dict[str, int] = {}
-        invalid_prior = False
-        for key, value in dict(prior_shard_rowid_highs or {}).items():
-            try:
-                rowid = int(value)
-            except TypeError, ValueError, OverflowError:
-                invalid_prior = True
-                continue
-            if rowid < 0:
-                invalid_prior = True
-                continue
-            normalized_prior[str(key)] = rowid
-
-        pass_rows = [0, 0]
-        page_count = 0
-        max_page_rows = 0
-        max_sort_seq: int | None = None
-        hold_reasons: set[str] = set()
-        held_shards: set[str] = set()
-        shard_highs: dict[str, int] = {}
-        scan_starts: dict[str, int] = {}
-        scan_ends: dict[str, int] = {}
-        current_shard_keys = {str(shard["key"]) for shard in shards}
-
-        normalized_prior_receipts: dict[str, dict[str, str | None]] = {}
-        receipt_input_invalid = False
-        try:
-            raw_prior_receipts = dict(prior_shard_self_sender_receipts or {})
-        except TypeError, ValueError:
-            raw_prior_receipts = {}
-            receipt_input_invalid = True
-
-        def hold(shard_key: str | None, rowid: int | None, reason: str) -> None:
-            hold_reasons.add(reason)
-            if shard_key is None:
-                return
-            held_shards.add(shard_key)
-            previous_high = normalized_prior.get(shard_key, 0)
-            candidate = max(0, int(rowid or 0) - 1)
-            # A tail re-read cannot roll an already durable cursor backwards;
-            # it can only stop newly discovered rows from advancing it.
-            candidate = max(previous_high, candidate) if initialized else candidate
-            shard_highs[shard_key] = min(
-                shard_highs.get(shard_key, candidate), candidate
-            )
-
-        if invalid_prior:
-            hold(None, None, "group_anchor_cursor_invalid")
-        if initialized and current_shard_keys != set(normalized_prior):
-            hold(None, None, "group_anchor_shard_catalog_drift")
-        if initialized and (
-            receipt_input_invalid or current_shard_keys != set(raw_prior_receipts)
-        ):
-            hold(None, None, "group_anchor_self_sender_receipt_shard_mismatch")
-        if initialized and not hold_reasons:
-            for shard in shards:
-                key = str(shard["key"])
-                receipt = self._validated_group_self_sender_receipt(
-                    shard_key=key,
-                    value=raw_prior_receipts[key],
-                )
-                if receipt is None:
-                    hold(key, None, "group_anchor_self_sender_receipt_invalid")
-                    break
-                normalized_prior_receipts[key] = receipt
-                shard["self_sender_receipt"] = receipt
-        elif not initialized:
-            for shard in shards:
-                key = str(shard["key"])
-                # The group receipt uses the all-history physical-database
-                # calibration (the ``message_table=None`` cache entry), so
-                # source-local initialization never repeats it during this
-                # reader run. Private sessions use table-scoped cache entries.
-                shard["self_sender_receipt"] = self._group_self_sender_receipt(
-                    shard_key=key,
-                    calibrated_sender=self._calibrated_self_sender(
-                        shard["source"], shard["connection"]
-                    ),
-                )
-
-        receipt_upgrade_senders: dict[str, str] = {}
-
-        def maybe_upgrade_unproven_sender_receipt(
-            shard: Mapping[str, Any], row: sqlite3.Row
-        ) -> None:
-            """Check/upgrade a receipt only from exact status=2 evidence.
-
-            A normal delta must never silently accept a new native ``self``
-            sender after the opaque receipt was established.  The temporary
-            in-memory upgrade for a previously unproven receipt is returned
-            only if this whole projection succeeds; any later hold restores
-            the prior durable receipt in the return path below.
-            """
-
-            if not initialized or hold_reasons:
-                return
-            receipt = shard.get("self_sender_receipt")
-            if not isinstance(receipt, Mapping):
-                return
-            if _base_message_type(row["local_type"]) == 10000:
-                return
-            try:
-                native_status = int(row["status"])
-            except TypeError, ValueError, OverflowError:
-                return
-            if native_status != _OUTGOING_MESSAGE_STATUS:
-                return
-            sender_key = _valid_sender_key(row["real_sender_id"])
-            if sender_key is None:
-                return
-            key = str(shard["key"])
-            candidate_commitment = self._opaque_sha256_commitment(
-                GROUP_SELF_SENDER_RECEIPT_ALGORITHM,
-                "sha256:" + self.account_identity_commitment,
-                key,
-                sender_key,
-            )
-            prior_commitment = receipt.get("selfSenderCommitment")
-            if prior_commitment is not None:
-                if not hmac.compare_digest(str(prior_commitment), candidate_commitment):
-                    hold(
-                        key,
-                        self._group_projection_rowid(row),
-                        "group_anchor_self_sender_drift",
-                    )
-                return
-            previous = receipt_upgrade_senders.get(key)
-            if previous is not None and previous != sender_key:
-                hold(
-                    key,
-                    self._group_projection_rowid(row),
-                    "group_anchor_self_sender_calibration_conflict",
-                )
-                return
-            receipt_upgrade_senders[key] = sender_key
-            shard["self_sender_receipt"] = self._group_self_sender_receipt(
-                shard_key=key,
-                calibrated_sender=sender_key,
-            )
-
-        for shard in shards:
-            key = str(shard["key"])
-            if shard.get("server_index") is None:
-                hold(key, None, "group_anchor_server_lookup_index_unavailable")
-                continue
-            try:
-                maximum = int(
-                    shard["connection"]
-                    .execute(
-                        f"SELECT COALESCE(MAX(rowid),0) FROM {_quote_identifier(str(shard['table']))}"
-                    )
-                    .fetchone()[0]
-                )
-            except (TypeError, ValueError, sqlite3.DatabaseError) as exc:
-                raise DirectSchemaError(
-                    "group projection rowid cursor is unavailable"
-                ) from exc
-            previous_high = normalized_prior.get(key, 0)
-            if initialized and maximum < previous_high:
-                hold(key, maximum + 1, "group_anchor_rowid_rollback")
-                shard_highs[key] = previous_high
-                continue
-            if initialized:
-                scan_starts[key] = max(0, previous_high - tail_rows)
-                shard_highs[key] = previous_high
-            else:
-                scan_starts[key] = 0
-                shard_highs[key] = 0
-            scan_ends[key] = maximum
-
-        missing_identity_rows = 0
-        missing_identity_self_rows = 0
-        self_signatures: dict[str, tuple[Any, ...]] = {}
-
-        # Pass 1 is metadata-only and establishes a safe per-shard high water
-        # mark before the selector opens any body or media payload.
-        if not hold_reasons:
-            for shard in shards:
-                if hold_reasons:
-                    break
-                key = str(shard["key"])
-                if key in held_shards:
-                    continue
-                stopped = False
-                for page in self._iter_group_projection_metadata_pages(
-                    shard,
-                    start_rowid=scan_starts[key],
-                    end_rowid=scan_ends[key],
-                    page_size=page_size,
-                ):
-                    pass_rows[0] += len(page)
-                    page_count += 1
-                    max_page_rows = max(max_page_rows, len(page))
-                    for row in page:
-                        rowid = self._group_projection_rowid(row)
-                        if rowid is None:
-                            hold(key, None, "group_anchor_rowid_missing")
-                            stopped = True
-                            break
-                        try:
-                            native_time = int(row["create_time"])
-                        except TypeError, ValueError, OverflowError:
-                            native_time = None
-                        if native_time is not None and native_time > int(end_s):
-                            hold(key, rowid, "group_anchor_future_cutoff_hole")
-                            stopped = True
-                            break
-                        maybe_upgrade_unproven_sender_receipt(shard, row)
-                        if hold_reasons:
-                            stopped = True
-                            break
-                        _, relation_conflict = self._row_structured_quote_resolution(
-                            row
-                        )
-                        if relation_conflict:
-                            # A metadata-only app message can otherwise be
-                            # silently skipped as unrelated while two native
-                            # quote fields disagree about whether it touches
-                            # the user.  Do not advance this shard cursor.
-                            hold(key, rowid, "group_anchor_relation_conflict")
-                            stopped = True
-                            break
-                        base_type, sender_role, _, _ = self._group_message_sender_role(
-                            shard, row
-                        )
-                        if sender_role == "unknown":
-                            hold(key, rowid, "group_anchor_sender_role_unproven")
-                            stopped = True
-                            break
-                        if sender_role == "self" and native_time is None:
-                            hold(key, rowid, "group_anchor_message_time_unproven")
-                            stopped = True
-                            break
-                        identity = self._message_row_identity(row)
-                        if identity is None:
-                            missing_identity_rows += 1
-                            if sender_role == "self":
-                                missing_identity_self_rows += 1
-                                hold(key, rowid, "group_anchor_self_identity_missing")
-                                stopped = True
-                                break
-                        elif sender_role == "self" and identity[0] == "server":
-                            signature = self._group_record_signature(
-                                self._group_projection_record(shard, row)
-                            )
-                            existing = self_signatures.get(identity[1])
-                            if existing is not None and existing != signature:
-                                hold(
-                                    key, rowid, "group_anchor_server_identity_conflict"
-                                )
-                                stopped = True
-                                break
-                            self_signatures[identity[1]] = signature
-                        try:
-                            sort_seq = int(row["sort_seq"])
-                        except TypeError, ValueError, OverflowError:
-                            sort_seq = None
-                        if sort_seq is not None:
-                            max_sort_seq = (
-                                sort_seq
-                                if max_sort_seq is None
-                                else max(max_sort_seq, sort_seq)
-                            )
-                        shard_highs[key] = max(shard_highs[key], rowid)
-                    if stopped:
-                        break
-
-        selected_records: dict[tuple[str, str], dict[str, Any]] = {}
-
-        def record_is_safe(record: Mapping[str, Any]) -> bool:
-            key = str(record["shard"]["key"])
-            return int(record["rowid"]) <= shard_highs.get(key, 0)
-
-        def select_record(
-            record: Mapping[str, Any],
-            *,
-            origin_shard_key: str,
-            origin_rowid: int,
-        ) -> bool:
-            try:
-                native_time = int(record["row"]["create_time"])
-            except TypeError, ValueError, OverflowError:
-                hold(
-                    origin_shard_key,
-                    origin_rowid,
-                    "group_anchor_message_time_unproven",
-                )
-                return False
-            if native_time > int(end_s):
-                hold(
-                    origin_shard_key,
-                    origin_rowid,
-                    "group_anchor_future_cutoff_hole",
-                )
-                return False
-            if not record_is_safe(record):
-                hold(
-                    origin_shard_key,
-                    origin_rowid,
-                    "group_anchor_target_after_safe_cursor",
-                )
-                return False
-            _, relation_conflict = self._row_structured_quote_resolution(record["row"])
-            if relation_conflict:
-                hold(origin_shard_key, origin_rowid, "group_anchor_relation_conflict")
-                return False
-            identity = self._group_record_identity(record["shard"], record["row"])
-            if identity is None:
-                hold(
-                    origin_shard_key,
-                    origin_rowid,
-                    "group_anchor_target_identity_missing",
-                )
-                return False
-            existing = selected_records.get(identity)
-            if existing is not None:
-                if str(existing["shard"]["key"]) == str(record["shard"]["key"]) and int(
-                    existing["rowid"]
-                ) == int(record["rowid"]):
-                    return True
-                # The metadata signature catches the cheap common case, but a
-                # same-server copy with an app body/title/media difference is
-                # also an identity conflict.  Compare the exact selected
-                # output inputs before choosing a shard deterministically.
-                try:
-                    same = self._group_record_exact_signature(
-                        existing
-                    ) == self._group_record_exact_signature(record)
-                except DirectSchemaError:
-                    same = False
-                if not same:
-                    hold(
-                        origin_shard_key,
-                        origin_rowid,
-                        "group_anchor_server_identity_conflict",
-                    )
-                    return False
-            selected_records[identity] = dict(record)
-            return True
-
-        # Pass 2 performs the selection over exactly the safe interval.  Each
-        # page asks the native SERVERID index only for explicit one-hop targets.
-        if not hold_reasons:
-            for shard in shards:
-                if hold_reasons:
-                    break
-                key = str(shard["key"])
-                if key in held_shards:
-                    continue
-                stopped = False
-                for page in self._iter_group_projection_metadata_pages(
-                    shard,
-                    start_rowid=scan_starts[key],
-                    end_rowid=shard_highs[key],
-                    page_size=page_size,
-                ):
-                    pass_rows[1] += len(page)
-                    page_count += 1
-                    max_page_rows = max(max_page_rows, len(page))
-                    records = [
-                        self._group_projection_record(shard, row) for row in page
-                    ]
-                    target_ids: set[str] = set()
-                    for record in records:
-                        row = record["row"]
-                        quote_id, relation_conflict = (
-                            self._row_structured_quote_resolution(row)
-                        )
-                        if relation_conflict:
-                            hold(
-                                key,
-                                int(record["rowid"]),
-                                "group_anchor_relation_conflict",
-                            )
-                            stopped = True
-                            break
-                        identity = self._message_row_identity(row)
-                        if identity is not None and identity[0] == "server":
-                            _, role, _, _ = self._group_message_sender_role(shard, row)
-                            if role == "self":
-                                target_ids.add(identity[1])
-                        if quote_id:
-                            target_ids.add(quote_id)
-                    if stopped:
-                        break
-                    targets, conflicts = self._exact_group_server_records(
-                        shards, target_ids
-                    )
-                    for record in records:
-                        row = record["row"]
-                        rowid = int(record["rowid"])
-                        _, sender_role, _, _ = self._group_message_sender_role(
-                            shard, row
-                        )
-                        if sender_role == "unknown":
-                            hold(key, rowid, "group_anchor_sender_role_unproven")
-                            stopped = True
-                            break
-                        quote_id, relation_conflict = (
-                            self._row_structured_quote_resolution(row)
-                        )
-                        if relation_conflict:
-                            hold(key, rowid, "group_anchor_relation_conflict")
-                            stopped = True
-                            break
-                        identity = self._message_row_identity(row)
-                        if identity is None:
-                            if sender_role == "self":
-                                hold(key, rowid, "group_anchor_self_identity_missing")
-                                stopped = True
-                                break
-                            # A counterpart without either native identity
-                            # can still be a direct reply/quote to the user.
-                            # Resolve that explicit target before treating it
-                            # as harmless unselected noise; otherwise the
-                            # cursor would permanently skip relevant context.
-                            if quote_id is not None:
-                                if quote_id in conflicts:
-                                    hold(
-                                        key,
-                                        rowid,
-                                        "group_anchor_server_identity_conflict",
-                                    )
-                                    stopped = True
-                                    break
-                                target = targets.get(quote_id)
-                                if target is None:
-                                    hold(
-                                        key,
-                                        rowid,
-                                        "group_anchor_relation_target_unresolved",
-                                    )
-                                    stopped = True
-                                    break
-                                _, target_role, _, _ = self._group_message_sender_role(
-                                    target["shard"], target["row"]
-                                )
-                                if target_role == "unknown":
-                                    hold(
-                                        key,
-                                        rowid,
-                                        "group_anchor_relation_target_role_unproven",
-                                    )
-                                    stopped = True
-                                    break
-                                if target_role == "self":
-                                    hold(
-                                        key,
-                                        rowid,
-                                        "group_anchor_relation_identity_missing",
-                                    )
-                                    stopped = True
-                                    break
-                            continue
-                        server_id = identity[1] if identity[0] == "server" else None
-                        if sender_role == "self":
-                            if server_id is not None:
-                                if server_id in conflicts or server_id not in targets:
-                                    hold(
-                                        key,
-                                        rowid,
-                                        "group_anchor_server_identity_conflict",
-                                    )
-                                    stopped = True
-                                    break
-                                if not select_record(
-                                    targets[server_id],
-                                    origin_shard_key=key,
-                                    origin_rowid=rowid,
-                                ):
-                                    stopped = True
-                                    break
-                            elif not select_record(
-                                record,
-                                origin_shard_key=key,
-                                origin_rowid=rowid,
-                            ):
-                                stopped = True
-                                break
-                            # A self quote/reply is already an explicit consent
-                            # to include its one-hop context.  A truly absent old
-                            # target stays an honest relation gap downstream;
-                            # it does not cause a history scan.
-                            if quote_id is not None:
-                                if quote_id in conflicts:
-                                    hold(
-                                        key,
-                                        rowid,
-                                        "group_anchor_server_identity_conflict",
-                                    )
-                                    stopped = True
-                                    break
-                                target = targets.get(quote_id)
-                                if target is not None and not select_record(
-                                    target,
-                                    origin_shard_key=key,
-                                    origin_rowid=rowid,
-                                ):
-                                    stopped = True
-                                    break
-                        elif quote_id is not None:
-                            if quote_id in conflicts:
-                                hold(
-                                    key, rowid, "group_anchor_server_identity_conflict"
-                                )
-                                stopped = True
-                                break
-                            target = targets.get(quote_id)
-                            if target is None:
-                                # Whether this counterpart message touches the
-                                # user is unknown, so no cursor may advance past
-                                # it without a durable pending backlog.
-                                hold(
-                                    key,
-                                    rowid,
-                                    "group_anchor_relation_target_unresolved",
-                                )
-                                stopped = True
-                                break
-                            _, target_role, _, _ = self._group_message_sender_role(
-                                target["shard"], target["row"]
-                            )
-                            if target_role == "unknown":
-                                hold(
-                                    key,
-                                    rowid,
-                                    "group_anchor_relation_target_role_unproven",
-                                )
-                                stopped = True
-                                break
-                            if target_role == "self":
-                                if not select_record(
-                                    record,
-                                    origin_shard_key=key,
-                                    origin_rowid=rowid,
-                                ) or not select_record(
-                                    target,
-                                    origin_shard_key=key,
-                                    origin_rowid=rowid,
-                                ):
-                                    stopped = True
-                                    break
-                    if stopped:
-                        break
-
-        # Metadata is sufficient for bounded selection, but the selected full
-        # row is the only place where a body-level refermsg can disagree with
-        # source/packed metadata.  Validate it before a cursor can be returned
-        # or a durable quote relation emitted.
-        selected_full_rows: dict[tuple[str, str], sqlite3.Row] = {}
-        if not hold_reasons:
-            for identity, record in selected_records.items():
-                shard = record["shard"]
-                row = self._fetch_group_projection_row(
-                    connection=shard["connection"],
-                    table=shard["table"],
-                    rowid=int(record["rowid"]),
-                    status_expr=shard["status_expr"],
-                    origin_expr=shard["origin_expr"],
-                )
-                if self._group_record_identity(shard, row) != identity:
-                    hold(
-                        str(shard["key"]),
-                        int(record["rowid"]),
-                        "group_anchor_selected_identity_changed",
-                    )
-                    break
-                _, relation_conflict = self._row_structured_quote_resolution(row)
-                if relation_conflict:
-                    hold(
-                        str(shard["key"]),
-                        int(record["rowid"]),
-                        "group_anchor_relation_conflict",
-                    )
-                    break
-                selected_full_rows[identity] = row
-
-        # A held row makes this whole projection non-committable: callers have
-        # one batch receipt, not independently durable shard receipts.  Return
-        # only the prior durable cursors (or zero during first initialization)
-        # and no selected bodies, so a later shard cannot be committed past a
-        # held earlier shard.
-        if hold_reasons:
-            shard_highs = (
-                dict(sorted(normalized_prior.items()))
-                if initialized
-                else {str(shard["key"]): 0 for shard in shards}
-            )
-            shard_self_sender_receipts = (
-                dict(sorted(normalized_prior_receipts.items()))
-                if initialized and len(normalized_prior_receipts) == len(shards)
-                else {}
-            )
-            selected_records = {}
-        else:
-            selected_records = {
-                identity: record
-                for identity, record in selected_records.items()
-                if record_is_safe(record)
-            }
-            selected_full_rows = {
-                identity: row
-                for identity, row in selected_full_rows.items()
-                if identity in selected_records
-            }
-            shard_self_sender_receipts = {
-                str(shard["key"]): dict(shard["self_sender_receipt"])
-                for shard in shards
-            }
-        messages: dict[tuple[str, str], dict[str, Any]] = {}
-        for identity, record in selected_records.items():
-            shard = record["shard"]
-            row = selected_full_rows.get(identity)
-            if row is None:
-                raise DirectSchemaError("selected group row is unavailable")
-            messages[identity] = self._message_from_row(
-                row=row,
-                session_native_id=session_native_id,
-                message_source=shard["source"],
-                message_table=shard["table"],
-                connection=shard["connection"],
-                # Group selection needs roles but never an all-contact sender
-                # map; a missing counterpart display name is an explicit gap.
-                sender_index={},
-                strict_group_projection=True,
-                group_shard_key=str(shard["key"]),
-                group_self_sender_receipt=shard.get("self_sender_receipt"),
-            )
-        ordered = sorted(
-            messages.values(),
-            key=lambda item: (
-                item.get("createTime") is None,
-                int(item.get("createTime") or 0),
-                int(item.get("sortSeq") or 0),
-                str(item.get("serverId") or item.get("localId") or ""),
-            ),
-        )
-        return {
-            "messages": ordered,
-            "sync": {
-                "hasMore": False,
-                "watermark": end_s,
-                "sortSeqWatermark": max_sort_seq,
-                "scanMode": "group_anchor_two_pass_metadata",
-                "scanPasses": 2,
-                "pageSize": page_size,
-                "pageCount": page_count,
-                "maxPageRows": max_page_rows,
-                "scannedRows": pass_rows,
-                "retainedRows": len(messages),
-                "missingIdentityRows": missing_identity_rows,
-                "missingIdentitySelfRows": missing_identity_self_rows,
-                "shardRowidHighs": dict(sorted(shard_highs.items())),
-                "shardSelfSenderReceipts": dict(
-                    sorted(shard_self_sender_receipts.items())
-                ),
-                "cursorHeld": bool(hold_reasons),
-                "holdReasons": sorted(hold_reasons),
-                "initialScanComplete": not initialized and not hold_reasons,
-                "historicalMutationCoverage": (
-                    "explicit_full_reconcile"
-                    if full_reconcile
-                    else "tail_only_requires_explicit_full_reconcile"
-                    if initialized
-                    else "initial_full_scan"
-                ),
-                "tailRows": tail_rows,
-            },
-        }
 
     def _private_messages_by_server_ids(
         self,

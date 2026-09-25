@@ -130,6 +130,19 @@ def _decode_safe_value(value: object, key: bytes) -> str:
         raise DirectCredentialError("local source credential decode failed") from exc
 
 
+def moments_author_identity(identity: str) -> str:
+    """Return the native Moments author form of a configured account identity.
+
+    The configured database identity may carry a trailing underscore plus
+    four hexadecimal characters that distinguishes the local account storage
+    root.  Moments stores the same identity without that storage suffix.  Keep
+    the unsuffixed form unchanged for compatible sources.
+    """
+
+    match = re.fullmatch(r"(.+)_([0-9a-fA-F]{4})", identity)
+    return match.group(1) if match else identity
+
+
 def load_direct_source_identity(
     config_path: Path | str, local_state_path: Path | str
 ) -> tuple[Path, str, str]:
@@ -1349,16 +1362,9 @@ class DirectWeChatReader:
 
     @property
     def moments_self_native_id(self) -> str:
-        """Return the native Moments author identity for this account.
+        """Return the native Moments author identity for this account."""
 
-        The configured database identity may carry a trailing underscore plus
-        four hexadecimal characters that distinguishes the local account
-        storage root.  Moments stores the same identity without that storage
-        suffix.  Keep the unsuffixed form unchanged for compatible sources.
-        """
-
-        match = re.fullmatch(r"(.+)_([0-9a-fA-F]{4})", self._identity)
-        return match.group(1) if match else self._identity
+        return moments_author_identity(self._identity)
 
     def __enter__(self) -> "DirectWeChatReader":
         return self

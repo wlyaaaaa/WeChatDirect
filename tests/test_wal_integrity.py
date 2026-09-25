@@ -7,9 +7,11 @@ import isolation  # noqa: F401
 import hashlib
 import hmac
 import sqlite3
+import os
 import struct
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -318,37 +320,37 @@ class EncryptedSnapshotTests(unittest.TestCase):
             wal_path = source.with_name(source.name + "-wal")
             wal_path.write_bytes(encrypted_wal)
 
-            reader = object.__new__(DirectWeChatReader)
-            reader._storage = root / "db_storage"
-            reader._master_hex = master
-            reader._prepared = {}
-            reader._connections = {}
-            reader._message_schema_probe_pages = {}
-            reader._message_table_sources_cache = {}
-            reader._message_connections_cache = None
-            reader._sender_index_cache = None
-            reader._sender_index_by_message_source_cache = None
-            reader._message_self_sender_cache = {}
-            reader._resource_index_cache = None
-            reader._voice_index_cache = None
-            reader._identity = "synthetic-self"
-            reader._expected_self_username_sha256 = None
-            reader._temporary = SimpleNamespace(name=str(root / "scratch"))
-            Path(reader._temporary.name).mkdir()
-            copied = reader._prepare(source)
-            check = sqlite3.connect(copied)
+            # Construct through the real initializer; only the protected
+            # credential carrier is replaced by the synthetic master key.
+            with (
+                mock.patch(
+                    "wechat_source.load_direct_source_identity",
+                    return_value=(root, master, "synthetic-self"),
+                ),
+                mock.patch.dict(os.environ, {"WECHAT_DIRECT_TEMP_ROOT": str(root)}),
+            ):
+                reader = DirectWeChatReader(
+                    config_path=root / "unused-config",
+                    local_state_path=root / "unused-state",
+                    snapshot_cutoff_s=1000,
+                )
             try:
-                self.assertEqual(check.execute("PRAGMA quick_check").fetchone()[0], "ok")
-            finally:
-                check.close()
-            reader._message_connections = lambda _table=None: [
-                (source, reader._open(source))
-            ]
-            reader._session_is_registered = lambda _session: True
-            reader._message_from_row = lambda **kwargs: {
-                "content": kwargs["row"]["message_content"]
-            }
-            try:
+                copied = reader._prepare(source)
+                self.assertTrue(copied.is_relative_to(root / "wechat-direct-scratch"))
+                check = sqlite3.connect(copied)
+                try:
+                    self.assertEqual(
+                        check.execute("PRAGMA quick_check").fetchone()[0], "ok"
+                    )
+                finally:
+                    check.close()
+                reader._message_connections = lambda _table=None: [
+                    (source, reader._open(source))
+                ]
+                reader._session_is_registered = lambda _session: True
+                reader._message_from_row = lambda **kwargs: {
+                    "content": kwargs["row"]["message_content"]
+                }
                 result = reader.fetch_messages(
                     session, since_s=None, end_s=300, limit=None
                 )
@@ -358,5 +360,4 @@ class EncryptedSnapshotTests(unittest.TestCase):
                 )
                 self.assertNotEqual(source.read_bytes()[:16], b"SQLite format 3\0")
             finally:
-                for opened in reader._connections.values():
-                    opened.close()
+                reader.close()

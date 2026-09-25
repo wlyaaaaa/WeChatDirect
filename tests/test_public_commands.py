@@ -70,11 +70,61 @@ class PublicCommandTests(unittest.TestCase):
         self.assertNotIn("private-key", json.dumps(receipt))
         self.assertNotIn("wxid-private", json.dumps(receipt))
 
+    def test_identity_helper_and_reader_share_one_suffix_rule(self) -> None:
+        from wechat_source import DirectWeChatReader, moments_author_identity
+
+        cases = {
+            "wxid-private_AB12": "wxid-private",
+            "wxid-private_ab12": "wxid-private",
+            "wxid-private": "wxid-private",
+            "wxid-private_xy12": "wxid-private_xy12",
+            "wxid-private_ab123": "wxid-private_ab123",
+            "_ab12": "_ab12",
+        }
+        for identity, expected in cases.items():
+            with self.subTest(identity=identity):
+                self.assertEqual(moments_author_identity(identity), expected)
+                reader = DirectWeChatReader.__new__(DirectWeChatReader)
+                reader._identity = identity
+                self.assertEqual(reader.moments_self_native_id, expected)
+                args = argparse.Namespace(config_path="c", local_state_path="s")
+                with mock.patch.object(
+                    wechat_cli,
+                    "load_direct_source_identity",
+                    return_value=(Path("synthetic"), "private-key", identity),
+                ):
+                    _code, receipt = self._capture(
+                        wechat_cli.command_identity_commitments, args
+                    )
+                self.assertEqual(
+                    receipt["expected_moments_author_sha256"],
+                    _sha256(expected.encode("utf-8")),
+                )
+
     def test_invalid_cli_arguments_have_json_failure_receipt(self) -> None:
         code, receipt = self._capture(wechat_cli.main, ["media-open"])
         self.assertEqual(code, 2)
         self.assertEqual(receipt["error"], "cli_arguments_invalid")
         self.assertEqual(receipt["nextAction"], "correct_query_arguments")
+
+    def test_interrupt_has_json_failure_receipt(self) -> None:
+        def interrupted(_args: argparse.Namespace) -> int:
+            raise KeyboardInterrupt()
+
+        parser = mock.Mock()
+        parser.parse_args.return_value = argparse.Namespace(handler=interrupted)
+        with mock.patch.object(wechat_cli, "parser", return_value=parser):
+            code, receipt = self._capture(wechat_cli.main, ["sync-contact"])
+        self.assertEqual(code, 130)
+        self.assertEqual(
+            receipt,
+            {
+                "status": "failed",
+                "error": "operation_interrupted",
+                "retryable": False,
+                "nextAction": "inspect_interrupted_operation_and_output",
+            },
+        )
 
     def _capture(self, function, args: argparse.Namespace) -> tuple[int, dict]:
         stream = io.BytesIO()

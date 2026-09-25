@@ -23,7 +23,6 @@ import json
 import mimetypes
 import os
 from pathlib import Path, PurePosixPath
-import re
 import shutil
 import subprocess
 import sys
@@ -36,6 +35,7 @@ from wechat_source import (
     DirectWeChatReader,
     WeChatDirectError,
     load_direct_source_identity,
+    moments_author_identity,
 )
 from wechat_storage import (
     StorageError,
@@ -201,8 +201,7 @@ def command_identity_commitments(args: argparse.Namespace) -> int:
     _root, _key, identity = load_direct_source_identity(
         args.config_path, args.local_state_path
     )
-    suffix = re.fullmatch(r"(.+)_([0-9a-fA-F]{4})", identity)
-    moments_author = suffix.group(1) if suffix else identity
+    moments_author = moments_author_identity(identity)
     sys.stdout.buffer.write(
         _canonical_bytes(
             {

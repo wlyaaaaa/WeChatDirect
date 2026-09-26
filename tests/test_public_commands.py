@@ -452,8 +452,10 @@ class PublicCommandTests(unittest.TestCase):
                 wechat_cli._verify_contact_fast_path_archive(root, count_drift, state)
 
     def test_public_copy_states_current_media_and_recovery_limits(self) -> None:
-        readme = Path(wechat_cli.__file__).with_name("README.md").read_text(
-            encoding="utf-8"
+        project_root = Path(wechat_cli.__file__).parent
+        readme = "\n".join(
+            (project_root / path).read_text(encoding="utf-8")
+            for path in ("README.md", "docs/USAGE.md", "docs/RECOVERY.md")
         )
         for phrase in (
             "hardlink.db",

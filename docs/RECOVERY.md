@@ -21,6 +21,8 @@ wechat-direct repair-media --account primary --contact "<contact-or-group>" --ou
 
 它不重扫聊天历史、不访问远端 CDN，不改变已读游标；可复用已验证的 SILK 派生 WAV。没有可用来源时保留缺口，错误不会伪装成已补齐。语音解码超时、解释器失效、非法 WAV 均转为可解释缺口；原 SILK 与其他消息继续保留。
 
+档案中的附件缺口取决于设备当前仍可读取的本机缓存。文字档案和 `verify-export` 通过都不表示缺失附件已经保存；本人后来在微信中下载并使附件重新进入本机缓存后，才可对点名档案运行 `repair-media` 或 `--full-reconcile` 重试，仍读不到时继续报告缺口，不承诺追回。
+
 ### 按字节分页与长文本
 
 `context --byte-limit 65536` 可把 stdout JSON 控制在 32–512 KiB 范围内。结果过大时先缩小消息页并保留续查游标；单条长文本使用 `segmentedFields` 明确指出预览长度、总长度、原文哈希和续读入口，不静默删字：

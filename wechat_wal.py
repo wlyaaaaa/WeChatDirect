@@ -14,6 +14,7 @@ import os
 import shutil
 import struct
 
+from wechat_storage import open_source_read
 
 class WalError(ValueError):
     """Unsupported or inconsistent snapshot input; never contains source paths."""
@@ -69,7 +70,7 @@ def scan_wal(
     tail = "end"
     covered = base_page_count
     beyond: set[int] = set()
-    with path.open("rb") as stream:
+    with open_source_read(path) as stream:
         header = stream.read(32)
         if len(header) != 32:
             raise WalError("wal_header_truncated")
@@ -144,7 +145,7 @@ def copy_plain_snapshot(source: Path, destination: Path, wal: Path) -> None:
         destination.exists() and os.path.samefile(source, destination)
     ):
         raise WalError("snapshot_source_destination_same")
-    with source.open("rb") as stream:
+    with open_source_read(source) as stream:
         header = stream.read(100)
     if len(header) != 100 or header[:16] != b"SQLite format 3\0":
         raise WalError("sqlite_header_invalid")
@@ -154,10 +155,12 @@ def copy_plain_snapshot(source: Path, destination: Path, wal: Path) -> None:
     if not size or length % size:
         raise WalError("sqlite_page_geometry_invalid")
     scan = scan_wal(wal, page_size=size, base_page_count=length // size)
-    shutil.copy2(source, destination)
+    with open_source_read(source) as stream, destination.open("wb") as out:
+        shutil.copyfileobj(stream, out, 1024 * 1024)
+    shutil.copystat(source, destination)
     if scan.database_pages is None:
         return
-    with Path(wal).open("rb") as stream, destination.open("r+b") as out:
+    with open_source_read(wal) as stream, destination.open("r+b") as out:
         for number, (_index, offset) in sorted(scan.offsets.items()):
             stream.seek(offset)
             payload = stream.read(size)

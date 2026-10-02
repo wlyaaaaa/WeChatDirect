@@ -15,7 +15,7 @@ from pathlib import Path
 import shutil
 import tempfile
 import time
-from typing import Callable, Iterator
+from typing import BinaryIO, Callable, Iterator
 
 
 class StorageError(RuntimeError):
@@ -146,6 +146,36 @@ else:
 
     def _change_time(_path: Path, stat: os.stat_result) -> int:
         return stat.st_ctime_ns
+
+
+def open_source_read(path: Path | str) -> BinaryIO:
+    """Read a live source without blocking its owner's writes or file rotation."""
+    path = Path(path)
+    if os.name != "nt":
+        return path.open("rb")
+    import msvcrt
+
+    handle = _kernel32.CreateFileW(
+        str(path),
+        0x80000000,  # GENERIC_READ only
+        0x7,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        None,
+        3,  # OPEN_EXISTING; never create a source
+        0x80,  # FILE_ATTRIBUTE_NORMAL
+        None,
+    )
+    if handle == _INVALID_HANDLE:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY | os.O_NOINHERIT)
+    except BaseException:
+        _kernel32.CloseHandle(handle)
+        raise
+    try:
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _tree_signature(root: Path) -> list[tuple]:

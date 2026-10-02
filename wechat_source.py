@@ -22,7 +22,7 @@ from pathlib import Path
 import re
 import sqlite3
 import struct
-from wechat_storage import ScratchDirectory
+from wechat_storage import ScratchDirectory, open_source_read
 import time
 import unicodedata
 from typing import Any, Iterable, Iterator, Mapping, Sequence
@@ -463,7 +463,7 @@ class EncryptedPageCodec:
             raise SnapshotCopyError("snapshot_source_destination_same")
         created = False
         try:
-            with source_path.open("rb") as source_file, temporary.open("xb") as output:
+            with open_source_read(source_path) as source_file, temporary.open("xb") as output:
                 created = True
                 page_number = 1
                 while True:
@@ -505,7 +505,7 @@ class EncryptedPageCodec:
             raise SnapshotCopyError("wal_resume_boundary_invalid")
         if scan.database_pages is None or scan.committed_frames <= from_frame:
             return from_frame
-        with wal_path.open("rb") as source, database_path.open("r+b") as output:
+        with open_source_read(wal_path) as source, database_path.open("r+b") as output:
             for number, (index, offset) in sorted(scan.offsets.items()):
                 if index < from_frame:
                     continue
@@ -603,12 +603,14 @@ def _committed_wal_page_offsets(
     }, scan.database_pages
 
 
-def _file_signature(path: Path) -> tuple[int, int] | None:
+def _file_signature(path: Path) -> tuple[int, int, int, int] | None:
     try:
         stat = path.stat()
     except FileNotFoundError:
         return None
-    return stat.st_size, stat.st_mtime_ns
+    # A replacement can preserve both size and mtime. File identity must also
+    # change the snapshot signature now that source handles allow rotation.
+    return stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino
 
 
 def _sqlite_schema_message_tables_once(
@@ -627,7 +629,7 @@ def _sqlite_schema_message_tables_once(
         base_page_count=base_page_count,
         page_size=PAGE_SIZE,
     )
-    with source.open("rb") as database:
+    with open_source_read(source) as database:
         first_encrypted = database.read(PAGE_SIZE)
         if len(first_encrypted) != PAGE_SIZE:
             raise SnapshotCopyError("message shard first page is incomplete")
@@ -642,7 +644,7 @@ def _sqlite_schema_message_tables_once(
             if encrypted
             else None
         )
-        wal_stream = wal.open("rb") if wal_offsets else None
+        wal_stream = open_source_read(wal) if wal_offsets else None
         pages: dict[int, bytes] = {}
         try:
 
@@ -1392,12 +1394,8 @@ class DirectWeChatReader:
         )
 
     @staticmethod
-    def _signature(path: Path) -> tuple[int, int] | None:
-        try:
-            stat = path.stat()
-        except FileNotFoundError:
-            return None
-        return stat.st_size, stat.st_mtime_ns
+    def _signature(path: Path) -> tuple[int, int, int, int] | None:
+        return _file_signature(path)
 
     def _prepare(self, source: Path) -> Path:
         cached = self._prepared.get(source)
@@ -1411,7 +1409,7 @@ class DirectWeChatReader:
         for _attempt in range(3):
             before = (self._signature(source), self._signature(wal))
             try:
-                with source.open("rb") as stream:
+                with open_source_read(source) as stream:
                     first_page = stream.read(PAGE_SIZE)
                 if first_page.startswith(b"SQLite format 3\x00"):
                     try:
@@ -1506,7 +1504,7 @@ class DirectWeChatReader:
                 signature = self._signature(candidate)
                 if signature is None:
                     continue
-                size, modified_ns = signature
+                size, modified_ns = signature[:2]
                 entries.append(
                     (
                         candidate.relative_to(self._storage).as_posix(),

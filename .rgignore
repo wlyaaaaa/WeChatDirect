@@ -1,0 +1,17 @@
+# 默认搜索只排除生成物、缓存和依赖；不改变 Git 跟踪或文件内容。
+# 现行源码、配置、文档和有用的合成夹具保留。
+/exports/
+/preserve/
+/wechat-direct-scratch/
+/media/
+/voice/
+*.wechat-transaction/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+*.log
+/docs/search-hygiene-candidates.md

@@ -1,3 +1,35 @@
+# BEGIN eagent-search-ignore (source: E:/.agents/templates/project/.rgignore)
+# Generated block; project-specific entries and exceptions go below it.
+.git/
+node_modules/
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+[Cc]ache/
+.tmp/
+[Tt]mp/
+[Tt]emp/
+[Ll]ogs/
+dist*/
+build/
+site-release/
+.publish/
+releases/
+**/docs/archive/
+[Aa]rchives/
+old-versions/
+[Ss]napshots/
+[Bb]ackups/
+output/
+outputs/
+[Ww]orktrees/
+_worktrees/
+gpt-children/
+# END eagent-search-ignore
 # 默认搜索只排除生成物、缓存和依赖；不改变 Git 跟踪或文件内容。
 # 现行源码、配置、文档和有用的合成夹具保留。
 /exports/

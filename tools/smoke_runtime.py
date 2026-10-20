@@ -49,7 +49,12 @@ def main() -> int:
     checks["installed_cli_environment"] = "pass"
     with tempfile.TemporaryDirectory(prefix="wechat-runtime-smoke-") as td:
         root = Path(td)
-        if args.voice_python:
+        if args.voice_python or args.require_voice:
+            voice_command = (
+                [args.voice_python]
+                if args.voice_python
+                else cli._voice_interpreter_command()
+            )
             pcm, silk, wav = root / "tone.pcm", root / "tone.silk", root / "tone.wav"
             pcm.write_bytes(
                 b"".join(
@@ -60,11 +65,12 @@ def main() -> int:
                 )
             )
             encode = "import pilk,sys;pilk.encode(sys.argv[1],sys.argv[2],pcm_rate=24000,tencent=True)"
-            run([args.voice_python, "-B", "-c", encode, str(pcm), str(silk)])
+            run([*voice_command, "-B", "-c", encode, str(pcm), str(silk)])
             original = silk.read_bytes()
             assert original.startswith(b"\x02#!SILK_V3")
             previous = os.environ.get("WECHAT_DIRECT_VOICE_PYTHON")
-            os.environ["WECHAT_DIRECT_VOICE_PYTHON"] = args.voice_python
+            if args.voice_python:
+                os.environ["WECHAT_DIRECT_VOICE_PYTHON"] = args.voice_python
             try:
                 cli._decode_voice_file(silk, wav)
             finally:
@@ -80,8 +86,6 @@ def main() -> int:
             assert silk.read_bytes() == original
             checks["python311_silk_to_wav_real_roundtrip"] = "pass"
         else:
-            if args.require_voice:
-                raise RuntimeError("voice_python_required")
             checks["python311_silk_to_wav_real_roundtrip"] = "not_run"
         if shutil.which("ffmpeg") and shutil.which("ffprobe"):
             hevc = run(

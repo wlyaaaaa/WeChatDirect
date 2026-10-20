@@ -27,8 +27,10 @@ WeChatDirect 主要供 AI 调用，是一个 Windows-only 的本地工具：从�
 ```powershell
 py -3.14 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -c constraints-verified.txt .
+python -m pip install -c constraints-verified.txt -e .
 ```
+
+可编辑安装让 `wechat-direct` 直接使用仓库源码，修复源码后无需重装；本地设置也从源码目录发现，无需在 `site-packages` 维护链接。移动项目或换机后重建虚拟环境，再执行上述安装命令。非可编辑安装的打包结果由 GitHub CI 验证。
 
 开发依赖（包含未固定版本的 `ruff`）可安装为：
 

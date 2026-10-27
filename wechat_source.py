@@ -13,7 +13,7 @@ import base64
 import binascii
 import ctypes
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cached_property, lru_cache
 import hashlib
 import hmac
 import json
@@ -25,11 +25,16 @@ import struct
 from wechat_storage import ScratchDirectory, open_source_read
 import time
 import unicodedata
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, BinaryIO, Iterable, Iterator, Mapping, Sequence
 from urllib.parse import quote
 import xml.etree.ElementTree as ET
 
 from wechat_wal import WalError, scan_wal, copy_plain_snapshot
+from wechat_plaincache import (
+    PlaintextCacheEntry,
+    PlaintextCacheError,
+    resolve_cache_root,
+)
 
 
 PAGE_SIZE = 4096
@@ -273,7 +278,14 @@ def derive_page_key(
         raise ValueError("salt is empty")
     if iterations <= 0:
         raise ValueError("iterations must be positive")
-    return hashlib.pbkdf2_hmac("sha512", password, salt_bytes, iterations, 32)
+    return _pbkdf2_page_key(password, salt_bytes, iterations)
+
+
+@lru_cache(maxsize=64)
+def _pbkdf2_page_key(password: bytes, salt: bytes, iterations: int) -> bytes:
+    # The schema probe and the snapshot of one database derive the same key
+    # in one process; the key already lives in memory for that process.
+    return hashlib.pbkdf2_hmac("sha512", password, salt, iterations, 32)
 
 
 def _aes_decrypt(ciphertext: bytes, key: bytes, iv: bytes) -> bytes:
@@ -441,8 +453,115 @@ class EncryptedPageCodec:
         )
         return hmac.compare_digest(expected, tag)
 
-    def decrypt_database(self, source: Path | str, destination: Path | str) -> Path:
-        """Decrypt a database to ``destination`` using an atomic temp file."""
+    @cached_property
+    def key_fingerprint(self) -> str:
+        """Identify the page key without deriving or storing it.
+
+        The derived key is a pure function of these inputs, so a persistent
+        cache can detect a key change without paying for PBKDF2 when nothing
+        needs decrypting. Only this one-way digest is ever written to disk.
+        """
+
+        digest = hashlib.sha256(b"WeChatDirect page key fingerprint v1\0")
+        digest.update(self.key_derivation.encode("ascii") + b"\0")
+        if self.key_derivation == "raw":
+            material = self.key
+        elif isinstance(self.master_hex, str):
+            try:
+                material = bytes.fromhex(self.master_hex.strip())
+            except ValueError as exc:
+                raise ValueError("master_hex is not valid hexadecimal") from exc
+        else:
+            material = bytes(self.master_hex)
+        salt = b"" if self.salt is None else _as_bytes(self.salt)
+        for part in (material, salt):
+            digest.update(len(part).to_bytes(4, "big") + part)
+        digest.update(self.iterations.to_bytes(8, "big"))
+        return digest.hexdigest()
+
+    def decrypt_pages(self, numbers: Sequence[int], pages: Sequence[bytes]) -> bytes:
+        """Batch-decrypt numbered pages into normal SQLite pages, in order.
+
+        Every page is authenticated first when an HMAC mode is configured.
+        CBC decryption is ECB decryption XOR the IV or previous ciphertext
+        block, so a small batch shares one cipher context.
+        """
+
+        if len(numbers) != len(pages):
+            raise ValueError("page numbers and pages differ in length")
+        try:
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        except ImportError as exc:  # pragma: no cover - environment-dependent
+            raise CryptoUnavailableError(
+                "cryptography is required for the encrypted direct-read path"
+            ) from exc
+        payload_size = self.page_size - self.reserve_size
+        clear_reserve = b"\x00" * self.reserve_size
+        iv_start = payload_size + self.iv_offset
+        preserve_header = (
+            len(self.key) == 48
+            if self.plaintext_header is None
+            else self.plaintext_header
+        )
+        result: list[bytes] = []
+        # Small batches keep the ECB/XOR buffers in cache.
+        for begin in range(0, len(pages), 16):
+            batch_numbers = numbers[begin : begin + 16]
+            batch = pages[begin : begin + 16]
+            ciphertexts, previous_blocks = [], []
+            for number, page in zip(batch_numbers, batch):
+                if number <= 0:
+                    raise EncryptedPageError("page number must be positive")
+                if len(page) != self.page_size:
+                    raise EncryptedPageError("encrypted page has an unexpected size")
+                if self.hmac_mode is not None and not self.verify_page_hmac(
+                    number, page
+                ):
+                    raise EncryptedPageError("encrypted page authentication failed")
+                start = AES_BLOCK_SIZE if number == 1 else 0
+                ciphertext = page[start:payload_size]
+                if len(ciphertext) % AES_BLOCK_SIZE:
+                    raise EncryptedPageError(
+                        "encrypted page payload is not block aligned"
+                    )
+                ciphertexts.append(ciphertext)
+                if ciphertext:
+                    previous_blocks.append(
+                        page[iv_start : iv_start + AES_BLOCK_SIZE]
+                        + ciphertext[:-AES_BLOCK_SIZE]
+                    )
+            decryptor = Cipher(algorithms.AES(self.key[:32]), modes.ECB()).decryptor()
+            decrypted = decryptor.update(b"".join(ciphertexts)) + decryptor.finalize()
+            plaintext = (
+                int.from_bytes(decrypted, "little")
+                ^ int.from_bytes(b"".join(previous_blocks), "little")
+            ).to_bytes(len(decrypted), "little")
+            position = 0
+            for number, page, ciphertext in zip(batch_numbers, batch, ciphertexts):
+                if number == 1:
+                    result.append(
+                        page[:AES_BLOCK_SIZE]
+                        if preserve_header
+                        else b"SQLite format 3\x00"
+                    )
+                count = len(ciphertext)
+                result.append(plaintext[position : position + count])
+                result.append(clear_reserve)
+                position += count
+        return b"".join(result)
+
+    def decrypt_database(
+        self,
+        source: Path | str,
+        destination: Path | str,
+        *,
+        reserve_output: BinaryIO | None = None,
+    ) -> Path:
+        """Decrypt a database to ``destination`` using an atomic temp file.
+
+        ``reserve_output`` optionally receives every source page's reserve
+        bytes (IV and tag), in page order, from the same reads.
+        """
 
         source_path = Path(source)
         destination_path = Path(destination)
@@ -464,14 +583,12 @@ class EncryptedPageCodec:
         ):
             raise SnapshotCopyError("snapshot_source_destination_same")
         created = False
+        payload_size = self.page_size - self.reserve_size
         try:
             with open_source_read(source_path) as source_file, temporary.open("xb") as output:
                 created = True
                 page_number = 1
-                payload_size = self.page_size - self.reserve_size
-                clear_reserve = b"\x00" * self.reserve_size
                 while True:
-                    # Small batches keep the ECB/XOR buffers in cache.
                     block = source_file.read(self.page_size * 16)
                     if not block:
                         break
@@ -481,55 +598,12 @@ class EncryptedPageCodec:
                         block[i : i + self.page_size]
                         for i in range(0, len(block), self.page_size)
                     ]
-                    ciphertexts, previous_blocks = [], []
-                    for offset, page in enumerate(pages):
-                        number = page_number + offset
-                        if self.hmac_mode is not None and not self.verify_page_hmac(
-                            number, page
-                        ):
-                            raise EncryptedPageError("encrypted page authentication failed")
-                        start = AES_BLOCK_SIZE if number == 1 else 0
-                        ciphertext = page[start:payload_size]
-                        if len(ciphertext) % AES_BLOCK_SIZE:
-                            raise EncryptedPageError("encrypted page payload is not block aligned")
-                        ciphertexts.append(ciphertext)
-                        iv_start = payload_size + self.iv_offset
-                        if ciphertext:
-                            previous_blocks.append(
-                                page[iv_start : iv_start + AES_BLOCK_SIZE]
-                                + ciphertext[:-AES_BLOCK_SIZE]
-                            )
-                    try:
-                        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-                    except ImportError as exc:  # pragma: no cover - environment-dependent
-                        raise CryptoUnavailableError(
-                            "cryptography is required for the encrypted direct-read path"
-                        ) from exc
-                    decryptor = Cipher(algorithms.AES(self.key[:32]), modes.ECB()).decryptor()
-                    decrypted = decryptor.update(b"".join(ciphertexts)) + decryptor.finalize()
-                    # CBC is ECB decryption XOR the IV/previous ciphertext block.
-                    plaintext = (
-                        int.from_bytes(decrypted, "little")
-                        ^ int.from_bytes(b"".join(previous_blocks), "little")
-                    ).to_bytes(len(decrypted), "little")
-                    result, position = [], 0
-                    for offset, page in enumerate(pages):
-                        count = len(ciphertexts[offset])
-                        if page_number + offset == 1:
-                            preserve_header = (
-                                len(self.key) == 48
-                                if self.plaintext_header is None
-                                else self.plaintext_header
-                            )
-                            result.append(
-                                page[:AES_BLOCK_SIZE]
-                                if preserve_header
-                                else b"SQLite format 3\x00"
-                            )
-                        result.append(plaintext[position : position + count])
-                        result.append(clear_reserve)
-                        position += count
-                    output.write(b"".join(result))
+                    numbers = range(page_number, page_number + len(pages))
+                    output.write(self.decrypt_pages(numbers, pages))
+                    if reserve_output is not None:
+                        reserve_output.write(
+                            b"".join(page[payload_size:] for page in pages)
+                        )
                     page_number += len(pages)
             temporary.replace(destination_path)
         except Exception:
@@ -542,6 +616,19 @@ class EncryptedPageCodec:
         self, database: Path | str, wal: Path | str, *, from_frame: int = 0
     ) -> int:
         """Overlay only checksum-validated committed frames on a disposable copy."""
+        return self.merge_wal_detailed(
+            database, wal, from_frame=from_frame
+        ).committed_frames
+
+    def merge_wal_detailed(
+        self, database: Path | str, wal: Path | str, *, from_frame: int = 0
+    ) -> "WalMergeResult":
+        """Overlay committed frames and report which pages were rewritten.
+
+        ``pages_written`` includes page 1 whenever its in-header database size
+        was rewritten, and ``database_pages`` is the resulting file page count
+        (``None`` when nothing was applied and the file is untouched).
+        """
         database_path, wal_path = Path(database), Path(wal)
         if from_frame < 0:
             raise ValueError("from_frame must be non-negative")
@@ -563,7 +650,8 @@ class EncryptedPageCodec:
         if from_frame and from_frame not in scan.commit_boundaries:
             raise SnapshotCopyError("wal_resume_boundary_invalid")
         if scan.database_pages is None or scan.committed_frames <= from_frame:
-            return from_frame
+            return WalMergeResult(from_frame, None, frozenset())
+        written = {1}
         with open_source_read(wal_path) as source, database_path.open("r+b") as output:
             for number, (index, offset) in sorted(scan.offsets.items()):
                 if index < from_frame:
@@ -577,6 +665,7 @@ class EncryptedPageCodec:
                     )
                 output.seek((number - 1) * self.page_size)
                 output.write(plaintext)
+                written.add(number)
             output.truncate(scan.database_pages * self.page_size)
             output.seek(0)
             if output.read(16) != b"SQLite format 3\x00":
@@ -585,7 +674,20 @@ class EncryptedPageCodec:
             output.write(struct.pack(">I", scan.database_pages))
             output.flush()
             os.fsync(output.fileno())
-        return scan.committed_frames
+        return WalMergeResult(
+            scan.committed_frames,
+            scan.database_pages,
+            frozenset(page for page in written if page <= scan.database_pages),
+        )
+
+
+@dataclass(frozen=True)
+class WalMergeResult:
+    """Committed frames applied, resulting page count and rewritten pages."""
+
+    committed_frames: int
+    database_pages: int | None
+    pages_written: frozenset[int]
 
 
 def _read_sqlite_varint(data: bytes, offset: int) -> tuple[int, int]:
@@ -1376,6 +1478,7 @@ class DirectWeChatReader:
         local_state_path: Path | str,
         snapshot_cutoff_s: int | None = None,
         expected_self_username_sha256: str | None = None,
+        plaintext_cache_root: Path | str | None = None,
     ):
         account_root, master_hex, identity = load_direct_source_identity(
             config_path, local_state_path
@@ -1394,6 +1497,10 @@ class DirectWeChatReader:
         self.snapshot_cutoff_s = int(snapshot_cutoff_s or time.time())
         self._temporary = ScratchDirectory(prefix="wechat-direct-")
         self._prepared: dict[Path, Path] = {}
+        # ``plaintext_cache_root`` is the optional local setting; the
+        # environment can override it or disable the cache entirely.
+        self._plaintext_cache_root = resolve_cache_root(plaintext_cache_root)
+        self._cache_entries: list[PlaintextCacheEntry] = []
         self._connections: dict[Path, sqlite3.Connection] = {}
         self._message_connections_cache: (
             list[tuple[Path, sqlite3.Connection]] | None
@@ -1434,10 +1541,19 @@ class DirectWeChatReader:
         self.close()
 
     def close(self) -> None:
-        for connection in self._connections.values():
-            connection.close()
-        self._connections.clear()
-        self._temporary.cleanup()
+        try:
+            for connection in self._connections.values():
+                connection.close()
+            self._connections.clear()
+        finally:
+            # Snapshots stay cached; only their locks end with the reader,
+            # after every connection reading them has closed.
+            entries = getattr(self, "_cache_entries", [])
+            while entries:
+                entries.pop().release()
+            # Snapshot paths are no longer lock-protected or present.
+            getattr(self, "_prepared", {}).clear()
+            self._temporary.cleanup()
 
     def _database_files(self) -> list[Path]:
         result = []
@@ -1460,6 +1576,106 @@ class DirectWeChatReader:
         cached = self._prepared.get(source)
         if cached is not None:
             return cached
+        prepared = self._prepare_cached(source)
+        if prepared is None:
+            prepared = self._prepare_scratch_snapshot(source)
+        self._prepared[source] = prepared
+        return prepared
+
+    def _prepare_cached(self, source: Path) -> Path | None:
+        """Refresh the persistent snapshot of an encrypted source.
+
+        ``None`` means use the task-scratch snapshot for this one source:
+        the cache is disabled, the source is not encrypted, the entry lock is
+        busy, or the refresh failed. A failed refresh leaves the entry dirty
+        (rebuilt next time); the scratch path then reports any real source
+        error exactly as before. A source still changing after the bounded
+        retries raises the scratch path's existing error directly.
+        """
+
+        root = getattr(self, "_plaintext_cache_root", None)
+        if root is None:
+            return None
+        try:
+            with open_source_read(source) as stream:
+                first_page = stream.read(PAGE_SIZE)
+        except OSError:
+            return None
+        if len(first_page) != PAGE_SIZE or first_page.startswith(
+            b"SQLite format 3\x00"
+        ):
+            return None
+        entry = PlaintextCacheEntry(
+            root,
+            self.account_identity_commitment,
+            source.relative_to(self._storage).as_posix(),
+        )
+        try:
+            if not entry.acquire():
+                return None
+        except OSError:
+            return None
+        try:
+            prepared = self._refresh_cache_entry(entry, source)
+        except BaseException:
+            entry.release()
+            raise
+        if prepared is None:
+            entry.release()
+            return None
+        if not hasattr(self, "_cache_entries"):
+            self._cache_entries = []
+        # The lock stays held until close(), so no other process rewrites
+        # this snapshot while connections read it.
+        self._cache_entries.append(entry)
+        return prepared
+
+    def _refresh_cache_entry(
+        self, entry: PlaintextCacheEntry, source: Path
+    ) -> Path | None:
+        wal = source.with_name(source.name + "-wal")
+        codec: EncryptedPageCodec | None = None
+        for _attempt in range(3):
+            before = (self._signature(source), self._signature(wal))
+            try:
+                with open_source_read(source) as stream:
+                    first_page = stream.read(PAGE_SIZE)
+                if len(first_page) != PAGE_SIZE or first_page.startswith(
+                    b"SQLite format 3\x00"
+                ):
+                    raise PlaintextCacheError("plaintext_cache_source_not_encrypted")
+                if codec is None or codec.salt != first_page[:16]:
+                    codec = EncryptedPageCodec(
+                        master_hex=self._master_hex,
+                        salt=first_page[:16],
+                        hmac_mode="sqlcipher",
+                        plaintext_header=False,
+                    )
+                outcome = entry.refresh(codec, source, wal, before[0])
+                if before != (self._signature(source), self._signature(wal)):
+                    # Each page still matches its recorded reserve, so the
+                    # next attempt continues incrementally from here.
+                    entry.commit(outcome, check_pending=outcome.needs_check)
+                    continue
+                if outcome.needs_check and not entry.quick_check():
+                    return None
+                entry.commit(outcome, check_pending=False)
+                return entry.plain
+            except (
+                OSError,
+                WeChatDirectError,
+                sqlite3.DatabaseError,
+                PlaintextCacheError,
+                ValueError,
+            ):
+                if before != (self._signature(source), self._signature(wal)):
+                    continue
+                return None
+        raise SnapshotCopyError(
+            "local database changed throughout bounded snapshot retries"
+        )
+
+    def _prepare_scratch_snapshot(self, source: Path) -> Path:
         wal = source.with_name(source.name + "-wal")
         relative = source.relative_to(self._storage).as_posix()
         destination = Path(self._temporary.name) / (
@@ -1516,7 +1732,6 @@ class DirectWeChatReader:
                         )
                 finally:
                     connection.close()
-                self._prepared[source] = destination
                 return destination
         raise SnapshotCopyError(
             "local database changed throughout bounded snapshot retries"

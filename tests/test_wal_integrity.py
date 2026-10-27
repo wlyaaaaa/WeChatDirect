@@ -321,43 +321,60 @@ class EncryptedSnapshotTests(unittest.TestCase):
             wal_path.write_bytes(encrypted_wal)
 
             # Construct through the real initializer; only the protected
-            # credential carrier is replaced by the synthetic master key.
-            with (
-                mock.patch(
-                    "wechat_source.load_direct_source_identity",
-                    return_value=(root, master, "synthetic-self"),
+            # credential carrier is replaced by the synthetic master key. The
+            # task-scratch snapshot and the persistent cache must agree.
+            snapshots = {}
+            for label, environment, parent in (
+                ("scratch", {"WECHAT_DIRECT_CACHE": "0"}, "wechat-direct-scratch"),
+                (
+                    "cache",
+                    {"WECHAT_DIRECT_CACHE_ROOT": str(root / "plain-cache")},
+                    "plain-cache",
                 ),
-                mock.patch.dict(os.environ, {"WECHAT_DIRECT_TEMP_ROOT": str(root)}),
             ):
-                reader = DirectWeChatReader(
-                    config_path=root / "unused-config",
-                    local_state_path=root / "unused-state",
-                    snapshot_cutoff_s=1000,
-                )
-            try:
-                copied = reader._prepare(source)
-                self.assertTrue(copied.is_relative_to(root / "wechat-direct-scratch"))
-                check = sqlite3.connect(copied)
-                try:
-                    self.assertEqual(
-                        check.execute("PRAGMA quick_check").fetchone()[0], "ok"
+                with (
+                    self.subTest(path=label),
+                    mock.patch(
+                        "wechat_source.load_direct_source_identity",
+                        return_value=(root, master, "synthetic-self"),
+                    ),
+                    mock.patch.dict(
+                        os.environ, {"WECHAT_DIRECT_TEMP_ROOT": str(root), **environment}
+                    ),
+                ):
+                    reader = DirectWeChatReader(
+                        config_path=root / "unused-config",
+                        local_state_path=root / "unused-state",
+                        snapshot_cutoff_s=1000,
                     )
+                try:
+                    copied = reader._prepare(source)
+                    self.assertTrue(copied.is_relative_to(root / parent))
+                    snapshots[label] = copied.read_bytes()
+                    check = sqlite3.connect(
+                        copied.as_uri() + "?mode=ro&immutable=1", uri=True
+                    )
+                    try:
+                        self.assertEqual(
+                            check.execute("PRAGMA quick_check").fetchone()[0], "ok"
+                        )
+                    finally:
+                        check.close()
+                    reader._message_connections = lambda _table=None, reader=reader: [
+                        (source, reader._open(source))
+                    ]
+                    reader._session_is_registered = lambda _session: True
+                    reader._message_from_row = lambda **kwargs: {
+                        "content": kwargs["row"]["message_content"]
+                    }
+                    result = reader.fetch_messages(
+                        session, since_s=None, end_s=300, limit=None
+                    )
+                    self.assertEqual(
+                        [item["content"] for item in result["messages"]],
+                        ["base", "wal-only"],
+                    )
+                    self.assertNotEqual(source.read_bytes()[:16], b"SQLite format 3\0")
                 finally:
-                    check.close()
-                reader._message_connections = lambda _table=None: [
-                    (source, reader._open(source))
-                ]
-                reader._session_is_registered = lambda _session: True
-                reader._message_from_row = lambda **kwargs: {
-                    "content": kwargs["row"]["message_content"]
-                }
-                result = reader.fetch_messages(
-                    session, since_s=None, end_s=300, limit=None
-                )
-                self.assertEqual(
-                    [item["content"] for item in result["messages"]],
-                    ["base", "wal-only"],
-                )
-                self.assertNotEqual(source.read_bytes()[:16], b"SQLite format 3\0")
-            finally:
-                reader.close()
+                    reader.close()
+            self.assertEqual(snapshots["scratch"], snapshots["cache"])

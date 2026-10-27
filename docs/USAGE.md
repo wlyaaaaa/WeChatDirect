@@ -64,7 +64,7 @@ py -3.11 -m pip install pilk
 
 导出根的优先级从高到低为：命令的显式 `--output`（该命令支持时） > `WECHAT_DIRECT_EXPORT_ROOT` > `.wechatdirect.local.json` 中的 `export_root` > `%LOCALAPPDATA%\WeChatDirect\exports`。
 
-`.wechatdirect.local.json` 允许 `config`、`export_root` 和可选的 `aliases` 三个路径键。可复制 `local-settings.example.json` 后填入本机值；该文件只应留在本机，不要提交或分享。
+`.wechatdirect.local.json` 允许 `config`、`export_root`，以及可选的 `aliases`（称呼表路径）和 `plaintextCacheRoot`（见下文明文快照缓存）四个路径键。可复制 `local-settings.example.json` 后填入本机值；该文件只应留在本机，不要提交或分享。
 
 `accounts.example.json` 只展示结构和占位符。真实配置至少填写一个槽位；键名只允许 `primary`、`secondary`，两者均可配置。`auto` 和 `changes --account both` 只检查已配置槽位，显式点名缺失槽位返回 `wechat_account_not_configured`，不会转到另一账号。每个已配置槽位须填写：
 
@@ -86,6 +86,16 @@ wechat-direct identity-commitments --config-path "<source-config.json>" --local-
 把输出的 `expected_source_identity_sha256` 和 `expected_moments_author_sha256` 分别填入该槽位。前者是 UTF-8 编码 `myWxid` 的 SHA-256；后者先严格去掉原生 ID 末尾的 `_` 加四位十六进制存储后缀（若存在），再取 UTF-8 SHA-256。运行时仍会独立校验来源身份，不会因能计算承诺就自动信任或改写配置。
 
 图片解码按当前来源身份从同一配置载体的 `wxidConfigs` 读取 `imageAesKey`、`imageXorKey`，缺少账号专属项时才使用身份一致的当前顶层项；沿用原有 DPAPI/safe 解封流程，仅在进程内使用。不会从昵称或配置目录名猜账号，不要求重新粘贴已保存的密钥，也不把密钥写入阅读包、终端或 Git。媒体字段缺失不影响普通文字读取。
+
+### 明文快照缓存
+
+读取加密的本地数据库时，解密后的明文库会长期留在本机缓存中；之后只重新解密主库变化的页，并重新叠加当前 WAL，不再每次整库解密。源文件完好时，结果与逐次整库解密逐字节一致；与旧做法的差别见 [恢复与结果边界](RECOVERY.md)。
+
+- 位置优先级：环境变量 `WECHAT_DIRECT_CACHE_ROOT` > `.wechatdirect.local.json` 中的 `plaintextCacheRoot` > `%TEMP%\WeChatDirect\plain-cache`。其下按账号身份承诺和数据库相对路径分条目存放。
+- 关闭：设置环境变量 `WECHAT_DIRECT_CACHE=0`，即回到每次在任务临时目录整库解密的旧做法。
+- 删除：没有读取在进行时，可随时整个删除缓存目录，下次读取自动重建（首次重建耗时与旧做法相当）。缓存不归 `temp-status` 管理，`--clean` 不会碰它。
+- 同一数据库的缓存正被另一个读取进程使用时，本次最多等待约 5 秒，仍拿不到就对该库退回旧做法，结果不变。
+- 缓存中的明文不另加密、遮盖或定期清理，按与导出文件同等的敏感本机资料对待，不要提交或分享。
 
 ## 命令
 

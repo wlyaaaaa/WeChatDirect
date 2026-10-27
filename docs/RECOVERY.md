@@ -68,8 +68,12 @@ wechat-direct temp-status --root "<task-temp-parent>" --session "<exact-session>
 
 `--environment-only` 不打开本地设置或账号配置；分别报告文本、普通图片、WXGF、语音 WAV、离线验证，以及 ffmpeg/ffprobe 和执行身份。`sourceAccess=not_tested` 不等于真实账号读取通过。SYSTEM 与登录用户的 PATH/解释器配置必须分别判断；不通过更换账号绕过来源权限。
 
-临时目录来自 `WECHAT_DIRECT_TEMP_ROOT`，否则使用调用方的 TEMP/TMP 设置。解密快照和音频中间文件只进入其下的 `wechat-direct-scratch`，带无正文的可重建标记与操作系统占用锁；正常退出删除。硬中断残留由精确 session 检查和显式清理，不能批量清理其他任务或未识别原件。它是临时明文生命周期管理，不承诺安全擦除或替代磁盘加密。
+临时目录来自 `WECHAT_DIRECT_TEMP_ROOT`，否则使用调用方的 TEMP/TMP 设置。音频中间文件，以及缓存关闭、缓存条目被占用或刷新失败时的解密快照，进入其下的 `wechat-direct-scratch`，带无正文的可重建标记与操作系统占用锁；正常退出删除。硬中断残留由精确 session 检查和显式清理，不能批量清理其他任务或未识别原件。它是临时明文生命周期管理，不承诺安全擦除或替代磁盘加密。
+
+加密数据库的解密快照默认长期保存在独立的明文快照缓存中（位置与开关见 [使用说明](USAGE.md)），不在上述临时目录里，`temp-status` 不检查也不清理它。每个条目由操作系统锁保护，锁一直持有到该次读取结束，进程退出或崩溃时由系统释放。刷新前先把条目标记为未完成（原地写入并落盘），全部写入并落盘、通过检查后才标记完成；硬中断、断电、校验失败或 `PRAGMA quick_check` 失败都会留下未完成标记或无法解析的元数据，下次读取整库重建，本次读取改走临时目录。源库在三轮有界重试内仍在变化时，照旧报出原有错误。主库未变时的增量刷新只恢复上次 WAL 覆盖过的页并重新叠加当前 WAL；主库签名变化或 WAL 换了一代（说明发生过 checkpoint）时，按每页随加密写入更新的 IV 与认证标签找出改动页。
+
+与每次整库解密相比有两处差别：未改动的主库页不再逐次重做认证校验，磁盘上未动认证区的位损坏不会被增量刷新发现；只有 WAL 变化时不跑 `PRAGMA quick_check`，若叠加结果有结构损坏，会在查询时而不是准备阶段报错。怀疑缓存有问题时直接删除整个缓存目录，下次自动重建。
 
 ### 安装与验证
 
-`constraints-verified.txt` 记录已验证的主要依赖组合，便于复现，不禁止未来兼容版本。静态检查规则由 `pyproject.toml` 显式固定为项目既有的 E4/E7/E9/F 正确性检查，不依赖 Ruff 版本的默认规则集合；新工具默认风格要求不自动变成业务验收要求。Windows CI 同时验证该组合和当前依赖，使用合成消息、完整加密 SQLite 数据库及加密 WAL、真实 SQLite WAL、人工加密页和故障注入，不携带真实账号、聊天、密钥或导出。每个测试模块先导入 `tests/isolation.py`，统一屏蔽本机 `.wechatdirect.local.json`、真实 `%LOCALAPPDATA%` 和全部 `WECHAT_DIRECT_*` 环境变量，测试结果不随开发机设置变化。CI 现在安装 ffmpeg，并同时要求合成语音与 WXGF 转码 smoke 通过。主程序环境中的 `tools/smoke_runtime.py --require-voice --require-wxgf` 可用合成音频与图像验证真实解码链。本机运行环境采用 venv 可编辑安装；源码目录外的 smoke 用于验证入口与编解码依赖，非可编辑安装的打包正确性由 CI 验证。
+`constraints-verified.txt` 记录已验证的主要依赖组合，便于复现，不禁止未来兼容版本。静态检查规则由 `pyproject.toml` 显式固定为项目既有的 E4/E7/E9/F 正确性检查，不依赖 Ruff 版本的默认规则集合；新工具默认风格要求不自动变成业务验收要求。Windows CI 同时验证该组合和当前依赖，使用合成消息、完整加密 SQLite 数据库及加密 WAL、真实 SQLite WAL、人工加密页和故障注入，不携带真实账号、聊天、密钥或导出。每个测试模块先导入 `tests/isolation.py`，统一屏蔽本机 `.wechatdirect.local.json`、真实 `%LOCALAPPDATA%`、TEMP 下的真实明文快照缓存和全部 `WECHAT_DIRECT_*` 环境变量，测试结果不随开发机设置变化。CI 现在安装 ffmpeg，并同时要求合成语音与 WXGF 转码 smoke 通过。主程序环境中的 `tools/smoke_runtime.py --require-voice --require-wxgf` 可用合成音频与图像验证真实解码链。本机运行环境采用 venv 可编辑安装；源码目录外的 smoke 用于验证入口与编解码依赖，非可编辑安装的打包正确性由 CI 验证。

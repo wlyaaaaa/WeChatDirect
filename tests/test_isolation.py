@@ -8,6 +8,7 @@ from pathlib import Path
 import unittest
 
 import wechat_cli
+import wechat_plaincache
 
 
 class TestEnvironmentIsolationTests(unittest.TestCase):
@@ -22,6 +23,9 @@ class TestEnvironmentIsolationTests(unittest.TestCase):
             wechat_cli.LOCAL_SETTINGS_PATH.parent, Path(wechat_cli.__file__).parent
         )
         self.assertEqual({}, wechat_cli._local_settings())
+        self.assertEqual(
+            isolation.ROOT / "plain-cache", wechat_plaincache.resolve_cache_root()
+        )
         self.assertEqual(
             isolation.LOCAL_APPDATA / "WeChatDirect" / "accounts.json",
             wechat_cli._resolve_config_path(None),

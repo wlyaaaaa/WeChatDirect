@@ -50,7 +50,7 @@ from wechat_storage import (
 LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 ACCOUNT_LABELS = ("primary", "secondary")
 LOCAL_SETTINGS_PATH = Path(__file__).with_name(".wechatdirect.local.json")
-LOCAL_SETTINGS_KEYS = frozenset({"config", "export_root", "aliases"})
+LOCAL_SETTINGS_KEYS = frozenset({"config", "export_root", "aliases", "plaintextCacheRoot"})
 DEFAULT_APP_DIRECTORY = "WeChatDirect"
 MAX_SCAN_MESSAGES = 500
 MAX_RETURN_MESSAGES = 80
@@ -130,6 +130,16 @@ def _default_export_root() -> Path:
     if configured:
         return Path(configured)
     return _local_appdata_directory() / "exports"
+
+
+def _plaintext_cache_setting() -> str | None:
+    """Local cache-root setting, read only when the environment leaves it open."""
+
+    if os.environ.get("WECHAT_DIRECT_CACHE", "").strip() == "0" or os.environ.get(
+        "WECHAT_DIRECT_CACHE_ROOT", ""
+    ).strip():
+        return None
+    return _local_settings().get("plaintextCacheRoot")
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -227,6 +237,7 @@ def _reader(account: Mapping[str, str], cutoff_s: int) -> DirectWeChatReader:
         local_state_path=account["local_state_path"],
         snapshot_cutoff_s=cutoff_s,
         expected_self_username_sha256=account["expected_moments_author_sha256"],
+        plaintext_cache_root=_plaintext_cache_setting(),
     )
     actual = "sha256:" + reader.account_identity_commitment
     expected = str(account["expected_source_identity_sha256"])

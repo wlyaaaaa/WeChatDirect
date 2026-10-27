@@ -64,7 +64,7 @@ py -3.11 -m pip install pilk
 
 导出根的优先级从高到低为：命令的显式 `--output`（该命令支持时） > `WECHAT_DIRECT_EXPORT_ROOT` > `.wechatdirect.local.json` 中的 `export_root` > `%LOCALAPPDATA%\WeChatDirect\exports`。
 
-`.wechatdirect.local.json` 只允许两个键：`config` 和 `export_root`。可复制 `local-settings.example.json` 后填入本机值；该文件只应留在本机，不要提交或分享。
+`.wechatdirect.local.json` 允许 `config`、`export_root` 和可选的 `aliases` 三个路径键。可复制 `local-settings.example.json` 后填入本机值；该文件只应留在本机，不要提交或分享。
 
 `accounts.example.json` 只展示结构和占位符。真实配置至少填写一个槽位；键名只允许 `primary`、`secondary`，两者均可配置。`auto` 和 `changes --account both` 只检查已配置槽位，显式点名缺失槽位返回 `wechat_account_not_configured`，不会转到另一账号。每个已配置槽位须填写：
 
@@ -98,9 +98,9 @@ wechat-direct context --account primary --contact "<contact-or-group>" --lookbac
 wechat-direct context --account auto --contact "<contact-or-group>" --contains "<keyword>"
 ```
 
-这是有界读取，不会先做全账号同步。`auto` 在多个账号都匹配或无法唯一定位时会停止并返回候选，不会猜测。结果包含消息、发送者方向、可影响含义的媒体关系和缺口。
+这是有界读取，不会先做全账号同步。`auto` 合并已配置账号的匹配，无法唯一定位时会停止并返回候选；称呼表有下节所述的默认私聊规则。结果包含消息、发送者方向、可影响含义的媒体关系和缺口。
 
-已知要找群时加 `--chat-type group`，只找私聊则加 `--chat-type private`（包含文件传输助手，不含公众号）。`context`、`export-context` 和 `preserve` 依次尝试完整名称或原生 ID、忽略空白和标点符号后的相等名称、不少于两字的部分名称、群成员称呼；每一层会合并所选账号的命中，有命中便停止。`sync-contact` 也接受 `--chat-type`，只用前两层，已有档案仍核对原绑定。
+已知要找群时加 `--chat-type group`，只找私聊则加 `--chat-type private`（包含文件传输助手，不含公众号）。`context`、`export-context` 和 `preserve` 先查称呼表，再依次尝试完整名称或原生 ID、忽略空白和标点符号后的相等名称、不少于两字的部分名称、群成员称呼；每一层会合并所选账号的命中，有有效命中便停止。`sync-contact` 也接受称呼表和 `--chat-type`，之后只用完整名称或原生 ID、宽松相等名称两层，已有档案仍核对原绑定。
 
 非精确选中的 `contact.resolution` 会说明 `matchKind` 和原查询，按成员选群时还有 `matchedMembers`。重名会返回 `status=needs_choice` 和按最近时间排序的 `candidates`，最多列 20 个，更多时看 `candidateTotal`；群成员候选的 `memberCount` 是该群当前可见成员数。没找到时，`suggestions` 最多提供 5 个相似名称供重新选择，`similarity` 越接近 1 越相似，工具不会自动替你选。
 
@@ -117,6 +117,30 @@ wechat-direct context --account primary --contact "<contact-or-group>" --around 
 ```
 
 `--around` 在允许的时间窗中优先读取离目标时间最近的消息，再按时间顺序返回。未指定起止时间时，窗口默认围绕目标时间前后各 `--lookback-days` 天，截止时间不晚于本次读取时间。显式时间窗不包含目标时间时返回参数错误。`--since`、`--until` 和 `--around` 接受 ISO 日期/时间；未写时区时按 `Asia/Shanghai` 解释。
+
+### 称呼表
+
+微信备注、昵称或群名里找不到本人常用的称呼时，AI 先跟本人确认对应的私聊或群，再用 `alias add` 记下来；以后直接用这个称呼。登记时的 `--contact` 可以填完整名称或原生 ID，仍有歧义时会返回 `needs_choice`，找不到时返回 `contact_not_found`，由 AI 用确认后的原生 ID 重试。登记目标时不会用旧称呼去解析新称呼。
+
+```powershell
+wechat-direct alias add --name "<称呼>" --contact "<private-native-id>" --account primary --chat-type private
+wechat-direct alias add --name "<称呼>" --contact "<group-native-id>" --account primary --chat-type group
+wechat-direct context --contact "<称呼>"
+wechat-direct context --contact "<称呼>" --chat-type group
+```
+
+同一个称呼可以对应一个人的私聊和多个群。没加 `--chat-type` 时，若有效命中中恰好有一个私聊，就默认选私聊；要找群时加 `--chat-type group`，多个群仍会返回候选。可用 `--account auto|primary|secondary` 限定账号，`auto` 只查已配置账号；称呼比较会忽略空白和标点符号。称呼表是匹配的第一层，优先于微信里的同名标签；`context`、`export-context`、`preserve`、`sync-contact` 都支持，朋友圈作者也可用该账号登记的私聊称呼。
+
+称呼表保存在 `.wechatdirect.local.json` 的可选 `aliases` 路径指定的 UTF-8 JSON 文件中；没有这个键时，使用当前生效的 `accounts.json` 所在目录下的 `aliases.json`。表内的称呼、账号和原生 ID 都是私人资料，文件只留在本机，不要提交到公开仓库。重复登记同一宽松称呼、账号和原生 ID 会更新显示名与登记时间，不会新增重复条目。
+
+`alias list` 会为每条登记附上当前显示名 `current` 和是否失效的 `stale`。已登记的原生 ID 不在该账号当前会话列表里时，该条称呼失效，不会被选中；解析结果的 `staleAliases` 会列出称呼、账号和登记时显示名，并继续尝试后面的匹配层。失效登记仍保留，确认不用后可以删除：
+
+```powershell
+wechat-direct alias list --name "<称呼>" --account auto
+wechat-direct alias remove --name "<称呼>" --account primary --native-id "<native-id>"
+```
+
+`list` 可省略 `--name` 以列出所选账号的全部登记；`remove` 必须给 `--name`，省略 `--native-id` 会删除该称呼在所选账号中的全部登记，一条都没匹配到会明确报错。这几个命令只读联系人和会话库，不读取消息分库。文件损坏时会报错并保留原文件。
 
 ### `changes`：发现本机当前会话的增量候选
 

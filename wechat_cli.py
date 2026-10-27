@@ -50,7 +50,7 @@ from wechat_storage import (
 LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 ACCOUNT_LABELS = ("primary", "secondary")
 LOCAL_SETTINGS_PATH = Path(__file__).with_name(".wechatdirect.local.json")
-LOCAL_SETTINGS_KEYS = frozenset({"config", "export_root"})
+LOCAL_SETTINGS_KEYS = frozenset({"config", "export_root", "aliases"})
 DEFAULT_APP_DIRECTORY = "WeChatDirect"
 MAX_SCAN_MESSAGES = 500
 MAX_RETURN_MESSAGES = 80
@@ -257,6 +257,152 @@ def _loose_name(value: object) -> str:
     )
 
 
+def _aliases_path(config_path: Path | None = None) -> Path:
+    configured = _local_settings().get("aliases")
+    if configured:
+        return Path(configured)
+    if config_path is None:
+        config_path = _resolve_config_path(None)
+    return config_path.with_name("aliases.json")
+
+
+def _read_aliases(path: Path) -> list[dict[str, str]]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as exc:
+        raise ProductError("aliases_file_invalid") from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != "wechat-direct.aliases.v1"
+        or not isinstance(value.get("aliases"), list)
+    ):
+        raise ProductError("aliases_file_invalid")
+    entries = value["aliases"]
+    for entry in entries:
+        if (
+            not isinstance(entry, dict)
+            or any(
+                not isinstance(entry.get(key), str) or not entry[key].strip()
+                for key in ("name", "account", "nativeId", "chatType", "label", "addedAt")
+            )
+            or entry["account"] not in ACCOUNT_LABELS
+            or entry["chatType"] not in ("private", "group")
+            or not _loose_name(entry["name"])
+        ):
+            raise ProductError("aliases_file_invalid")
+    return entries
+
+
+def _alias_matches(
+    entries: list[dict[str, str]],
+    contacts: list[tuple[str, dict[str, Any]]],
+    labels: tuple[str, ...],
+    query: str,
+    chat_type: str | None = None,
+) -> tuple[list[tuple[str, dict[str, Any]]], list[dict[str, str]]]:
+    directory = {(label, str(item.get("nativeId"))): item for label, item in contacts}
+    matches: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
+    stale = []
+    loose_query = _loose_name(query)
+    for entry in entries:
+        if (
+            entry["account"] not in labels
+            or _loose_name(entry["name"]) != loose_query
+            or (chat_type and entry["chatType"] != chat_type)
+        ):
+            continue
+        key = (entry["account"], entry["nativeId"])
+        contact = directory.get(key)
+        if contact is None:
+            stale.append({key: entry[key] for key in ("name", "account", "label")})
+        else:
+            item = dict(contact)
+            item["resolution"] = {
+                "matchKind": "alias", "query": query, "aliasName": entry["name"],
+            }
+            matches[key] = (entry["account"], item)
+    return list(matches.values()), stale
+
+
+def command_alias(args: argparse.Namespace) -> int:
+    config_path = _resolve_config_path(getattr(args, "config", None))
+    config = _read_config(config_path)
+    path = _aliases_path(config_path)
+    entries = _read_aliases(path)
+    labels = tuple(config) if args.account == "auto" else (args.account,)
+    for label in labels:
+        _account_config(config, label)
+    name = getattr(args, "name", None)
+    if name is not None and not _loose_name(name):
+        raise ProductError("alias_name_required")
+    selected = [
+        entry for entry in entries if entry["account"] in labels
+        and (name is None or _loose_name(entry["name"]) == _loose_name(name))
+    ]
+    result: dict[str, Any] = {"status": "success"}
+    if args.alias_action == "list":
+        directory = {}
+        for label in labels:
+            with _reader(_account_config(config, label), int(time.time())) as reader:
+                directory.update({
+                    (label, str(item["nativeId"])): item for item in reader.list_contacts()
+                })
+        result["aliases"] = [
+            {
+                **entry,
+                "current": directory.get((entry["account"], entry["nativeId"]), {}).get("displayName"),
+                "stale": (entry["account"], entry["nativeId"]) not in directory,
+            }
+            for entry in selected
+        ]
+    else:
+        if args.alias_action == "remove":
+            removed = [
+                entry for entry in selected
+                if not args.native_id or entry["nativeId"] == args.native_id
+            ]
+            if not removed:
+                raise ProductError("alias_not_found")
+            entries = [entry for entry in entries if entry not in removed]
+            result["removed"] = len(removed)
+        else:
+            label, reader, contact = _resolve_contact(
+                config, account=args.account, query=args.contact,
+                cutoff_s=int(time.time()), chat_type=args.chat_type,
+                allow_partial=True, use_aliases=False, prefer_native_id=True,
+            )
+            reader.close()
+            previous = next((
+                entry for entry in selected
+                if entry["account"] == label and entry["nativeId"] == contact["nativeId"]
+            ), None)
+            native_id = str(contact["nativeId"])
+            record = {
+                "name": previous["name"] if previous else name,
+                "account": label,
+                "nativeId": native_id,
+                "chatType": "group" if native_id.casefold().endswith("@chatroom") else "private",
+                "label": str(contact.get("displayName") or contact["nativeId"]),
+                "addedAt": datetime.now(LOCAL_TIMEZONE).isoformat(),
+            }
+            entries = [
+                entry for entry in entries if not (
+                    _loose_name(entry["name"]) == _loose_name(name)
+                    and entry["account"] == label and entry["nativeId"] == native_id
+                )
+            ]
+            entries.append(record)
+            result["alias"] = record
+        entries.sort(key=lambda entry: (entry["name"], entry["account"], entry["nativeId"]))
+        payload = {"schema": "wechat-direct.aliases.v1", "aliases": entries}
+        encoded = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        _write_bytes_atomic(path, encoded)
+    sys.stdout.buffer.write(_canonical_bytes(result))
+    return 0
+
+
 def _contact_match_fields(contact: Mapping[str, Any]) -> tuple[str, ...]:
     builtin_names = (
         ("文件传输助手", "file transfer assistant", "file_transfer_assistant")
@@ -297,7 +443,7 @@ def _safe_contact(contact: Mapping[str, Any], account: str) -> dict[str, Any]:
     if str(contact.get("nativeId") or "").casefold() == "filehelper":
         result["conversationKind"] = "file_transfer_assistant"
     resolution = contact.get("resolution")
-    if resolution and resolution.get("matchKind") != "exact":
+    if resolution and (resolution.get("matchKind") != "exact" or resolution.get("staleAliases")):
         result["resolution"] = resolution
     return result
 
@@ -497,6 +643,9 @@ def _resolve_contact(
     cutoff_s: int,
     chat_type: str | None = None,
     allow_partial: bool = False,
+    aliases_path: Path | None = None,
+    use_aliases: bool = True,
+    prefer_native_id: bool = False,
 ) -> tuple[str, DirectWeChatReader, dict[str, Any]]:
     normalized = _normalize_name(query)
     if not normalized:
@@ -504,6 +653,8 @@ def _resolve_contact(
     labels = tuple(config) if account == "auto" else (account,)
     readers: dict[str, DirectWeChatReader] = {}
     contacts: list[tuple[str, dict[str, Any]]] = []
+    all_contacts: list[tuple[str, dict[str, Any]]] = []
+    entries = _read_aliases(aliases_path or _aliases_path()) if use_aliases else []
     loose_query = _loose_name(query)
 
     def names(contact: Mapping[str, Any]) -> tuple[str, ...]:
@@ -526,6 +677,7 @@ def _resolve_contact(
             reader = _reader(_account_config(config, label), cutoff_s)
             readers[label] = reader
             for contact in reader.list_contacts():
+                all_contacts.append((label, dict(contact)))
                 native_id = str(contact.get("nativeId") or "").casefold()
                 group = native_id.endswith("@chatroom")
                 if chat_type == "group" and not group:
@@ -533,8 +685,13 @@ def _resolve_contact(
                 if chat_type == "private" and (group or native_id.startswith("gh_")):
                     continue
                 contacts.append((label, dict(contact)))
-        matches: list[tuple[str, dict[str, Any]]] = []
-        for kind in ("exact", "loose", "partial_name", "group_member"):
+        matches, stale = _alias_matches(entries, all_contacts, labels, query, chat_type)
+        if len(matches) > 1 and chat_type is None:
+            private = [match for match in matches if not str(match[1]["nativeId"]).casefold().endswith("@chatroom")]
+            if len(private) == 1:
+                matches = private
+        details = {"staleAliases": stale} if stale else {}
+        for kind in (() if matches else ("exact", "loose", "partial_name", "group_member")):
             if kind in ("partial_name", "group_member") and (
                 not allow_partial or len(loose_query) < 2
             ):
@@ -549,7 +706,11 @@ def _resolve_contact(
                 label: readers[label].list_group_member_contact_labels()
                 for label in labels if label in group_accounts
             }
-            for label, contact in contacts:
+            layer_contacts = contacts
+            if kind == "exact" and prefer_native_id:
+                layer_contacts = [(label, item) for label, item in contacts
+                                  if normalized == _normalize_name(item.get("nativeId"))] or contacts
+            for label, contact in layer_contacts:
                 matched_members: list[str] = []
                 if kind == "exact":
                     matched = normalized in _contact_match_fields(contact)
@@ -590,14 +751,16 @@ def _resolve_contact(
                     if similarity >= 0.5:
                         suggestions.append({**_safe_contact(item, label), "similarity": round(similarity, 4)})
                 suggestions.sort(key=lambda item: (item["similarity"], _known_session_timestamp(item.get("lastTimestamp")) or 0), reverse=True)
-                raise ProductError("contact_not_found", suggestions=suggestions[:5])
+                raise ProductError("contact_not_found", suggestions=suggestions[:5], **details)
             matches.sort(key=lambda match: _known_session_timestamp(match[1].get("lastTimestamp")) or 0, reverse=True)
             candidates = [candidate(label, item) for label, item in matches[:20]]
             raise ProductError(
                 "contact_ambiguous:" + json.dumps(candidates, ensure_ascii=False, separators=(",", ":")),
                 **({"candidateTotal": len(matches)} if len(matches) > 20 else {}),
+                **details,
             )
         selected_label, selected_contact = matches[0]
+        selected_contact["resolution"].update(details)
         selected_reader = readers.pop(selected_label)
         return selected_label, selected_reader, selected_contact
     finally:
@@ -612,6 +775,7 @@ def _resolve_moments_subject(
     query: str | None,
     self_requested: bool,
     cutoff_s: int,
+    aliases_path: Path | None = None,
 ) -> tuple[str, DirectWeChatReader, dict[str, Any] | None]:
     """Resolve one exact Moments author inside one explicit account.
 
@@ -649,6 +813,20 @@ def _resolve_moments_subject(
         normalized = _normalize_name(query)
         if not normalized:
             return account, reader, None
+
+        aliases, stale = _alias_matches(
+            _read_aliases(aliases_path or _aliases_path()),
+            [(account, dict(item)) for item in reader.list_contacts()],
+            (account,), str(query), "private",
+        )
+        details = {"staleAliases": stale} if stale else {}
+        if len(aliases) == 1:
+            aliases[0][1]["resolution"].update(details)
+            return account, reader, aliases[0][1]
+        if aliases:
+            raise ProductError("contact_ambiguous:" + json.dumps([
+                {**_safe_contact(item, account), "matchKind": "alias"} for _, item in aliases
+            ], ensure_ascii=False, separators=(",", ":")), **details)
 
         candidates: dict[str, dict[str, Any]] = {}
         match_fields: dict[str, set[str]] = {}
@@ -712,8 +890,11 @@ def _resolve_moments_subject(
                     [_safe_contact(item, account) for item in matches],
                     ensure_ascii=False,
                     separators=(",", ":"),
-                )
+                ),
+                **details,
             )
+        if stale:
+            matches[0]["resolution"] = {"matchKind": "exact", "query": query, **details}
         return account, reader, matches[0]
     except Exception:
         reader.close()
@@ -1033,6 +1214,7 @@ def _context_result_raw(args: argparse.Namespace) -> dict[str, Any]:
         cutoff_s=cutoff_s,
         chat_type=getattr(args, "chat_type", None),
         allow_partial=True,
+        aliases_path=_aliases_path(_resolve_config_path(getattr(args, "config", None))),
     )
     try:
         identity = "sha256:" + reader.account_identity_commitment
@@ -1673,6 +1855,7 @@ def command_moments(args: argparse.Namespace) -> int:
         query=getattr(args, "contact", None),
         self_requested=bool(getattr(args, "self", False)),
         cutoff_s=cutoff_s,
+        aliases_path=_aliases_path(_resolve_config_path(getattr(args, "config", None))),
     )
     try:
         end_s = _parse_time(args.until, default=cutoff_s)
@@ -3287,6 +3470,8 @@ def command_sync_contact(args: argparse.Namespace) -> int:
     if not 0 <= int(args.overlap_seconds) <= 31 * 86_400:
         raise ProductError("sync_overlap_seconds_invalid")
     config = _read_config(_resolve_config_path(getattr(args, "config", None)))
+    aliases_path = _aliases_path(_resolve_config_path(getattr(args, "config", None)))
+    aliases = _read_aliases(aliases_path)
     output = (
         Path(args.output)
         if args.output
@@ -3308,6 +3493,7 @@ def command_sync_contact(args: argparse.Namespace) -> int:
             query=args.contact,
             cutoff_s=cutoff_s,
             chat_type=getattr(args, "chat_type", None),
+            aliases_path=aliases_path,
         )
     else:
         label = str(existing_state.get("account") or "")
@@ -3319,7 +3505,21 @@ def command_sync_contact(args: argparse.Namespace) -> int:
             reader.close()
             raise ProductError("sync_state_invalid")
         contact = dict(stored_contact)
-        if _normalize_name(args.contact) not in _contact_match_fields(contact):
+        if any(
+            entry["account"] == label
+            and _loose_name(entry["name"]) == _loose_name(args.contact)
+            and (not getattr(args, "chat_type", None) or entry["chatType"] == args.chat_type)
+            for entry in aliases
+        ):
+            reader.close()
+            label, reader, contact = _resolve_contact(
+                config, account=label, query=args.contact, cutoff_s=cutoff_s,
+                chat_type=getattr(args, "chat_type", None), aliases_path=aliases_path,
+            )
+            if str(contact.get("nativeId")) != str(existing_state.get("contactNativeId")):
+                reader.close()
+                raise ProductError("sync_identity_mismatch")
+        elif _normalize_name(args.contact) not in _contact_match_fields(contact):
             reader.close()
             raise ProductError("sync_identity_mismatch")
     lock: Path | None = None
@@ -3472,7 +3672,10 @@ def command_sync_contact(args: argparse.Namespace) -> int:
             None,
         )
         if refreshed is not None:
-            contact = refreshed
+            resolution = contact.get("resolution")
+            contact = dict(refreshed)
+            if resolution:
+                contact["resolution"] = resolution
         fetched = reader.fetch_messages(
             contact_native_id,
             since_s=since_s,
@@ -3947,6 +4150,7 @@ def command_sync_moments(args: argparse.Namespace) -> int:
             query=args.contact,
             self_requested=self_requested,
             cutoff_s=cutoff_s,
+            aliases_path=_aliases_path(_resolve_config_path(getattr(args, "config", None))),
         )
     else:
         label = str(args.account)
@@ -4040,7 +4244,10 @@ def command_sync_moments(args: argparse.Namespace) -> int:
                 None,
             )
             if refreshed is not None:
-                contact = refreshed
+                resolution = contact.get("resolution")
+                contact = dict(refreshed)
+                if resolution:
+                    contact["resolution"] = resolution
         source = reader.list_moments(
             since_s=0,
             end_s=cutoff_s,
@@ -4628,6 +4835,20 @@ def parser() -> argparse.ArgumentParser:
     commitments.add_argument("--config-path", required=True)
     commitments.add_argument("--local-state-path", required=True)
     commitments.set_defaults(handler=command_identity_commitments)
+
+    alias = commands.add_parser("alias", help="manage local personal names bound to native chats")
+    actions = alias.add_subparsers(dest="alias_action", required=True, parser_class=ReceiptArgumentParser)
+    for action in ("add", "list", "remove"):
+        command = actions.add_parser(action)
+        _add_config_argument(command)
+        command.add_argument("--account", choices=("auto", *ACCOUNT_LABELS), default="auto")
+        command.add_argument("--name", required=action != "list")
+        if action == "add":
+            command.add_argument("--contact", required=True)
+            command.add_argument("--chat-type", choices=("group", "private"))
+        if action == "remove":
+            command.add_argument("--native-id")
+        command.set_defaults(handler=command_alias)
 
     context = commands.add_parser("context", help="read one bounded chat context")
     _add_context_arguments(context)

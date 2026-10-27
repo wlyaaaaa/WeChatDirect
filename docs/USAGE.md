@@ -94,7 +94,7 @@ wechat-direct identity-commitments --config-path "<source-config.json>" --local-
 - 位置优先级：环境变量 `WECHAT_DIRECT_CACHE_ROOT` > `.wechatdirect.local.json` 中的 `plaintextCacheRoot` > `%TEMP%\WeChatDirect\plain-cache`。其下按账号身份承诺和数据库相对路径分条目存放。
 - 关闭：设置环境变量 `WECHAT_DIRECT_CACHE=0`，即回到每次在任务临时目录整库解密的旧做法。
 - 删除：没有读取在进行时，可随时整个删除缓存目录，下次读取自动重建（首次重建耗时与旧做法相当）。缓存不归 `temp-status` 管理，`--clean` 不会碰它。
-- 同一数据库的缓存正被另一个读取进程使用时，本次最多等待约 5 秒，仍拿不到就对该库退回旧做法，结果不变。
+- 同一数据库的缓存正被另一个读取进程使用时，本次读取对所有被占用的库合计最多等待约 2 秒，仍拿不到就对这些库退回旧做法，结果不变。
 - 缓存中的明文不另加密、遮盖或定期清理，按与导出文件同等的敏感本机资料对待，不要提交或分享。
 
 ## 命令

@@ -39,7 +39,9 @@ from wechat_storage import open_source_read
 CACHE_FORMAT = "wechat-direct-plaintext-cache.v1"
 # None means ``<TEMP>/WeChatDirect/plain-cache``; tests point this elsewhere.
 DEFAULT_ROOT: Path | None = None
-LOCK_TIMEOUT_S = 5.0
+# Total time one reader may wait on busy cache locks, shared across all of
+# its databases; waiting longer costs more than the scratch fallback.
+LOCK_TIMEOUT_S = 2.0
 LOCK_POLL_S = 0.05
 COMPARE_CHUNK_PAGES = 2048
 RESTORE_RUN_PAGES = 256

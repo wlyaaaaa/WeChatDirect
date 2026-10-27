@@ -30,6 +30,7 @@ from urllib.parse import quote
 import xml.etree.ElementTree as ET
 
 from wechat_wal import WalError, scan_wal, copy_plain_snapshot
+import wechat_plaincache
 from wechat_plaincache import (
     PlaintextCacheEntry,
     PlaintextCacheError,
@@ -1501,6 +1502,7 @@ class DirectWeChatReader:
         # environment can override it or disable the cache entirely.
         self._plaintext_cache_root = resolve_cache_root(plaintext_cache_root)
         self._cache_entries: list[PlaintextCacheEntry] = []
+        self._cache_lock_wait_s = wechat_plaincache.LOCK_TIMEOUT_S
         self._connections: dict[Path, sqlite3.Connection] = {}
         self._message_connections_cache: (
             list[tuple[Path, sqlite3.Connection]] | None
@@ -1610,10 +1612,15 @@ class DirectWeChatReader:
             self.account_identity_commitment,
             source.relative_to(self._storage).as_posix(),
         )
+        budget = getattr(self, "_cache_lock_wait_s", wechat_plaincache.LOCK_TIMEOUT_S)
+        started = time.monotonic()
         try:
-            if not entry.acquire():
-                return None
+            acquired = entry.acquire(timeout=budget)
         except OSError:
+            return None
+        finally:
+            self._cache_lock_wait_s = max(0.0, budget - (time.monotonic() - started))
+        if not acquired:
             return None
         try:
             prepared = self._refresh_cache_entry(entry, source)

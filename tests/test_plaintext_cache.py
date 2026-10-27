@@ -675,6 +675,28 @@ class ReaderCacheTests(unittest.TestCase):
         holder.wait(10)
         self.read_cached()
 
+    def test_busy_locks_share_one_wait_budget_per_reader(self):
+        self.read_cached()
+        offered: list[float] = []
+
+        def busy(entry, timeout=None):
+            offered.append(timeout)
+            time.sleep(min(timeout, 0.2))
+            return False
+
+        with (
+            mock.patch.object(wechat_plaincache, "LOCK_TIMEOUT_S", 0.3),
+            mock.patch.object(wechat_plaincache.PlaintextCacheEntry, "acquire", busy),
+        ):
+            reader = self.reader()
+            self.assertIsNone(reader._prepare_cached(self.source.path))
+            self.assertIsNone(reader._prepare_cached(self.source.path))
+            self.assertIsNone(reader._prepare_cached(self.source.path))
+        reader.close()
+        self.assertAlmostEqual(offered[0], 0.3, places=6)
+        self.assertLess(offered[1], 0.15)
+        self.assertEqual(offered[2], 0.0)
+
     def test_reader_holds_lock_until_close_and_keeps_snapshot(self):
         first = self.reader()
         cached = first._prepare(self.source.path)

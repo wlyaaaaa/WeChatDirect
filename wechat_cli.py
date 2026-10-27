@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import base64
 import binascii
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 import hashlib
 import hmac
 import importlib.util
@@ -65,6 +66,10 @@ SENDER_IDENTITY_VERSION = "message-shard-name2id-v1"
 
 class ProductError(RuntimeError):
     """A bounded, user-actionable product failure."""
+
+    def __init__(self, message: str, **details: Any):
+        super().__init__(message)
+        self.details = details
 
 
 class _ArchiveNeedsTransaction(Exception):
@@ -244,6 +249,14 @@ def _normalize_name(value: object) -> str:
     return " ".join(unicodedata.normalize("NFKC", str(value or "")).casefold().split())
 
 
+def _loose_name(value: object) -> str:
+    return "".join(
+        character
+        for character in _normalize_name(value)
+        if not character.isspace() and unicodedata.category(character)[0] not in "PSZ"
+    )
+
+
 def _contact_match_fields(contact: Mapping[str, Any]) -> tuple[str, ...]:
     builtin_names = (
         ("文件传输助手", "file transfer assistant", "file_transfer_assistant")
@@ -283,6 +296,9 @@ def _safe_contact(contact: Mapping[str, Any], account: str) -> dict[str, Any]:
             result[gap] = contact[gap]
     if str(contact.get("nativeId") or "").casefold() == "filehelper":
         result["conversationKind"] = "file_transfer_assistant"
+    resolution = contact.get("resolution")
+    if resolution and resolution.get("matchKind") != "exact":
+        result["resolution"] = resolution
     return result
 
 
@@ -479,27 +495,107 @@ def _resolve_contact(
     account: str,
     query: str,
     cutoff_s: int,
+    chat_type: str | None = None,
+    allow_partial: bool = False,
 ) -> tuple[str, DirectWeChatReader, dict[str, Any]]:
     normalized = _normalize_name(query)
     if not normalized:
         raise ProductError("contact_name_required")
     labels = tuple(config) if account == "auto" else (account,)
     readers: dict[str, DirectWeChatReader] = {}
-    matches: list[tuple[str, dict[str, Any]]] = []
+    contacts: list[tuple[str, dict[str, Any]]] = []
+    loose_query = _loose_name(query)
+
+    def names(contact: Mapping[str, Any]) -> tuple[str, ...]:
+        return tuple(
+            value for key in ("remark", "nickname", "alias")
+            if (value := _loose_name(contact.get(key)))
+        )
+
+    def candidate(label: str, item: Mapping[str, Any]) -> dict[str, Any]:
+        result = _safe_contact(item, label)
+        resolution = result.pop("resolution", None) or item["resolution"]
+        result["matchKind"] = resolution["matchKind"]
+        if resolution["matchKind"] == "group_member":
+            result["matchedMembers"] = resolution["matchedMembers"]
+            result["memberCount"] = item["_memberCount"]
+        return result
+
     try:
         for label in labels:
             reader = _reader(_account_config(config, label), cutoff_s)
             readers[label] = reader
             for contact in reader.list_contacts():
-                if normalized in _contact_match_fields(contact):
-                    matches.append((label, contact))
+                native_id = str(contact.get("nativeId") or "").casefold()
+                group = native_id.endswith("@chatroom")
+                if chat_type == "group" and not group:
+                    continue
+                if chat_type == "private" and (group or native_id.startswith("gh_")):
+                    continue
+                contacts.append((label, dict(contact)))
+        matches: list[tuple[str, dict[str, Any]]] = []
+        for kind in ("exact", "loose", "partial_name", "group_member"):
+            if kind in ("partial_name", "group_member") and (
+                not allow_partial or len(loose_query) < 2
+            ):
+                continue
+            if kind == "group_member" and chat_type == "private":
+                continue
+            group_accounts = {
+                label for label, item in contacts
+                if str(item.get("nativeId") or "").casefold().endswith("@chatroom")
+            } if kind == "group_member" else set()
+            members_by_account = {
+                label: readers[label].list_group_member_contact_labels()
+                for label in labels if label in group_accounts
+            }
+            for label, contact in contacts:
+                matched_members: list[str] = []
+                if kind == "exact":
+                    matched = normalized in _contact_match_fields(contact)
+                elif kind == "loose":
+                    matched = bool(loose_query) and loose_query in names(contact)
+                elif kind == "partial_name":
+                    matched = any(loose_query in name for name in names(contact))
+                else:
+                    if not str(contact.get("nativeId") or "").casefold().endswith("@chatroom"):
+                        continue
+                    members = members_by_account[label].get(str(contact["nativeId"]), [])
+                    for member in members:
+                        if any(loose_query in name for name in names(member)):
+                            display_name = next(
+                                (str(member[key]) for key in ("displayName", "remark", "nickname", "alias", "nativeId")
+                                 if member.get(key)), ""
+                            )
+                            if display_name not in matched_members:
+                                matched_members.append(display_name)
+                    matched = bool(matched_members)
+                if matched:
+                    item = dict(contact)
+                    item["resolution"] = {"matchKind": kind, "query": query}
+                    if kind == "group_member":
+                        item["resolution"]["matchedMembers"] = matched_members
+                        item["_memberCount"] = len(members)
+                    matches.append((label, item))
+            if matches:
+                break
         if len(matches) != 1:
-            candidates = [_safe_contact(item, label) for label, item in matches]
+            if not matches:
+                suggestions = []
+                for label, item in contacts:
+                    similarity = max(
+                        (SequenceMatcher(None, loose_query, name).ratio() for name in names(item)),
+                        default=0.0,
+                    ) if loose_query else 0.0
+                    if similarity >= 0.5:
+                        suggestions.append({**_safe_contact(item, label), "similarity": round(similarity, 4)})
+                suggestions.sort(key=lambda item: (item["similarity"], _known_session_timestamp(item.get("lastTimestamp")) or 0), reverse=True)
+                raise ProductError("contact_not_found", suggestions=suggestions[:5])
+            matches.sort(key=lambda match: _known_session_timestamp(match[1].get("lastTimestamp")) or 0, reverse=True)
+            candidates = [candidate(label, item) for label, item in matches[:20]]
             raise ProductError(
-                "contact_not_found"
-                if not candidates
-                else "contact_ambiguous:"
-                + json.dumps(candidates, ensure_ascii=False, separators=(",", ":"))
+                "contact_ambiguous:" + json.dumps(candidates, ensure_ascii=False, separators=(",", ":")),
+                **({"candidateTotal": len(matches)} if len(matches) > 20 else {}),
             )
         selected_label, selected_contact = matches[0]
         selected_reader = readers.pop(selected_label)
@@ -935,6 +1031,8 @@ def _context_result_raw(args: argparse.Namespace) -> dict[str, Any]:
         account=cursor["account"] if cursor is not None else args.account,
         query=args.contact,
         cutoff_s=cutoff_s,
+        chat_type=getattr(args, "chat_type", None),
+        allow_partial=True,
     )
     try:
         identity = "sha256:" + reader.account_identity_commitment
@@ -3209,6 +3307,7 @@ def command_sync_contact(args: argparse.Namespace) -> int:
             account=args.account,
             query=args.contact,
             cutoff_s=cutoff_s,
+            chat_type=getattr(args, "chat_type", None),
         )
     else:
         label = str(existing_state.get("account") or "")
@@ -4466,6 +4565,7 @@ def _add_context_arguments(command: argparse.ArgumentParser) -> None:
     _add_config_argument(command)
     command.add_argument("--account", choices=("auto", *ACCOUNT_LABELS), default="auto")
     command.add_argument("--contact", required=True)
+    command.add_argument("--chat-type", choices=("group", "private"))
     command.add_argument(
         "--since", help="inclusive ISO date/time; naive values use Asia/Shanghai"
     )
@@ -4613,6 +4713,7 @@ def parser() -> argparse.ArgumentParser:
         "--account", choices=("auto", *ACCOUNT_LABELS), default="auto"
     )
     sync_contact.add_argument("--contact", required=True)
+    sync_contact.add_argument("--chat-type", choices=("group", "private"))
     sync_contact.add_argument("--output")
     sync_contact.add_argument(
         "--overlap-seconds",
@@ -4862,6 +4963,7 @@ def main(argv: list[str] | None = None) -> int:
                 else type(exc).__name__,
             }
             payload.update(_failure_details(exc))
+        payload.update(getattr(exc, "details", {}))
         sys.stdout.buffer.write(_canonical_bytes(payload))
         return 2
 

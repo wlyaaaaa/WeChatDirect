@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import isolation  # noqa: F401
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 import io
 import os
 from pathlib import Path
@@ -55,15 +55,19 @@ class SourceSharingTests(unittest.TestCase):
         moved = self.root / "rotated.db"
         destination = self.root / "copy.db"
         source.write_bytes(b"A" * PAGE_SIZE)
-        codec = EncryptedPageCodec(b"K" * 32, b"S" * 16)
+        codec = EncryptedPageCodec(b"K" * 32, b"S" * 16, key_derivation="raw")
+        expected = codec.decrypt_page(1, source.read_bytes())
+        open_source = wechat_source.open_source_read
 
-        def decode(_number, _page):
-            source.rename(moved)
-            return b"B" * PAGE_SIZE
+        @contextmanager
+        def open_and_rotate(path):
+            with open_source(path) as stream:
+                source.rename(moved)
+                yield stream
 
-        with patch.object(EncryptedPageCodec, "decrypt_page", side_effect=decode):
+        with patch.object(wechat_source, "open_source_read", open_and_rotate):
             codec.decrypt_database(source, destination)
-        self.assertEqual(destination.read_bytes(), b"B" * PAGE_SIZE)
+        self.assertEqual(destination.read_bytes(), expected)
         self.assertEqual(moved.read_bytes(), b"A" * PAGE_SIZE)
 
     def test_snapshot_retries_replaced_file_with_same_size_and_mtime(self):

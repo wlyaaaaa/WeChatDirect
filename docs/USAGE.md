@@ -100,6 +100,10 @@ wechat-direct context --account auto --contact "<contact-or-group>" --contains "
 
 这是有界读取，不会先做全账号同步。`auto` 在多个账号都匹配或无法唯一定位时会停止并返回候选，不会猜测。结果包含消息、发送者方向、可影响含义的媒体关系和缺口。
 
+已知要找群时加 `--chat-type group`，只找私聊则加 `--chat-type private`（包含文件传输助手，不含公众号）。`context`、`export-context` 和 `preserve` 依次尝试完整名称或原生 ID、忽略空白和标点符号后的相等名称、不少于两字的部分名称、群成员称呼；每一层会合并所选账号的命中，有命中便停止。`sync-contact` 也接受 `--chat-type`，只用前两层，已有档案仍核对原绑定。
+
+非精确选中的 `contact.resolution` 会说明 `matchKind` 和原查询，按成员选群时还有 `matchedMembers`。重名会返回 `status=needs_choice` 和按最近时间排序的 `candidates`，最多列 20 个，更多时看 `candidateTotal`；群成员候选的 `memberCount` 是该群当前可见成员数。没找到时，`suggestions` 最多提供 5 个相似名称供重新选择，`similarity` 越接近 1 越相似，工具不会自动替你选。
+
 AI 读取结果时还应检查这些字段：
 
 - `coverage.hasMore` 和 `continuation`：有下一批可读内容时，把返回的 `account`、`contact` 和 `cursor` 用于下一次 `context` 调用。游标固定账号身份、联系人、时间窗和搜索条件；不要自行构造或修改游标。扫描上限和返回上限可以调整。

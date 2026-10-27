@@ -371,6 +371,17 @@ class EncryptedPageCodec:
         endian = "big" if self.hmac_mode == "page_be_ciphertext" else "little"
         return page_number.to_bytes(4, endian, signed=False) + ciphertext
 
+    @cached_property
+    def mac_key(self) -> bytes:
+        if len(self.key) == 48:
+            salt = self.key[32:48]
+        elif self.salt is not None:
+            salt = _as_bytes(self.salt)
+        else:
+            raise ValueError("SQLCipher HMAC requires the database salt")
+        mac_salt = bytes(value ^ 0x3A for value in salt)
+        return hashlib.pbkdf2_hmac("sha512", self.key[:32], mac_salt, 2, 32)
+
     def decrypt_page(self, page_number: int, page: bytes) -> bytes:
         """Return one normal SQLite page; reserve bytes are cleared."""
 
@@ -409,34 +420,25 @@ class EncryptedPageCodec:
         reserve = page[payload_size:]
         tag = reserve[self.tag_offset : self.tag_offset + HMAC_SIZE]
         if self.hmac_mode == "sqlcipher":
-            key = self.key[:32]
-            if len(self.key) == 48:
-                salt = self.key[32:48]
-            elif self.salt is not None:
-                salt = _as_bytes(self.salt)
-            else:
-                raise ValueError("SQLCipher HMAC requires the database salt")
-            mac_salt = bytes(value ^ 0x3A for value in salt)
-            mac_key = hashlib.pbkdf2_hmac("sha512", key, mac_salt, 2, 32)
             hmac_data = (
                 page[16 : payload_size + 16]
                 if page_number == 1
                 else page[: payload_size + 16]
             )
-            expected = hmac.new(
-                mac_key,
+            expected = hmac.digest(
+                self.mac_key,
                 hmac_data + struct.pack("<I", page_number),
-                hashlib.sha512,
-            ).digest()
+                "sha512",
+            )
             return hmac.compare_digest(expected, tag)
         if self.hmac_mode is None:
             return True
         ciphertext = page[16:payload_size] if page_number == 1 else page[:payload_size]
-        expected = hmac.new(
+        expected = hmac.digest(
             self.key[:32],
             self._authentication_input(page_number, ciphertext),
-            hashlib.sha512,
-        ).digest()
+            "sha512",
+        )
         return hmac.compare_digest(expected, tag)
 
     def decrypt_database(self, source: Path | str, destination: Path | str) -> Path:
@@ -466,12 +468,69 @@ class EncryptedPageCodec:
             with open_source_read(source_path) as source_file, temporary.open("xb") as output:
                 created = True
                 page_number = 1
+                payload_size = self.page_size - self.reserve_size
+                clear_reserve = b"\x00" * self.reserve_size
                 while True:
-                    page = source_file.read(self.page_size)
-                    if not page:
+                    # Small batches keep the ECB/XOR buffers in cache.
+                    block = source_file.read(self.page_size * 16)
+                    if not block:
                         break
-                    output.write(self.decrypt_page(page_number, page))
-                    page_number += 1
+                    if len(block) % self.page_size:
+                        raise EncryptedPageError("encrypted page has an unexpected size")
+                    pages = [
+                        block[i : i + self.page_size]
+                        for i in range(0, len(block), self.page_size)
+                    ]
+                    ciphertexts, previous_blocks = [], []
+                    for offset, page in enumerate(pages):
+                        number = page_number + offset
+                        if self.hmac_mode is not None and not self.verify_page_hmac(
+                            number, page
+                        ):
+                            raise EncryptedPageError("encrypted page authentication failed")
+                        start = AES_BLOCK_SIZE if number == 1 else 0
+                        ciphertext = page[start:payload_size]
+                        if len(ciphertext) % AES_BLOCK_SIZE:
+                            raise EncryptedPageError("encrypted page payload is not block aligned")
+                        ciphertexts.append(ciphertext)
+                        iv_start = payload_size + self.iv_offset
+                        if ciphertext:
+                            previous_blocks.append(
+                                page[iv_start : iv_start + AES_BLOCK_SIZE]
+                                + ciphertext[:-AES_BLOCK_SIZE]
+                            )
+                    try:
+                        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+                    except ImportError as exc:  # pragma: no cover - environment-dependent
+                        raise CryptoUnavailableError(
+                            "cryptography is required for the encrypted direct-read path"
+                        ) from exc
+                    decryptor = Cipher(algorithms.AES(self.key[:32]), modes.ECB()).decryptor()
+                    decrypted = decryptor.update(b"".join(ciphertexts)) + decryptor.finalize()
+                    # CBC is ECB decryption XOR the IV/previous ciphertext block.
+                    plaintext = (
+                        int.from_bytes(decrypted, "little")
+                        ^ int.from_bytes(b"".join(previous_blocks), "little")
+                    ).to_bytes(len(decrypted), "little")
+                    result, position = [], 0
+                    for offset, page in enumerate(pages):
+                        count = len(ciphertexts[offset])
+                        if page_number + offset == 1:
+                            preserve_header = (
+                                len(self.key) == 48
+                                if self.plaintext_header is None
+                                else self.plaintext_header
+                            )
+                            result.append(
+                                page[:AES_BLOCK_SIZE]
+                                if preserve_header
+                                else b"SQLite format 3\x00"
+                            )
+                        result.append(plaintext[position : position + count])
+                        result.append(clear_reserve)
+                        position += count
+                    output.write(b"".join(result))
+                    page_number += len(pages)
             temporary.replace(destination_path)
         except Exception:
             if created:
@@ -1897,6 +1956,35 @@ class DirectWeChatReader:
                 fallback["sessionGap"] = session_gap
             contacts.setdefault(native_id, fallback)
         return list(contacts.values())
+
+    def list_group_member_contact_labels(self) -> dict[str, list[dict[str, str]]]:
+        """Read current group/member contact labels in one query per contact DB."""
+
+        result: dict[str, list[dict[str, str]]] = {}
+        for source in self._named_databases("contact.db"):
+            connection = self._open(source)
+            try:
+                rows = connection.execute(
+                    "SELECT r.username AS room_username, c.username, c.alias, c.remark, c.nick_name "
+                    "FROM chat_room r "
+                    "JOIN chatroom_member m ON m.room_id=r.id "
+                    "JOIN contact c ON c.id=m.member_id"
+                )
+                for row in rows:
+                    room = str(row["room_username"] or "")
+                    if not room.endswith("@chatroom"):
+                        continue
+                    labels = {
+                        "nativeId": str(row["username"] or ""),
+                        "remark": str(row["remark"] or "").strip(),
+                        "nickname": str(row["nick_name"] or "").strip(),
+                        "alias": str(row["alias"] or "").strip(),
+                    }
+                    labels["displayName"] = labels["remark"] or labels["nickname"] or labels["alias"]
+                    result.setdefault(room, []).append(labels)
+            except sqlite3.DatabaseError:
+                continue
+        return result
 
     def list_group_member_labels(self, session_native_id: str) -> list[dict[str, Any]]:
         """Read current labels only for one selected local chatroom."""

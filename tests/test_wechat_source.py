@@ -3,14 +3,22 @@ from __future__ import annotations
 import isolation  # noqa: F401
 
 import hashlib
+import hmac
 from pathlib import Path
+import random
 import sqlite3
+import struct
 import tempfile
 import unittest
+from unittest import mock
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from wechat_source import (
     DirectSchemaError,
     DirectWeChatReader,
+    EncryptedPageCodec,
+    EncryptedPageError,
     _TYPE_NAMES,
     _base_message_type,
     _message_content_projection,
@@ -19,6 +27,77 @@ from wechat_source import (
     _readable_payload_text,
     _text_from_message,
 )
+
+
+class BatchedPageDecryptionTests(unittest.TestCase):
+    @staticmethod
+    def _encrypted_pages(codec, count):
+        rng = random.Random(7123)
+        result = []
+        payload_size = codec.page_size - codec.reserve_size
+        for number in range(1, count + 1):
+            start = 16 if number == 1 else 0
+            iv = rng.randbytes(16)
+            encryptor = Cipher(algorithms.AES(codec.key[:32]), modes.CBC(iv)).encryptor()
+            ciphertext = encryptor.update(rng.randbytes(payload_size - start)) + encryptor.finalize()
+            page = bytearray((rng.randbytes(16) if start else b"") + ciphertext + bytes(codec.reserve_size))
+            iv_start = payload_size + codec.iv_offset
+            page[iv_start : iv_start + 16] = iv
+            if codec.hmac_mode == "sqlcipher":
+                salt = codec.key[32:48] if len(codec.key) == 48 else codec.salt
+                mac_key = hashlib.pbkdf2_hmac("sha512", codec.key[:32], bytes(x ^ 0x3A for x in salt), 2, 32)
+                auth = page[start : payload_size + 16] + struct.pack("<I", number)
+            else:
+                mac_key = codec.key[:32]
+                prefix = (number.to_bytes(4, "big" if codec.hmac_mode == "page_be_ciphertext" else "little")
+                          if codec.hmac_mode not in {None, "ciphertext"} else b"")
+                auth = prefix + ciphertext
+            tag_start = payload_size + codec.tag_offset
+            page[tag_start : tag_start + 64] = hmac.new(mac_key, auth, hashlib.sha512).digest()
+            result.append(bytes(page))
+        return result
+
+    def test_batch_matches_pages_across_boundaries_and_cleans_failed_part(self):
+        codec = EncryptedPageCodec(b"K" * 32, b"S" * 16, key_derivation="raw", hmac_mode="sqlcipher")
+        pages = self._encrypted_pages(codec, 2053)
+        expected = b"".join(codec.decrypt_page(i, page) for i, page in enumerate(pages, 1))
+        with tempfile.TemporaryDirectory() as temporary:
+            source, target = Path(temporary) / "source.db", Path(temporary) / "clear.db"
+            source.write_bytes(b"".join(pages))
+            codec.decrypt_database(source, target)
+            self.assertEqual(target.read_bytes(), expected)
+            corrupt = bytearray(pages[1030])
+            corrupt[53] ^= 1
+            pages[1030] = bytes(corrupt)
+            source.write_bytes(b"".join(pages))
+            with self.assertRaisesRegex(EncryptedPageError, "^encrypted page authentication failed$"):
+                codec.decrypt_database(source, target)
+            self.assertFalse(target.with_suffix(".db.part").exists())
+            self.assertEqual(target.read_bytes(), expected)
+
+    def test_other_hmac_modes_header_forms_and_reserve_layouts_match_pages(self):
+        configurations = [
+            dict(hmac_mode=mode, reserve_size=96, iv_offset=16, tag_offset=32)
+            for mode in (None, "ciphertext", "page_be_ciphertext", "page_le_ciphertext")
+        ] + [dict(hmac_mode="sqlcipher", plaintext_header=header) for header in (None, False, True)]
+        for kwargs in configurations:
+            with self.subTest(kwargs=kwargs), tempfile.TemporaryDirectory() as temporary:
+                codec = EncryptedPageCodec(b"K" * 32 + b"S" * 16, None, key_derivation="raw", **kwargs)
+                pages = self._encrypted_pages(codec, 4)
+                expected = b"".join(codec.decrypt_page(i, page) for i, page in enumerate(pages, 1))
+                source, target = Path(temporary) / "source.db", Path(temporary) / "clear.db"
+                source.write_bytes(b"".join(pages))
+                codec.decrypt_database(source, target)
+                self.assertEqual(target.read_bytes(), expected)
+
+    def test_sqlcipher_mac_key_is_derived_once_per_codec(self):
+        codec = EncryptedPageCodec(b"K" * 32, b"S" * 16, key_derivation="raw", hmac_mode="sqlcipher")
+        pages = self._encrypted_pages(codec, 3)
+        with mock.patch("wechat_source.hashlib.pbkdf2_hmac", wraps=hashlib.pbkdf2_hmac) as derive:
+            for number, page in enumerate(pages, 1):
+                self.assertTrue(codec.verify_page_hmac(number, page))
+                codec.decrypt_page(number, page)
+            self.assertEqual(derive.call_count, 1)
 
 
 class SourceFingerprintTests(unittest.TestCase):
@@ -179,6 +258,16 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
                 self.assertEqual(result[0]["nativeId"], "wxid-member")
                 self.assertEqual(result[0]["displayName"], "群成员备注")
                 self.assertIsNone(result[0]["labelGap"])
+                queries = []
+                reader._connections[source].set_trace_callback(queries.append)
+                all_labels = reader.list_group_member_contact_labels()
+                self.assertEqual(all_labels["room@chatroom"], [{
+                    "nativeId": "wxid-member", "remark": "群成员备注",
+                    "nickname": "昵称", "alias": "alias", "displayName": "群成员备注",
+                }])
+                self.assertEqual(len(queries), 1)
+                reader._connections[source].execute("DROP TABLE chatroom_member")
+                self.assertEqual(reader.list_group_member_contact_labels(), {})
             finally:
                 self._close(reader)
 

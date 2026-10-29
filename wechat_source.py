@@ -994,6 +994,8 @@ def _base_message_type(value: object) -> int | None:
         number = int(value)
     except TypeError, ValueError:
         return None
+    if number == (8 << 32) | 49:
+        return 47
     if number in _TYPE_NAMES:
         return number
     low = number & 0xFF
@@ -1144,6 +1146,7 @@ def _text_from_message(value: object, message_type: int | None) -> str | None:
     if message_type == 1:
         return _safe_plain_text(text, normalize_message_separators=True)
     if message_type == 48:
+        text = re.sub(r"^\s*[^\s<>:]+:\s*\n(?=<)", "", text, count=1)
         try:
             root = ET.fromstring(text)
         except ET.ParseError, ValueError:
@@ -1159,6 +1162,9 @@ def _text_from_message(value: object, message_type: int | None) -> str | None:
             return None
         labels = [_safe_plain_text(location.get(name)) for name in ("poiname", "label")]
         visible = "；".join(dict.fromkeys(value for value in labels if value))
+        coordinates = [_safe_plain_text(location.get(name)) for name in ("x", "y")]
+        if not visible and all(coordinates):
+            visible = "，".join(coordinates)
         return "位置分享：" + visible if visible else "位置分享（未提供地点名称）"
     if message_type == 50:
         call_status = (
@@ -3149,6 +3155,13 @@ class DirectWeChatReader:
             except ET.ParseError:
                 continue
             node = root if root.tag == tag else root.find(tag)
+            if node is None and kind == "emoji":
+                app = root if root.tag == "appmsg" else root.find("appmsg")
+                if app is not None and app.findtext("type") == "8":
+                    node = ET.Element("emoji", {
+                        "md5": app.findtext("appattach/emoticonmd5") or "",
+                        "len": app.findtext("appattach/totallen") or "",
+                    })
             if node is None:
                 continue
             attributes = dict(node.attrib)
@@ -4049,6 +4062,8 @@ class DirectWeChatReader:
         content, payload_texts, compressed_gap = _message_content_projection(
             row, base_type
         )
+        if content is None and base_type == 48:
+            content = "位置分享（地点信息不可用）"
         message: dict[str, Any] = {
             "serverId": str(server_id) if server_id is not None else None,
             "localId": local_id,

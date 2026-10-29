@@ -102,6 +102,18 @@ class NativeMediaSourceTests(unittest.TestCase):
                 path.write_bytes(self.png)
                 self.assertEqual(self.png, self.reader.open_locator(locator))
 
+    def test_app_emoji_uses_bound_md5_and_keeps_missing_media_gap(self):
+        xml = f'<msg><appmsg><type>8</type><appattach><emoticonmd5>{self.md5}</emoticonmd5><totallen>{len(self.png)}</totallen></appattach></appmsg></msg>'
+        self.messages.execute(f"INSERT INTO {self.table} VALUES (2,102,?,?)", ((8 << 32) | 49, xml))
+        locator = self.locator("emoji", 2, 102)
+        attributes = self.reader._native_media_attributes(self.reader._decode_locator(locator))
+        self.assertEqual(attributes, {"md5": self.md5, "len": str(len(self.png))})
+        with patch("wechat_media.fetch_emoji_media") as fetch:
+            metadata = self.reader.resolve_locator(locator)
+            self.assertEqual(metadata["resolution_gap"], "native_media_missing_or_unreadable")
+            self.assertFalse(metadata["openable"])
+            fetch.assert_not_called()
+
     def test_emoji_network_is_only_used_by_explicit_materialization(self):
         self.messages.execute(f"INSERT INTO {self.table} VALUES (2,102,47,?)", (f'<msg><emoji md5="{self.md5}" len="{len(self.png)}"/></msg>',))
         url = "https://emoji.qpic.cn/synthetic-native-item"

@@ -513,8 +513,48 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
             connection.close()
         self.assertEqual(content, '位置分享：合成公园；合成路1号')
         self.assertIsNone(gap)
-        self.assertEqual(_text_from_message('<msg><location x="1" y="2"/></msg>', 48), '位置分享（未提供地点名称）')
+        self.assertEqual(_text_from_message('<msg><location x="1" y="2"/></msg>', 48), '位置分享：1，2')
         self.assertIsNone(_text_from_message('<msg><location', 48))
+
+    def _project_content_row(self, local_type, payload):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT 1 AS local_id, ? AS local_type, 42 AS server_id, 0 AS real_sender_id, "
+            "100 AS create_time, ? AS message_content, '' AS source, '' AS packed_info_data, "
+            "'' AS compress_content, 7 AS sort_seq, 2 AS status, '' AS origin_source",
+            (local_type, payload),
+        ).fetchone()
+        reader = object.__new__(DirectWeChatReader)
+        reader._identity = "wxid-synthetic-self"
+        reader._expected_self_username_sha256 = None
+        reader._media_entries = lambda *_args, **_kwargs: []
+        return reader._message_from_row(row=row, session_native_id="synthetic@chatroom", message_source=Path("synthetic.db"), message_table="Msg_synthetic", connection=connection, sender_index={})
+
+    def test_group_location_prefix_and_unavailable_payload_are_nontext(self):
+        for payload, expected in (
+            ('wxid-synthetic:\n<msg><location poiname="合成公园" label="合成路1号"/></msg>', '位置分享：合成公园；合成路1号'),
+            ('<msg><location', '位置分享（地点信息不可用）'),
+            (b'\xff', '位置分享（地点信息不可用）'),
+        ):
+            with self.subTest(payload=payload):
+                message = self._project_content_row(48, payload)
+                self.assertEqual(message["type"], "location")
+                self.assertEqual(message["content"], expected)
+                self.assertNotIn("contentGap", message)
+
+    def test_native_app_emoji_has_no_unreadable_body_gap(self):
+        message = self._project_content_row((8 << 32) | 49, '<msg><appmsg><type>8</type></appmsg></msg>')
+        self.assertEqual(message["type"], "emoji")
+        self.assertIsNone(message["content"])
+        self.assertNotIn("contentGap", message)
+
+    def test_unreadable_text_and_other_app_still_report_content_gap(self):
+        for local_type in (1, 49):
+            with self.subTest(local_type=local_type):
+                message = self._project_content_row(local_type, b'\xff')
+                self.assertEqual(message["contentGap"], "message_content_unparsed")
 
     def test_system_plain_text_is_preserved_but_unknown_xml_is_a_gap(self):
         self.assertEqual(_text_from_message("小王撤回了一条消息", 10000), "小王撤回了一条消息")

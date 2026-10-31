@@ -4,7 +4,7 @@ WeChatDirect 主要供 AI 调用，是一个 Windows-only 的本地工具：从�
 
 它面向其他项目交付同一份有序消息和真实可读的媒体：保留发送者、引用关系，以及每次图片、表情包和其他附件出现的位置。媒体含义由消费项目和 AI 在实际读取后理解。HTML 只是可选查看方式，不是 AI 的输入要求或运行依赖。
 
-源数据库和缓存始终只读。普通 `context` 只查本机；显式 `export-context` 或 `media-open` 可以按选定消息自带的原生微信 CDN 地址物化表情，并严格核对原生 MD5、声明大小和图片解码结果。`--local-only` 可禁止这一步。工具不会改写 WeChat 数据、自动登录、打开远端主页、点赞、评论或启动后台同步，也不会搜索或拼造媒体地址、补抓全账号历史。
+源数据库和缓存始终只读。普通 `context` 只查本机；显式 `export-context` 或 `media-open` 可以按选定消息自带的原生微信 CDN 地址物化表情，并严格核对原生 MD5、声明大小和图片解码结果。`--local-only` 可禁止这一步。读取入口不会改写 WeChat 数据、自动登录、打开远端主页、点赞、评论或启动后台同步，也不会搜索或拼造媒体地址、补抓全账号历史。可选 `helper` 命令通过独立的原生服务执行显式发送或管理动作，见下文。
 
 处理大群中的本人参与时，`context --self-only`在原生发送者归属层筛选，再解码本人消息；归属未确定的消息仍返回，不能当作没有本人发言。分页、固定时间窗口与引用目标保持，`selectionScope`明确其只覆盖本人及待定发送者。需要对方前后回应时，用普通`context --around <时间>`补读；该筛选不声称已读全群或全部必要语境，也不检测已消失历史或所有旧消息修订。
 
@@ -64,7 +64,7 @@ py -3.11 -m pip install pilk
 
 导出根的优先级从高到低为：命令的显式 `--output`（该命令支持时） > `WECHAT_DIRECT_EXPORT_ROOT` > `.wechatdirect.local.json` 中的 `export_root` > `%LOCALAPPDATA%\WeChatDirect\exports`。
 
-`.wechatdirect.local.json` 允许 `config`、`export_root`，以及可选的 `aliases`（称呼表路径）和 `plaintextCacheRoot`（见下文明文快照缓存）四个路径键。可复制 `local-settings.example.json` 后填入本机值；该文件只应留在本机，不要提交或分享。
+`.wechatdirect.local.json` 允许 `config`、`export_root`，以及可选的 `aliases`（称呼表路径）、`plaintextCacheRoot`（见下文明文快照缓存）和 `helper_config`（原生 helper 本机配置）五个路径键。可复制 `local-settings.example.json` 后填入本机值；该文件只应留在本机，不要提交或分享。
 
 `accounts.example.json` 只展示结构和占位符。真实配置至少填写一个槽位；键名只允许 `primary`、`secondary`，两者均可配置。`auto` 和 `changes --account both` 只检查已配置槽位，显式点名缺失槽位返回 `wechat_account_not_configured`，不会转到另一账号。每个已配置槽位须填写：
 
@@ -245,6 +245,64 @@ wechat-direct verify-export --output "<export-directory>"
 ```
 
 需要更多选项时先运行 `wechat-direct doctor --help` 或 `wechat-direct verify-export --help`。`doctor` 应用于确认 Windows、Python、配置入口和所需本地依赖；`verify-export` 只读检查联系人档案、朋友圈快照、阅读包和保全包，验证文件哈希、大小、账号绑定及媒体关系。旧阅读包没有总清单时只报告其实际可验证范围，不把较弱的旧格式当成新格式完整验证。它不会重写、补齐或修复任何文件。它们都只报告检查结果，不代替用户决定账号、对象或公开分享范围。
+
+### `helper`：原生按次动作与任务内会话
+
+这是可选接入层，固定适配 Prometheus-first/helper 提交 `0a0cf6e09650fd2838af2042c4d7472c071977ee` 的 `NativeTextService`。上游须单独放置并保留其 `LICENSE`、`THIRD_PARTY_NOTICES.md` 与 MinHook 许可；上游限免费个人非商业使用，并非本项目的 MIT 许可。不要运行上游 `main.py`、`web.py` 或 `PluginManager`：其默认插件包含收到撤回后补发等写动作。这里直接使用原生服务，不启动机器人业务插件、LLM、定时任务或网页端口。
+
+主 CLI 的 64 位 Python 3.14 环境可选安装 `.[helper]`（增加 `pefile`）。helper 缺失不影响现有读取和 `doctor`。本机另建被忽略的 `helper-config.json`，只含两个绝对路径：
+
+```json
+{
+  "runtime_path": "<absolute-path-to-pinned-helper-runtime>",
+  "state_root": "<absolute-path-to-local-helper-media-state>"
+}
+```
+
+配置优先级为显式 `--helper-config` > `WECHAT_DIRECT_HELPER_CONFIG` > `.wechatdirect.local.json` 的 `helper_config`。安装时在资料存储实际可用期间创建配置的 `state_root`；运行时不存在就明确失败，不从失效或未挂载的逻辑根递归建目录。其下按 primary/secondary 分开保存接收媒体及上游发送快照；使用时解析目录联接到真实绝对路径，配置仍保留稳定逻辑路径，子目录由上游在实际写入时创建。不扫描表情资料库或保存全账号聊天。状态命令只检查依赖与文件，不导入原生模块、不读微信账号、不注入 DLL，也不证明当前微信核心版本或功能已实测：
+
+```powershell
+wechat-direct helper status --helper-config "<helper-config.json>"
+wechat-direct helper capabilities --helper-config "<helper-config.json>"
+```
+
+动作必须明确 `--account primary|secondary`，不支持 `auto`；继承原有 `--config` 配置解析。先核来源身份，再将原生登录 ID 的 SHA-256 与该槽位 `expected_moments_author_sha256` 核对；不会与含存储后缀的来源承诺混比。每次动作前再次读原生登录身份，退出或切号立即阻止后续动作。
+
+```powershell
+wechat-direct helper send-text --account secondary --target filehelper --text "明确要求发送的文字"
+wechat-direct helper send-image --account secondary --target filehelper --path "<absolute-image-path>"
+wechat-direct helper send-file --account secondary --target filehelper --path "<absolute-file-path>"
+wechat-direct helper send-emoticon --account secondary --target filehelper --path "<absolute-gif-path>"
+wechat-direct helper send-voice --account secondary --target filehelper --path "<absolute-silk-path>"
+```
+
+发送目标用显式原生 `--target`，或 `--contact` 精确名称/已登记称呼；后者复用原有解析，但拒绝宽松/部分匹配，不猜接收者。查群可加 `--chat-type group`。文本支持 `--text-file` UTF-8 文件，原生单条上限为 1023 UTF-8 字节，中文通常每字 3 字节；空文本、NUL 或超限返回结构化错误，不截断、不自动分段重发。AI 需要分段时自行按字节边界组织，并逐条解释结果。
+
+图片与动态 GIF 表情分别对应 `send-image` 和 `send-emoticon`。文件、语音沿用上游 `prepare_file`/`prepare_voice` 的上下文快照和清理，不直接绕过媒体生命周期。语音支持 Tencent SILK；单声道 16-bit PCM WAV 要求上游可选编码器 `pysilk`（发行包 `silk-python`），缺少时明确报错，可先用已有的 Python 3.11/pilk 路线转为 SILK。现有阅读端语音解码配置不会自动变成 helper 的 WAV 编码器。
+
+其他已接入动作是 `send-at-text --target <群ID> --text <文字> --member <成员ID>`（可重复 member，1–8 人）、`group-members --target <群ID>`、`invite-group-members --target <群ID> --member <成员ID>` 和 `create-group --member <成员ID>`（至少两人）。群成员仅是已加载缓存快照，缺失返回 `members=null`，不冒充空群；群艾特、邀请、建群只完成接口接线，未做真实群操作验收。
+
+需在同一 AI 任务连续收发、获取实时申请再显式同意时，使用按需 stdio（标准输入输出）会话，输入输出均为 UTF-8 JSON Lines（每行一个 JSON）：
+
+```powershell
+wechat-direct helper session --account secondary --event-target filehelper
+```
+
+```json
+{"action":"send-text","target":"filehelper","text":"明确要求发送的文字"}
+{"action":"receive","seconds":2,"limit":20}
+{"action":"friend-requests"}
+{"action":"accept-friend","request_id":"fr_<本会话实际返回的32位十六进制ID>"}
+{"action":"close"}
+```
+
+每条请求对应一条回执；最后一条示例申请 ID 是占位符，不能直接使用。会话只接受固定动作及原生 ID，不接受任意上游方法名或昵称。来自显式 `--event-target`（默认 filehelper）的事件在当前会话内至多缓冲 200 条，保留最新事件，溢出的最旧事件计入 `dropped`；只留内存，退出即清空。`receive` 按上限 1–100 条取走积累事件，可有界等待 0–60 秒接收新事件，后续调用不会重复交付已取走的消息；`bufferedRemaining` 给出剩余条数，发生溢出返回 partial。原生 Hook 本身仍观察当前账号的全局消息和好友申请，媒体接收白名单只约束允许目标，不能声称已在原生层缩成文件助手专用 Hook；适配层不转交范围外消息、不持久化全账号消息。
+
+好友申请仅来自当前活连接，不补历史、不自动同意。申请票据只留上游内存，不写 JSON 回执、日志或普通配置；用公开 `request_id` 在同一会话显式 `accept-friend`。当前目录已标记 accepted 的申请再次提交时返回 `outcome=previously_accepted`、`nativeInvoked=false`；`wechatAccepted=null` 表示本次没有新的原生完成回执，之前通过的证据来自当前活连接目录，会话仍可继续。close、EOF 或连接结束会清空申请窗口；退出后不能靠旧 ID 恢复票据。按次 CLI 的 `friend-requests`/`accept-friend` 在读取配置或加载原生模块前直接返回 `helper_live_session_required`；应通过 session 内的同名 JSON 动作完成，不能跨进程复用申请 ID。
+
+普通动作执行后在 finally 中 stop；会话 close/EOF 也清理并卸载桥接，EOF 额外输出最终 close 清理回执。会话启动、输入循环或卸载失败时进程退出码非零；可恢复的单条请求失败仍以逐条 JSON 回执为准，不累计为整个连接失败，正常 EOF/close 且卸载成功可退出 0。没有全局 daemon（常驻服务）、HTTP 端口、命令队列或任务结束后保留的服务。当前 `.13` 的主动加好友、完整联系人扫描及 helper 朋友圈读/发/互动明确返回不可用；原有数据库 `moments`/`sync-moments` 保持可用。
+
+回执中 `invocationCompleted` 表示适配调用是否返回，`wechatAccepted` 只在上游原生完成回执明确成功时为 true，`actualReadback=not_checked` 表示还没有从微信数据库或客户端验收实际结果。超时、异常或回执丢失返回 `status=unknown`、`retryable=false`，会话阻止继续发送，应先精确读回目标再决定后续；不自动重试。`cleanup` 单独报告卸载结果，发送已受理但清理失败为 partial，不能当作全成功。失败时上游可能留下其 `.runtime/native_requests` 报告或桥接，应按上游清理流程核实，不能强杀后直接重发。
 
 ## 故障与恢复边界
 

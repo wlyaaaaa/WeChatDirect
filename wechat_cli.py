@@ -50,7 +50,7 @@ from wechat_storage import (
 LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 ACCOUNT_LABELS = ("primary", "secondary")
 LOCAL_SETTINGS_PATH = Path(__file__).with_name(".wechatdirect.local.json")
-LOCAL_SETTINGS_KEYS = frozenset({"config", "export_root", "aliases", "plaintextCacheRoot"})
+LOCAL_SETTINGS_KEYS = frozenset({"config", "export_root", "aliases", "plaintextCacheRoot", "helper_config"})
 DEFAULT_APP_DIRECTORY = "WeChatDirect"
 MAX_SCAN_MESSAGES = 500
 MAX_RETURN_MESSAGES = 80
@@ -4779,6 +4779,135 @@ def _add_config_argument(command: argparse.ArgumentParser) -> None:
     command.add_argument("--config")
 
 
+def _helper_config_path(explicit=None) -> Path:
+    value = explicit or os.environ.get("WECHAT_DIRECT_HELPER_CONFIG") or _local_settings().get("helper_config")
+    if not value:
+        raise ProductError("helper_config_not_configured")
+    return Path(value)
+
+
+def _helper_expected_identity(account: Mapping[str, str]) -> str:
+    _root, _key, identity = load_direct_source_identity(account["config_path"], account["local_state_path"])
+    if not hmac.compare_digest(_sha256(identity.encode("utf-8")), account["expected_source_identity_sha256"]):
+        raise ProductError("wechat_account_identity_binding_mismatch")
+    wxid = moments_author_identity(identity)
+    if not hmac.compare_digest(_sha256(wxid.encode("utf-8")), account["expected_moments_author_sha256"]):
+        raise ProductError("wechat_moments_identity_binding_mismatch")
+    return wxid
+
+
+def _helper_target(args, config, config_path):
+    if getattr(args, "target", None):
+        return args.target
+    if not getattr(args, "contact", None):
+        return None
+    _label, reader, contact = _resolve_contact(
+        config, account=args.account, query=args.contact, cutoff_s=int(time.time()),
+        aliases_path=_aliases_path(config_path), allow_partial=False,
+        chat_type=getattr(args, "chat_type", None))
+    try:
+        if contact.get("resolution", {}).get("matchKind") not in {"exact", "alias"}:
+            raise ProductError("helper_exact_contact_required")
+        return str(contact["nativeId"])
+    finally:
+        reader.close()
+
+
+class _HelperJsonOutput:
+    def write(self, value):
+        sys.stdout.buffer.write(value.encode("utf-8"))
+
+    def flush(self):
+        sys.stdout.buffer.flush()
+
+
+def command_helper(args: argparse.Namespace) -> int:
+    # All ordinary reading/doctor paths stay independent of this optional module.
+    import wechat_helper as helper
+
+    try:
+        if args.helper_action in helper.UNAVAILABLE:
+            raise helper.HelperError("helper_capability_unavailable", capability=args.helper_action,
+                                     wechatVersion="4.1.15.13")
+        if args.helper_action in helper.LIVE_SESSION_ACTIONS:
+            raise helper.HelperError("helper_live_session_required",
+                                     nextAction="use_friend_requests_and_accept_friend_in_the_same_live_helper_session")
+        settings = helper.load_settings(_helper_config_path(args.helper_config))
+        if args.helper_action in {"status", "capabilities"}:
+            receipt = helper.environment_status(settings)
+        else:
+            config_path = _resolve_config_path(args.config)
+            config = _read_config(config_path)
+            account = _account_config(config, args.account)
+            expected_wxid = _helper_expected_identity(account)
+            session = helper.HelperSession(
+                settings, account=args.account, expected_wxid=expected_wxid,
+                expected_sha256=account["expected_moments_author_sha256"],
+                event_targets=getattr(args, "event_target", None) or ("filehelper",))
+            if args.helper_action == "session":
+                # JSONL input is always UTF-8, independent of the Windows console code page.
+                source = (line.decode("utf-8") for line in sys.stdin.buffer)
+                return helper.run_session(session, source, _HelperJsonOutput())
+            request = {"action": args.helper_action}
+            target = _helper_target(args, config, config_path)
+            if target is not None:
+                request["target"] = target
+            for key in ("text", "path", "request_id", "seconds", "limit"):
+                value = getattr(args, key, None)
+                if value is not None:
+                    request[key] = value
+            if getattr(args, "text_file", None):
+                try:
+                    request["text"] = Path(args.text_file).read_text(encoding="utf-8-sig")
+                except (OSError, UnicodeError) as exc:
+                    raise ProductError("helper_text_file_unavailable") from exc
+            if getattr(args, "member", None):
+                request["members"] = args.member
+            with redirect_stdout(sys.stderr):
+                receipt = helper.run_once(session, request)
+        sys.stdout.buffer.write(_canonical_bytes(receipt))
+        return 0 if receipt["status"] == "success" else 2
+    except helper.HelperError as exc:
+        raise ProductError(str(exc), **exc.details) from exc
+
+
+def _add_helper_commands(commands):
+    helper = commands.add_parser("helper", help="on-demand native sends and scoped live sessions")
+    actions = helper.add_subparsers(dest="helper_action", required=True, parser_class=ReceiptArgumentParser)
+    action_names = ("status", "capabilities", "session", "send-text", "send-at-text", "send-image",
+                    "send-file", "send-emoticon", "send-voice", "receive", "friend-requests", "accept-friend",
+                    "group-members", "invite-group-members", "create-group", "add-friend", "contacts",
+                    "read-moments", "publish-moments", "interact-moments")
+    for action in action_names:
+        command = actions.add_parser(action)
+        command.add_argument("--helper-config")
+        command.set_defaults(handler=command_helper)
+        if action in {"status", "capabilities"}:
+            continue
+        _add_config_argument(command)
+        command.add_argument("--account", choices=ACCOUNT_LABELS, required=True)
+        if action == "session" or action == "receive":
+            command.add_argument("--event-target", action="append", help="explicit native event target; default filehelper")
+        if action.startswith("send-") or action in {"group-members", "invite-group-members"}:
+            target = command.add_mutually_exclusive_group(required=True)
+            target.add_argument("--target", help="explicit native WeChat ID or filehelper")
+            target.add_argument("--contact", help="exact existing contact name or personal alias")
+            command.add_argument("--chat-type", choices=("group", "private"))
+        if action in {"send-text", "send-at-text"}:
+            text = command.add_mutually_exclusive_group(required=True)
+            text.add_argument("--text")
+            text.add_argument("--text-file", help="UTF-8 text file, at most 1023 encoded bytes")
+        if action in {"send-image", "send-file", "send-emoticon", "send-voice"}:
+            command.add_argument("--path", required=True)
+        if action in {"send-at-text", "invite-group-members", "create-group"}:
+            command.add_argument("--member", action="append", required=True, help="explicit native member ID; repeat")
+        if action == "accept-friend":
+            command.add_argument("--request-id", required=True)
+        if action == "receive":
+            command.add_argument("--seconds", type=float, default=1)
+            command.add_argument("--limit", type=int, default=40)
+
+
 def _add_context_arguments(command: argparse.ArgumentParser) -> None:
     _add_config_argument(command)
     command.add_argument("--account", choices=("auto", *ACCOUNT_LABELS), default="auto")
@@ -4839,6 +4968,7 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(
         dest="command", required=True, parser_class=ReceiptArgumentParser
     )
+    _add_helper_commands(commands)
     commitments = commands.add_parser(
         "identity-commitments",
         help="derive account and Moments SHA-256 commitments from one existing protected source carrier",

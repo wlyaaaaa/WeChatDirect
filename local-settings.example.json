@@ -1,4 +1,5 @@
 {
   "config": "<path-to-accounts.json>",
-  "export_root": "<path-to-export-root>"
+  "export_root": "<path-to-export-root>",
+  "helper_config": "<path-to-ignored-local-helper-config.json>"
 }

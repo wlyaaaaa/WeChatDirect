@@ -5,6 +5,8 @@ accounts.json
 **/.wechatdirect.local.json
 local-settings.json
 **/local-settings.json
+helper-config.json
+**/helper-config.json
 
 # Generated exports and preservation bundles.
 exports/

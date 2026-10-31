@@ -368,7 +368,13 @@ class HelperTests(unittest.TestCase):
     def test_state_root_junction_resolves_at_use_time_without_rewriting_config(self):
         with tempfile.TemporaryDirectory(dir=isolation.ROOT) as directory:
             base = Path(directory)
-            physical, logical = base / "physical", base / "logical"
+            parent, parent_alias = base / "parent", base / "parent-alias"
+            parent.mkdir()
+            result = subprocess.run(["cmd", "/c", "mklink", "/J", str(parent_alias), str(parent)],
+                                    capture_output=True, timeout=20,
+                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            physical, logical = parent_alias / "physical", parent_alias / "logical"
             physical.mkdir()
             (physical / "helper-state").mkdir()
             result = subprocess.run(["cmd", "/c", "mklink", "/J", str(logical), str(physical)],
@@ -380,13 +386,14 @@ class HelperTests(unittest.TestCase):
                 self.session.start()
                 for name in ("media_directory", "file_directory", "voice_directory", "emoticon_directory"):
                     path = self.module.service.options[name]
-                    self.assertTrue(path.is_relative_to(physical))
+                    self.assertTrue(path.is_relative_to(physical.resolve()))
                     self.assertEqual(path.resolve(), path)
                 self.assertEqual(self.settings["state_root"], logical / "helper-state")
                 self.session.close()
             finally:
                 # Remove only this synthetic junction, never its target tree.
                 logical.rmdir()
+                parent_alias.rmdir()
 
     def test_old_local_settings_and_helper_precedence(self):
         with mock.patch.object(cli, "_local_settings", return_value={"config": "synthetic"}):

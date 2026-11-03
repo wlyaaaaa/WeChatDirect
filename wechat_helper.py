@@ -220,6 +220,8 @@ def _diagnostics(exc, stage):
         "微信中加载了其他项目的桥接，请先退出该项目；当前项目不会卸载它": "foreign_bridge_loaded",
         "当前桥接缺少所需接收接口，请停止机器人并更新桥接 DLL": "native_receive_export_missing",
         "语音缓存目录必须是无链接的绝对本地路径": "native_media_path_requires_resolved_path",
+        "voice_receiver_inactive": "voice_receiver_inactive",
+        "voice_payload_unavailable": "exact_voice_payload_unavailable",
     }
     message = str(exc)
     result = {"stage": stage, "exceptionType": type(exc).__name__,
@@ -365,18 +367,23 @@ class HelperSession:
             return
         receiver = getattr(self.service, "_voice_receiver", None)
         destination, ready = None, False
+        started, stage = time.monotonic(), "verify_receiver"
         try:
             self._verify_identity()
             if receiver is None or not receiver._active():
                 raise ValueError("voice_receiver_inactive")
+            stage = "read_exact_voice"
             body = self.voice_reader(event)
             self._verify_identity()
+            stage = "validate_voice_payload"
             if not isinstance(body, bytes) or not body.startswith((b"\x02#!SILK_V3", b"#!SILK_V3")):
                 raise ValueError("voice_payload_unavailable")
             voice = importlib.import_module("wxbot_framework.voices")._inspect_silk(body)
             if not receiver._active():
                 raise ValueError("voice_receiver_inactive")
+            stage = "save_received_voice"
             destination = receiver._save(voice.silk)
+            stage = "verify_saved_voice"
             self._verify_identity()
             if not receiver._active():
                 raise ValueError("voice_receiver_inactive")
@@ -385,10 +392,12 @@ class HelperSession:
             ready = True
         except HelperError:
             raise
-        except Exception:
+        except Exception as exc:
             event.update(voice_error="local_database_voice_unavailable",
+                         voice_diagnostic=_diagnostics(exc, stage),
                          nextAction="read_exact_voice_message_from_local_history")
         finally:
+            event["voice_recovery_seconds"] = time.monotonic() - started
             if destination is not None and not ready:
                 receiver._remove_owned(destination)
 

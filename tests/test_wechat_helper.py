@@ -647,6 +647,13 @@ class HelperTests(unittest.TestCase):
                     else:
                         receipt = self.session.execute(dict(action="receive", seconds=0, limit=1))
                         self.assertEqual(receipt["events"][0]["voice_status"], "failed")
+                        diagnostic = receipt["events"][0]["voice_diagnostic"]
+                        expected_stage = ("save_received_voice" if mode == "save" else
+                                          "verify_saved_voice" if mode == "inactive" else "validate_voice_payload")
+                        self.assertEqual(diagnostic["stage"], expected_stage)
+                        self.assertIn(diagnostic["exceptionType"], {"OSError", "ValueError"})
+                        self.assertGreaterEqual(receipt["events"][0]["voice_recovery_seconds"], 0)
+                        self.assertNotIn("synthetic failure", json.dumps(receipt))
                 self.assertFalse(path.exists())
                 if mode in {"identity", "inactive"}:
                     receiver._remove_owned.assert_called_once_with(path)

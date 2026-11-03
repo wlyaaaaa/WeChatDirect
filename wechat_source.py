@@ -1413,6 +1413,72 @@ def _message_payload_texts(
     return body_texts, all_texts, message_gap or compressed_gap
 
 
+def _protobuf_fields(data: bytes) -> list[tuple[int, int, Any]]:
+    """Read bounded wire fields; skip unknown fields, including matched groups."""
+    if len(data) > 65536:
+        raise ValueError("protobuf size limit")
+    position, groups, fields = 0, [], []
+    def varint():
+        nonlocal position
+        value = 0
+        for shift in range(0, 70, 7):
+            if position >= len(data) or (shift == 63 and data[position] > 1):
+                raise ValueError("invalid protobuf varint")
+            byte = data[position]
+            position += 1
+            value |= (byte & 127) << shift
+            if byte < 128:
+                return value
+        raise ValueError("invalid protobuf varint")
+    while position < len(data):
+        tag = varint()
+        number, wire = tag >> 3, tag & 7
+        if not 0 < number < (1 << 29):
+            raise ValueError("invalid protobuf field")
+        if wire == 4:
+            if not groups or groups.pop() != number:
+                raise ValueError("unmatched protobuf group")
+            continue
+        if wire == 3:
+            if not groups:
+                fields.append((number, wire, None))
+            if len(groups) >= 8:
+                raise ValueError("protobuf group depth limit")
+            groups.append(number)
+            continue
+        if wire == 0:
+            value = varint()
+        elif wire in (1, 2, 5):
+            size = varint() if wire == 2 else 8 if wire == 1 else 4
+            if size > len(data) - position:
+                raise ValueError("truncated protobuf field")
+            value, position = data[position:position + size], position + size
+        else:
+            raise ValueError("invalid protobuf wire")
+        if not groups:
+            fields.append((number, wire, value))
+    if groups:
+        raise ValueError("truncated protobuf group")
+    return fields
+
+
+def _native_voice_transcript(value: object) -> str | None:
+    if not isinstance(value, (bytes, bytearray, memoryview)):
+        return None
+    try:
+        outer = [field for field in _protobuf_fields(bytes(value)) if field[0] == 5]
+        if len(outer) != 1 or outer[0][1] != 2:
+            return None
+        inner = [field for field in _protobuf_fields(outer[0][2]) if field[0] in (1, 2)]
+        states, texts = [f for f in inner if f[0] == 1], [f for f in inner if f[0] == 2]
+        if states != [(1, 0, 2)] or len(texts) != 1 or texts[0][1] != 2:
+            return None
+        text = texts[0][2].decode("utf-8").strip()
+        return text if text and "\0" not in text else None
+    except (ValueError, UnicodeError):
+        return None
+
+
 def _message_content_projection(
     row: sqlite3.Row, message_type: int | None
 ) -> tuple[str | None, list[str], str | None]:
@@ -1425,6 +1491,8 @@ def _message_content_projection(
     """
 
     body_texts, payload_texts, compressed_gap = _message_payload_texts(row)
+    if message_type == 34:
+        return _native_voice_transcript(row["packed_info_data"]), payload_texts, compressed_gap
     if message_type == 49:
         content_texts = payload_texts
     elif message_type == 50:
@@ -4009,6 +4077,10 @@ class DirectWeChatReader:
             if sender_role == "system"
             else _TYPE_NAMES.get(base_type or -1, "unknown"),
         }
+        if base_type == 34 and content is not None:
+            message.update(contentSource="wechat_native_cache", voiceTranscription={
+                "source": "wechat_native_cache", "status": "complete", "nativeStatus": 2,
+                "verbatimVerified": False})
         if sender:
             message["senderUsername"] = sender
         elif sender_role in {"self", "other"}:

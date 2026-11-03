@@ -622,21 +622,74 @@ class ExactIdentityAndMediaTests(unittest.TestCase):
         self.assertEqual(_text_from_message('<msg><location x="1" y="2"/></msg>', 48), '位置分享：1，2')
         self.assertIsNone(_text_from_message('<msg><location', 48))
 
-    def _project_content_row(self, local_type, payload):
+    def _project_content_row(self, local_type, payload, *, packed=b"", media=None):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
         connection.row_factory = sqlite3.Row
         row = connection.execute(
             "SELECT 1 AS local_id, ? AS local_type, 42 AS server_id, 0 AS real_sender_id, "
-            "100 AS create_time, ? AS message_content, '' AS source, '' AS packed_info_data, "
+            "100 AS create_time, ? AS message_content, '' AS source, ? AS packed_info_data, "
             "'' AS compress_content, 7 AS sort_seq, 2 AS status, '' AS origin_source",
-            (local_type, payload),
+            (local_type, payload, packed),
         ).fetchone()
         reader = object.__new__(DirectWeChatReader)
         reader._identity = "wxid-synthetic-self"
         reader._expected_self_username_sha256 = None
-        reader._media_entries = lambda *_args, **_kwargs: []
+        reader._media_entries = lambda *_args, **_kwargs: media or []
         return reader._message_from_row(row=row, session_native_id="synthetic@chatroom", message_source=Path("synthetic.db"), message_table="Msg_synthetic", connection=connection, sender_index={})
+
+    @staticmethod
+    def _packed_voice(text="这是微信语音转写测试，明天下午3点开会。", status=2, *, inner_extra=b"", outer_extra=b""):
+        raw = text.encode("utf-8") if isinstance(text, str) else text
+        inner = b"\x08" + bytes([status]) + b"\x12" + bytes([len(raw)]) + raw + inner_extra
+        return b"\x08\x9e\x02\x10\x02\x2a" + bytes([len(inner)]) + inner + b"\x58\x00" + outer_extra
+
+    def test_native_voice_transcript_projects_same_row_content_media_and_source(self):
+        expected = "这是微信语音转写测试，明天下午3点开会。"
+        media = [{"kind": "voice", "locator": "same-message", "openable": True}]
+        message = self._project_content_row(34, "<msg><voicemsg/></msg>", packed=self._packed_voice(), media=media)
+        self.assertEqual((message["type"], message["content"], message["contentSource"]),
+                         ("voice", expected, "wechat_native_cache"))
+        self.assertEqual(message["media_manifest"], media)
+        self.assertEqual(message["voiceTranscription"], {
+            "source": "wechat_native_cache", "status": "complete", "nativeStatus": 2, "verbatimVerified": False})
+
+    def test_native_voice_transcript_skips_unknown_wire_fields_without_accepting_unknown_status(self):
+        unknown = b"\x30\x01\x39" + b"x" * 8 + b"\x42\x01x\x4b\x08\x01\x4c\x55" + b"x" * 4
+        packet = self._packed_voice("同消息缓存", inner_extra=b"\x1a\x01x", outer_extra=unknown)
+        self.assertEqual(self._project_content_row(34, "", packed=packet)["content"], "同消息缓存")
+        for status in (0, 1, 3, 9):
+            with self.subTest(status=status):
+                message = self._project_content_row(34, "", packed=self._packed_voice(status=status))
+                self.assertIsNone(message["content"])
+                self.assertNotIn("voiceTranscription", message)
+
+    def test_native_voice_transcript_rejects_truncation_conflicts_types_and_invalid_text(self):
+        complete = self._packed_voice("完整")
+        bad = [complete[:-1], complete + b"\x80", b"\x28\x02", b"\x2a\x04\x0a\x01x\x10",
+               self._packed_voice(""), self._packed_voice(b"\xff"), self._packed_voice("\0"),
+               self._packed_voice("完整", inner_extra=b"\x08\x00"),
+               self._packed_voice("完整", inner_extra=b"\x12\x03\xe5\xbc\x82"),
+               complete + self._packed_voice("别条"), b"\x2a\x04\x08\x02\x10\x01",
+               complete + b"\x4b", complete + b"\x4c", b"\x80" * 9 + b"\x02", b"x" * 65537]
+        for packet in bad:
+            with self.subTest(packet=packet[:16]):
+                message = self._project_content_row(34, "", packed=packet)
+                self.assertIsNone(message["content"])
+                self.assertNotIn("contentSource", message)
+
+    def test_only_completed_voice_cache_is_keyword_content_and_other_types_do_not_borrow_it(self):
+        import wechat_cli
+        pending = self._project_content_row(34, "", packed=self._packed_voice("目标词", status=0))
+        complete = self._project_content_row(34, "", packed=self._packed_voice("目标词"))
+        selected, anchor = wechat_cli._select_window([pending, complete], contains="目标词", around_s=None, return_limit=1)
+        self.assertEqual((selected, anchor), ([complete], 0))
+        for kind, body, expected in ((1, "普通文字", "普通文字"), (3, "", None), (34, "", None)):
+            with self.subTest(kind=kind):
+                packet = b"" if kind == 34 else self._packed_voice("不能借用")
+                message = self._project_content_row(kind, body, packed=packet)
+                self.assertEqual(message["content"], expected)
+                self.assertNotIn("voiceTranscription", message)
 
     def test_group_location_prefix_and_unavailable_payload_are_nontext(self):
         for payload, expected in (

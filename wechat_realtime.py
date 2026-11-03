@@ -107,7 +107,7 @@ class RealtimeContextSession:
         with self.lock:
             if self.closed:
                 raise RuntimeError("realtime_session_closed")
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             self.processes.add(process)
         try:

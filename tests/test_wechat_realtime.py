@@ -4,6 +4,8 @@ from concurrent.futures import Future, wait
 import io
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -17,6 +19,29 @@ from wechat_realtime import RealtimeContextSession
 
 
 class RealtimeContextTests(unittest.TestCase):
+    def test_background_child_does_not_wait_for_or_consume_session_input(self):
+        code = (
+            "import sys, threading; from wechat_realtime import RealtimeContextSession; "
+            "runner=object.__new__(RealtimeContextSession); runner.lock=threading.Lock(); "
+            "runner.closed=False; runner.processes=set(); "
+            "print(runner._run([sys.executable,'-c',"
+            "'import sys; assert not sys.stdin.read(); print(123)'],2).strip(),flush=True)"
+        )
+        process = subprocess.Popen([sys.executable, '-B', '-c', code], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        try:
+            # Keep the parent's control input open while the non-interactive child exits.
+            process.wait(timeout=6)
+            self.assertEqual(process.returncode, 0, process.stderr.read().decode('utf-8'))
+            self.assertEqual(process.stdout.read().strip(), b'123')
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=3)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
+
     def fixture(self, *, cached=False, clock=time.monotonic):
         temporary = tempfile.TemporaryDirectory(dir=isolation.ROOT)
         self.addCleanup(temporary.cleanup)

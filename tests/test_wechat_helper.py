@@ -539,6 +539,120 @@ class HelperTests(unittest.TestCase):
         with mock.patch.object(cli, "_resolve_contact", side_effect=AssertionError("must not resolve names")):
             self.assertEqual(cli._helper_target(args, {}, Path("synthetic.json")), "wxid_explicit")
 
+    def _voice_recovery_fixture(self):
+        self.module.account = WXID
+        self.session = helper.HelperSession(self.settings, account="primary", expected_wxid=WXID,
+                                            expected_sha256=COMMITMENT, module=self.module)
+        self.session.start()
+        body = b"\x02#!SILK_V3\x01\x00x"
+        path = self.settings["state_root"] / "synthetic-received.silk"
+        def save(data):
+            path.write_bytes(data)
+            return path
+        receiver = SimpleNamespace(_active=mock.Mock(return_value=True), _save=mock.Mock(side_effect=save),
+                                   _remove_owned=mock.Mock(side_effect=lambda value: value.unlink(missing_ok=True)))
+        self.module.service._voice_receiver = receiver
+        self.session.voice_reader = mock.Mock(return_value=body)
+        inspector = SimpleNamespace(_inspect_silk=mock.Mock(return_value=SimpleNamespace(silk=body, duration_ms=20)))
+        event = dict(chat_id="filehelper", sender_id=WXID, native_sender=WXID, native_receiver="filehelper",
+                     is_self=True, sequence=123, native_message_id="456", wx_type=34, voice_status="failed")
+        return event, receiver, path, inspector
+
+    def test_failed_voice_recovers_exact_bytes_metadata_and_concurrent_buffer_count(self):
+        event, receiver, path, inspector = self._voice_recovery_fixture()
+        body = self.session.voice_reader.return_value
+        def read(data):
+            self.module.service.handler(123, 11046, dict(chat_id="filehelper", wx_type=1, msg="next"), None)
+            return body
+        self.session.voice_reader.side_effect = read
+        self.module.service.handler(123, 11046, event, None)
+        self.session.voice_reader.assert_not_called()
+        with mock.patch.object(helper.importlib, "import_module", return_value=inspector):
+            receipt = self.session.execute(dict(action="receive", seconds=0, limit=1))
+        recovered = receipt["events"][0]
+        self.assertEqual({key: recovered[key] for key in event if key != "voice_status"},
+                         {key: value for key, value in event.items() if key != "voice_status"})
+        self.assertEqual((recovered["voice_status"], recovered["voice_source"], recovered["voice_duration_ms"]),
+                         ("ready", "local_database", 20))
+        self.assertEqual(path.read_bytes(), body)
+        self.assertEqual(recovered["voice_size"], len(body))
+        self.assertEqual(receipt["bufferedRemaining"], 1)
+        receiver._remove_owned.assert_not_called()
+        self.session.close()
+
+    def test_native_ready_and_nonvoice_events_never_request_database_voice(self):
+        event, _receiver, _path, inspector = self._voice_recovery_fixture()
+        for change in ({"voice_status": "ready"}, {"wx_type": 1}):
+            self.module.service.handler(123, 11046, {**event, **change}, None)
+        with mock.patch.object(helper.importlib, "import_module", return_value=inspector):
+            receipt = self.session.execute(dict(action="receive", seconds=0, limit=2))
+        self.assertEqual(len(receipt["events"]), 2)
+        self.session.voice_reader.assert_not_called()
+        inspector._inspect_silk.assert_not_called()
+        self.session.close()
+
+    def test_received_voice_database_lookup_rejects_conflicts_and_bounds_fresh_attempts(self):
+        event = dict(chat_id="synthetic-chat", sender_id=WXID, native_message_id="456", is_self=True)
+        message = dict(type="voice", serverId="456", senderUsername=WXID, isSend=True,
+                       media_manifest=[dict(kind="voice", openable=True, locator="synthetic-locator")])
+        for change in (dict(type="text"), dict(serverId="other"), dict(senderUsername="other"), dict(isSend=False)):
+            reader = mock.MagicMock()
+            reader.__enter__.return_value = reader
+            reader.fetch_message_by_server_id.return_value = {**message, **change}
+            with self.subTest(change=change), mock.patch.object(cli, "_reader", return_value=reader) as factory:
+                self.assertIsNone(cli._helper_received_voice({}, event))
+            factory.assert_called_once()
+            reader.open_locator.assert_not_called()
+            reader.__exit__.assert_called_once()
+        readers = [mock.MagicMock() for _ in range(3)]
+        for index, reader in enumerate(readers):
+            reader.__enter__.return_value = reader
+            reader.fetch_message_by_server_id.return_value = message if index == 2 else None
+        readers[-1].open_locator.return_value = b"synthetic-silk"
+        with mock.patch.object(cli, "_reader", side_effect=readers) as factory, mock.patch.object(cli.time, "sleep") as sleep:
+            self.assertEqual(cli._helper_received_voice({}, event), b"synthetic-silk")
+        self.assertEqual(factory.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(0.15), mock.call(0.15)])
+        for reader in readers:
+            reader.fetch_message_by_server_id.assert_called_once_with("synthetic-chat", "456", exact_media_lookup=True)
+            reader.__exit__.assert_called_once()
+        with mock.patch.object(cli, "_reader", side_effect=cli.ProductError("wechat_account_identity_binding_mismatch")) as factory:
+            with self.assertRaisesRegex(cli.ProductError, "identity_binding_mismatch"):
+                cli._helper_received_voice({}, event)
+        factory.assert_called_once()
+
+    def test_voice_recovery_account_change_cache_failure_and_missing_payload_never_ready(self):
+        for mode in ("identity", "inactive", "save", "unavailable", "invalid"):
+            with self.subTest(mode=mode):
+                event, receiver, path, inspector = self._voice_recovery_fixture()
+                if mode == "identity":
+                    save = receiver._save.side_effect
+                    def switch(data):
+                        result = save(data)
+                        self.module.account = "wxid_other"
+                        return result
+                    receiver._save.side_effect = switch
+                elif mode == "inactive":
+                    receiver._active.side_effect = [True, True, False]
+                elif mode == "save":
+                    receiver._save.side_effect = OSError("synthetic failure")
+                else:
+                    self.session.voice_reader.return_value = None if mode == "unavailable" else b"invalid"
+                self.module.service.handler(123, 11046, event, None)
+                with mock.patch.object(helper.importlib, "import_module", return_value=inspector):
+                    if mode == "identity":
+                        with self.assertRaisesRegex(helper.HelperError, "identity_mismatch"):
+                            self.session.execute(dict(action="receive", seconds=0, limit=1))
+                        self.assertFalse(self.session.started)
+                    else:
+                        receipt = self.session.execute(dict(action="receive", seconds=0, limit=1))
+                        self.assertEqual(receipt["events"][0]["voice_status"], "failed")
+                self.assertFalse(path.exists())
+                if mode in {"identity", "inactive"}:
+                    receiver._remove_owned.assert_called_once_with(path)
+                if self.session.started:
+                    self.session.close()
+
 
 if __name__ == "__main__":
     unittest.main()

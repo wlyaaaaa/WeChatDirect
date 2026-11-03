@@ -4840,6 +4840,30 @@ class _HelperJsonOutput:
         sys.stdout.buffer.flush()
 
 
+def _helper_received_voice(account, event):
+    chat, sender = event.get("chat_id"), event.get("sender_id")
+    server = str(event.get("native_message_id") or "")
+    is_self = event.get("is_self")
+    if (not isinstance(chat, str) or not chat or not isinstance(sender, str) or not sender
+            or not server.isdigit() or int(server) <= 0 or type(is_self) is not bool):
+        return None
+    for attempt in range(3):
+        with _reader(account, int(time.time())) as reader:
+            message = reader.fetch_message_by_server_id(chat, server, exact_media_lookup=True)
+            if message is not None:
+                if (message.get("type") != "voice" or str(message.get("serverId")) != server
+                        or message.get("senderUsername") != sender or message.get("isSend") is not is_self):
+                    return None
+                voices = [media for media in message.get("media_manifest", []) if media.get("kind") == "voice"]
+                if len(voices) > 1:
+                    return None
+                if len(voices) == 1 and voices[0].get("openable") is True:
+                    return reader.open_locator(voices[0]["locator"])
+        if attempt < 2:
+            time.sleep(0.15)
+    return None
+
+
 def command_helper(args: argparse.Namespace) -> int:
     # All ordinary reading/doctor paths stay independent of this optional module.
     import wechat_helper as helper
@@ -4862,7 +4886,8 @@ def command_helper(args: argparse.Namespace) -> int:
             session = helper.HelperSession(
                 settings, account=args.account, expected_wxid=expected_wxid,
                 expected_sha256=account["expected_moments_author_sha256"],
-                event_targets=getattr(args, "event_target", None) or ("filehelper",))
+                event_targets=getattr(args, "event_target", None) or ("filehelper",),
+                voice_reader=lambda event: _helper_received_voice(account, event))
             if args.helper_action == "session":
                 # JSONL input is always UTF-8, independent of the Windows console code page.
                 source = (line.decode("utf-8") for line in sys.stdin.buffer)

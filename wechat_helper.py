@@ -238,7 +238,7 @@ def _diagnostics(exc, stage):
 
 class HelperSession:
     def __init__(self, settings, *, account, expected_wxid, expected_sha256,
-                 event_targets=("filehelper",), module=None):
+                 event_targets=("filehelper",), module=None, voice_reader=None):
         if account not in ("primary", "secondary"):
             raise HelperError("helper_explicit_account_required")
         if not hmac.compare_digest(_identity_hash(expected_wxid), expected_sha256):
@@ -249,6 +249,7 @@ class HelperSession:
         self.settings, self.account = settings, account
         self.expected_wxid, self.expected_sha256 = expected_wxid, expected_sha256
         self.module, self.service = module, None
+        self.voice_reader = voice_reader
         self.started = False
         self.poisoned = False
         self._event_lock = threading.Lock()
@@ -298,7 +299,7 @@ class HelperSession:
         # XML, CDN credentials and friend-request tickets are never forwarded.
         keys = ("chat_id", "sender_id", "native_sender", "native_receiver", "is_self", "sequence",
                 "native_message_id", "wx_type", "image_path", "image_status", "file_path", "file_status",
-                "voice_path", "voice_status", "app_type")
+                "voice_path", "voice_status", "voice_duration_ms", "voice_size", "app_type")
         event = {key: data[key] for key in keys if isinstance(data.get(key), (str, int, bool))}
         if data.get("wx_type") == 1:
             event["text"] = str(data.get("msg") or data.get("content") or "")
@@ -359,6 +360,38 @@ class HelperSession:
                     "target": room, "members": rows, "coverage": "loaded_cache_only"}
         return self._invoke(action, request)
 
+    def _recover_received_voice(self, event):
+        if self.voice_reader is None or event.get("wx_type") != 34 or event.get("voice_status") != "failed":
+            return
+        receiver = getattr(self.service, "_voice_receiver", None)
+        destination, ready = None, False
+        try:
+            self._verify_identity()
+            if receiver is None or not receiver._active():
+                raise ValueError("voice_receiver_inactive")
+            body = self.voice_reader(event)
+            self._verify_identity()
+            if not isinstance(body, bytes) or not body.startswith((b"\x02#!SILK_V3", b"#!SILK_V3")):
+                raise ValueError("voice_payload_unavailable")
+            voice = importlib.import_module("wxbot_framework.voices")._inspect_silk(body)
+            if not receiver._active():
+                raise ValueError("voice_receiver_inactive")
+            destination = receiver._save(voice.silk)
+            self._verify_identity()
+            if not receiver._active():
+                raise ValueError("voice_receiver_inactive")
+            event.update(voice_status="ready", voice_path=str(destination), voice_duration_ms=voice.duration_ms,
+                         voice_size=len(voice.silk), voice_source="local_database", voice_error="")
+            ready = True
+        except HelperError:
+            raise
+        except Exception:
+            event.update(voice_error="local_database_voice_unavailable",
+                         nextAction="read_exact_voice_message_from_local_history")
+        finally:
+            if destination is not None and not ready:
+                receiver._remove_owned(destination)
+
     def _receive(self, request):
         seconds, limit = request.get("seconds", 1), request.get("limit", 40)
         if (isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 <= seconds <= 60
@@ -382,6 +415,21 @@ class HelperSession:
         self._verify_identity()
         if self.service.last_error is not None:
             raise HelperError("helper_receive_service_stopped")
+        try:
+            for event in events:
+                self._recover_received_voice(event)
+            self._verify_identity()
+        except HelperError:
+            receiver = getattr(self.service, "_voice_receiver", None)
+            for event in events:
+                if event.get("voice_source") == "local_database":
+                    receiver._remove_owned(Path(event["voice_path"]))
+            self.close()
+            raise
+        with self._event_lock:
+            remaining = len(self._event_buffer)
+            dropped += self._event_dropped
+            self._event_dropped = 0
         return {"status": "partial" if dropped else "success", "action": "receive",
                 "events": events, "dropped": dropped, "bufferedRemaining": remaining,
                 "eventTargets": sorted(self.event_targets), "bufferLimit": 200,

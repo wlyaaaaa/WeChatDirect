@@ -4806,7 +4806,12 @@ def _helper_target(args, config, config_path):
         aliases_path=_aliases_path(config_path), allow_partial=False,
         chat_type=getattr(args, "chat_type", None))
     try:
-        if contact.get("resolution", {}).get("matchKind") not in {"exact", "alias"}:
+        resolution = contact.get("resolution", {})
+        if resolution.get("staleAliases") and resolution.get("matchKind") != "alias":
+            raise ProductError(
+                "helper_stale_alias_requires_resolution", staleAliases=resolution["staleAliases"],
+                nextAction="verify_explicit_target_or_repair_alias_before_sending")
+        if resolution.get("matchKind") not in {"exact", "alias"}:
             raise ProductError("helper_exact_contact_required")
         return str(contact["nativeId"])
     finally:

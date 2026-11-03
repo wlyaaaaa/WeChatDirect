@@ -278,6 +278,8 @@ wechat-direct helper send-voice --account secondary --target filehelper --path "
 
 发送目标用显式原生 `--target`，或 `--contact` 精确名称/已登记称呼；后者复用原有解析，但拒绝宽松/部分匹配，不猜接收者。查群可加 `--chat-type group`。文本支持 `--text-file` UTF-8 文件，原生单条上限为 1023 UTF-8 字节，中文通常每字 3 字节；空文本、NUL 或超限返回结构化错误，不截断、不自动分段重发。AI 需要分段时自行按字节边界组织，并逐条解释结果。
 
+若已登记称呼失效，`--contact` 不会沿同名联系人继续发送，而在启动原生服务前返回 `helper_stale_alias_requires_resolution`；应先核对并显式指定 `--target`，或修复称呼后再执行。正常精确名称、仍有效的称呼及显式 `--target` 保持可用，不自动修改或删除称呼。
+
 图片与动态 GIF 表情分别对应 `send-image` 和 `send-emoticon`。文件、语音沿用上游 `prepare_file`/`prepare_voice` 的上下文快照和清理，不直接绕过媒体生命周期。语音支持 Tencent SILK；单声道 16-bit PCM WAV 要求上游可选编码器 `pysilk`（发行包 `silk-python`），缺少时明确报错，可先用已有的 Python 3.11/pilk 路线转为 SILK。现有阅读端语音解码配置不会自动变成 helper 的 WAV 编码器。
 
 其他已接入动作是 `send-at-text --target <群ID> --text <文字> --member <成员ID>`（可重复 member，1–8 人）、`group-members --target <群ID>`、`invite-group-members --target <群ID> --member <成员ID>` 和 `create-group --member <成员ID>`（至少两人）。群成员仅是已加载缓存快照，缺失返回 `members=null`，不冒充空群；群艾特、邀请、建群只完成接口接线，未做真实群操作验收。

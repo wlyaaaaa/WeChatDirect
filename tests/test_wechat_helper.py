@@ -427,6 +427,61 @@ class HelperTests(unittest.TestCase):
         args = cli.parser().parse_args(["helper", "send-text", "--account", "primary", "--target", "filehelper", "--text", "x"])
         self.assertEqual(args.helper_action, "send-text")
 
+    def test_stale_alias_name_fallback_cannot_invoke_native_send(self):
+        args = cli.parser().parse_args([
+            "helper", "send-text", "--helper-config", "synthetic-helper.json",
+            "--config", "synthetic-config.json", "--account", "primary",
+            "--contact", "synthetic_alias", "--text", "synthetic"])
+        reader = mock.Mock()
+        reader.list_contacts.return_value = [
+            {"nativeId": "wxid_other_synthetic", "remark": "synthetic_alias"}]
+        stale = {"name": "synthetic_alias", "account": "primary", "nativeId": "wxid_absent",
+                 "chatType": "private", "label": "old_label", "addedAt": "2026-01-01"}
+        with (
+            mock.patch.object(helper, "load_settings", return_value=self.settings),
+            mock.patch.object(cli, "_read_config", return_value={
+                "primary": {"expected_moments_author_sha256": COMMITMENT}}),
+            mock.patch.object(cli, "_helper_expected_identity", return_value=WXID),
+            mock.patch.object(cli, "_read_aliases", return_value=[stale]),
+            mock.patch.object(cli, "_reader", return_value=reader),
+            mock.patch.object(helper, "run_once") as invoke,
+            mock.patch.object(helper, "native_module") as load_native,
+        ):
+            with self.assertRaisesRegex(cli.ProductError, "helper_stale_alias_requires_resolution") as caught:
+                cli.command_helper(args)
+        self.assertEqual(caught.exception.details["staleAliases"][0]["label"], "old_label")
+        self.assertEqual(caught.exception.details["nextAction"],
+                         "verify_explicit_target_or_repair_alias_before_sending")
+        reader.close.assert_called_once_with()
+        invoke.assert_not_called()
+        load_native.assert_not_called()
+
+    def test_exact_and_live_alias_targets_remain_available_and_close_reader(self):
+        stale = {"name": "synthetic_alias", "account": "primary", "nativeId": "wxid_absent",
+                 "chatType": "private", "label": "old_label", "addedAt": "2026-01-01"}
+        for query, name, aliases in (
+            ("synthetic_name", "synthetic_name", []),
+            ("synthetic_alias", "different_name", [stale, {**stale, "nativeId": "wxid_chosen"}]),
+        ):
+            with self.subTest(query=query):
+                args = cli.parser().parse_args([
+                    "helper", "send-text", "--account", "primary", "--contact", query, "--text", "synthetic"])
+                reader = mock.Mock()
+                reader.list_contacts.return_value = [{"nativeId": "wxid_chosen", "remark": name}]
+                with (
+                    mock.patch.object(cli, "_read_aliases", return_value=aliases),
+                    mock.patch.object(cli, "_reader", return_value=reader),
+                ):
+                    self.assertEqual(cli._helper_target(args, {"primary": {}}, Path("synthetic.json")),
+                                     "wxid_chosen")
+                reader.close.assert_called_once_with()
+
+    def test_explicit_target_does_not_resolve_names_or_aliases(self):
+        args = cli.parser().parse_args([
+            "helper", "send-text", "--account", "primary", "--target", "wxid_explicit", "--text", "synthetic"])
+        with mock.patch.object(cli, "_resolve_contact", side_effect=AssertionError("must not resolve names")):
+            self.assertEqual(cli._helper_target(args, {}, Path("synthetic.json")), "wxid_explicit")
+
 
 if __name__ == "__main__":
     unittest.main()

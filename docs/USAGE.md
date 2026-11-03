@@ -308,6 +308,25 @@ wechat-direct helper session --account secondary --event-target filehelper
 
 媒体回调异步完成，后发 GIF 可能早于先发图片就绪；同一 `native_message_id` 从 pending 变为 ready/failed 是同一消息的状态更新，不是重复消息。用该 ID 对接同账号、同会话的 reader 记录，`sequence` 只辅助当前连接排序，不能把事件抵达顺序当作原生聊天顺序。`.13` 桥接仅带语音元数据而没有音频时，`receive` 可沿现有 reader 按所选账号、会话和服务器消息 ID 精确补取，核对发送者、收发方向与类型后保存到接收账号的媒体目录，成功返回 ready 及 `voice_source=local_database`，源内容缺失仍返回 failed。这只补全已观察到的实时事件，不补接收前历史、不常驻，也不自动重发。
 
+实时上下文须显式开启，普通 session 的行为保持原样：
+
+```powershell
+wechat-direct helper session --account secondary --event-target filehelper --realtime --asr-root "<ChineseASR绝对根目录>"
+```
+
+启动先准备本地识别并返回就绪回执，再监听消息；读取消息时只使用已就绪模型，不触发冷加载。通过原生消息 ID 读取同一账号、同一对象的精确上下文：
+
+```json
+{"action":"read-context","target":"filehelper","native_message_id":"<本会话观察到的消息ID>"}
+{"action":"context-results","request_id":"<read-context返回的request_id>"}
+```
+
+`read-context` 返回精确消息、引用、原媒体路径、缺口与首个完整的语音转写候选。同一消息已有微信原生转写缓存时直接读取；没有缓存时，已就绪本地模型与云端双路并行，保留来源，后到候选用同一 `request_id` 调 `context-results` 读取，不重新发送云请求；云请求有界完成。
+
+`observedAt` 从原生事件首次观测起计时，`elapsed`、`onTime`、`late` 如实记录；15 秒完整上下文仍须真实链路验收，接口接线与模拟测试不代表已达标。图片和动图的 `materialComplete=true`、`ready_for_vision` 只表示材料齐备可供阅读；`visualRead=false` 时不得声明 `complete` 或 `onTime=true`，AI 必须实际打开内容看过，再判断图意与完整上下文是否按时获得。
+
+只处理显式目标，不做全账号同步或自动回复，不开服务端口；`close` 或 stdin EOF 清理本任务启动的识别及辅助进程。
+
 好友申请仅来自当前活连接，不补历史、不自动同意。申请票据只留上游内存，不写 JSON 回执、日志或普通配置；用公开 `request_id` 在同一会话显式 `accept-friend`。当前目录已标记 accepted 的申请再次提交时返回 `outcome=previously_accepted`、`nativeInvoked=false`；`wechatAccepted=null` 表示本次没有新的原生完成回执，之前通过的证据来自当前活连接目录，会话仍可继续。close、EOF 或连接结束会清空申请窗口；退出后不能靠旧 ID 恢复票据。按次 CLI 的 `friend-requests`/`accept-friend` 在读取配置或加载原生模块前直接返回 `helper_live_session_required`；应通过 session 内的同名 JSON 动作完成，不能跨进程复用申请 ID。
 
 普通动作执行后在 finally 中 stop；会话 close/EOF 也清理并卸载桥接，EOF 额外输出最终 close 清理回执。会话启动、输入循环或卸载失败时进程退出码非零；可恢复的单条请求失败仍以逐条 JSON 回执为准，不累计为整个连接失败，正常 EOF/close 且卸载成功可退出 0。没有全局 daemon（常驻服务）、HTTP 端口、命令队列或任务结束后保留的服务。当前 `.13` 的主动加好友、完整联系人扫描及 helper 朋友圈读/发/互动明确返回不可用；原有数据库 `moments`/`sync-moments` 保持可用。

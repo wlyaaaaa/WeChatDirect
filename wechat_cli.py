@@ -4889,6 +4889,18 @@ def command_helper(args: argparse.Namespace) -> int:
                 event_targets=getattr(args, "event_target", None) or ("filehelper",),
                 voice_reader=lambda event: _helper_received_voice(account, event))
             if args.helper_action == "session":
+                if args.realtime:
+                    if not args.asr_root:
+                        raise ProductError("realtime_asr_root_required")
+                    from wechat_realtime import RealtimeContextSession
+                    session = RealtimeContextSession(session, asr_root=args.asr_root, account=account,
+                        reader_factory=lambda: _reader(account, int(time.time())))
+                    try:
+                        ready = session.prepare()
+                    except Exception as exc:
+                        session.close()
+                        raise ProductError("realtime_local_prepare_failed") from exc
+                    helper._emit(_HelperJsonOutput(), ready)
                 # JSONL input is always UTF-8, independent of the Windows console code page.
                 source = (line.decode("utf-8") for line in sys.stdin.buffer)
                 return helper.run_session(session, source, _HelperJsonOutput())
@@ -4932,6 +4944,9 @@ def _add_helper_commands(commands):
         command.add_argument("--account", choices=ACCOUNT_LABELS, required=True)
         if action == "session" or action == "receive":
             command.add_argument("--event-target", action="append", help="explicit native event target; default filehelper")
+        if action == "session":
+            command.add_argument("--realtime", action="store_true", help="prepare task-scoped ASR and enable exact read-context")
+            command.add_argument("--asr-root", type=Path, help="explicit ChineseASR project root for realtime mode")
         if action.startswith("send-") or action in {"group-members", "invite-group-members"}:
             target = command.add_mutually_exclusive_group(required=True)
             target.add_argument("--target", help="explicit native WeChat ID or filehelper")

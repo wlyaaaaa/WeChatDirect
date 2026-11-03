@@ -544,10 +544,10 @@ def run_session(session, input_stream, output_stream):
         if cleanup is None:
             with redirect_stdout(sys.stderr):
                 cleanup = session.close()
-            _emit(output_stream, {"status": "success" if cleanup["dllUnloaded"] else "partial",
+            _emit(output_stream, {"status": "success" if cleanup["status"] in {"success", "not_needed"} else "partial",
                                   "action": "close", "reason": "eof_or_interruption", "cleanup": cleanup,
                                   "liveFriendRequests": "discarded"})
-    return 0 if cleanup["dllUnloaded"] and not fatal_failed else 2
+    return 0 if cleanup["status"] in {"success", "not_needed"} and not fatal_failed else 2
 
 
 def run_once(session, request):

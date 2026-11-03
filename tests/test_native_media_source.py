@@ -14,6 +14,7 @@ from unittest.mock import patch
 from PIL import Image
 
 import wechat_source
+from wechat_cli import ProductError
 from wechat_media import LocalMedia
 from wechat_source import DirectCredentialError, DirectSchemaError, DirectWeChatReader, MediaNotOpenableError
 
@@ -141,6 +142,54 @@ class NativeMediaSourceTests(unittest.TestCase):
             self.png, "emoji.png", "image/png", "original", source="remote"
         )) as fetch:
             self.assertEqual(self.png, self.reader.open_locator(self.locator("emoji", 3, 103), allow_remote=True))
+            fetch.assert_called_once_with(emoji_md5=self.md5, native_url=url, declared_size=len(self.png))
+
+    def test_monthly_emoji_cache_only_materializes_on_explicit_open_with_message_binding(self):
+        self.messages.execute(f"INSERT INTO {self.table} VALUES (2,102,47,?)", (
+            f'<msg><emoji md5="{self.md5}" len="{len(self.png)}"/></msg>',))
+        locator = self.locator("emoji", 2, 102)
+        with (
+            patch.object(self.reader, "_emoticon_cache_key_provider", create=True, return_value=b"synthetic-key") as provider,
+            patch("wechat_media.emoji_cache_paths", create=True, return_value=[self.root / "monthly-cache"]) as paths,
+            patch("wechat_media.open_cached_emoji_media", create=True,
+                  return_value=LocalMedia(self.png, "emoji.png", "image/png", "original")) as cached,
+            patch("wechat_media.fetch_emoji_media") as fetch,
+        ):
+            pending = self.reader.resolve_locator(locator)
+            self.assertTrue(pending["materializable"])
+            self.assertTrue(pending["requiresLiveAccount"])
+            self.assertFalse(pending["requiresNetwork"])
+            self.assertEqual(pending["materializationSource"], "local")
+            provider.assert_not_called()
+            cached.assert_not_called()
+            self.assertEqual(self.png, self.reader.open_locator(locator))
+            provider.assert_called_once_with()
+            paths.assert_called_with(self.root, self.md5)
+            cached.assert_called_once_with(account_root=self.root, emoji_md5=self.md5,
+                                           cache_key=b"synthetic-key", declared_size=len(self.png))
+            fetch.assert_not_called()
+
+    def test_monthly_emoji_key_failure_keeps_other_media_and_permitted_cdn_available(self):
+        self.add_image()
+        url = "https://emoji.qpic.cn/synthetic-cache-fallback"
+        self.messages.execute(f"INSERT INTO {self.table} VALUES (2,102,47,?)", (
+            f'<msg><emoji md5="{self.md5}" len="{len(self.png)}" cdnurl="{url}"/></msg>',))
+        failure = ProductError("helper_emoticon_cache_key_unavailable", diagnosticCode="bound_account_not_logged_in")
+        with (
+            patch.object(self.reader, "_emoticon_cache_key_provider", create=True,
+                         side_effect=failure) as provider,
+            patch("wechat_media.emoji_cache_paths", create=True, return_value=[self.root / "monthly-cache"]),
+            patch("wechat_media.open_cached_emoji_media", create=True),
+            patch("wechat_media.fetch_emoji_media", return_value=LocalMedia(
+                self.png, "emoji.png", "image/png", "original", source="remote")) as fetch,
+        ):
+            self.assertEqual(self.png, self.reader.open_locator(self.locator("image")))
+            provider.assert_not_called()
+            with self.assertRaises(ProductError) as caught:
+                self.reader.open_locator(self.locator("emoji", 2, 102))
+            self.assertIs(caught.exception, failure)
+            fetch.assert_not_called()
+            self.assertEqual(self.png, self.reader.open_locator(self.locator("emoji", 2, 102), allow_remote=True))
             fetch.assert_called_once_with(emoji_md5=self.md5, native_url=url, declared_size=len(self.png))
 
     def test_media_keys_use_only_the_current_identity_scoped_fields(self):

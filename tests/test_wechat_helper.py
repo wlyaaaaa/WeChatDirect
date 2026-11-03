@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -103,6 +104,62 @@ class HelperTests(unittest.TestCase):
         self.settings["state_root"].mkdir()
         self.session = helper.HelperSession(self.settings, account="primary", expected_wxid=WXID,
                                             expected_sha256=COMMITMENT, module=self.module)
+
+    def test_cache_key_reader_checks_identity_and_fingerprint_without_service(self):
+        runtime = self.settings["state_root"] / "runtime"
+        (runtime / "native").mkdir(parents=True)
+        (runtime / "native" / "compatibility.json").write_text("{}", encoding="utf-8")
+        settings = {**self.settings, "runtime_path": runtime}
+        core = (4096, "synthetic-weixin.dll")
+        native = mock.Mock()
+        native.find_account_process.return_value = 123
+        native.modules.return_value = {"weixin.dll": core}
+        native.inspect_account.return_value = WXID
+        native._inspect_identity.side_effect = lambda pid, read, **kw: read(None, core[0])
+        probe = SimpleNamespace(__file__=runtime / "native" / "run_selftest.py",
+                                compatible_core=mock.Mock(return_value={"matched": True}))
+        cache = SimpleNamespace(__file__=runtime / "wxbot_framework" / "emoticon_account.py",
+                                read_emoticon_cache_key=mock.Mock(return_value=b"synthetic-key-16"))
+        modules = {"run_selftest": probe, "wxbot_framework.emoticon_account": cache}
+        with mock.patch.object(helper, "native_module", return_value=native), \
+                mock.patch.object(helper.importlib, "import_module", side_effect=modules.__getitem__):
+            self.assertEqual(helper.read_emoticon_cache_key(
+                settings, expected_wxid=WXID, expected_sha256=COMMITMENT), b"synthetic-key-16")
+            native.NativeTextService.assert_not_called()
+            for fault in ("commitment", "fingerprint", "identity_before", "identity_after", "core_after"):
+                with self.subTest(fault=fault):
+                    native.inspect_account.side_effect = None
+                    native.modules.side_effect = None
+                    probe.compatible_core.return_value = None if fault == "fingerprint" else {}
+                    if fault.startswith("identity"):
+                        native.inspect_account.side_effect = (["wxid_other"] if fault.endswith("before")
+                                                             else [WXID, "wxid_other"])
+                    if fault == "core_after":
+                        native.modules.side_effect = [{"weixin.dll": core}, {"weixin.dll": (8192, core[1])}]
+                    with self.assertRaises(helper.HelperError):
+                        helper.read_emoticon_cache_key(settings, expected_wxid=WXID,
+                            expected_sha256="sha256:" + "0" * 64 if fault == "commitment" else COMMITMENT)
+            native.NativeTextService.assert_not_called()
+
+    def test_reader_cache_key_callback_is_lazy_and_retains_fixed_errors(self):
+        account = {"config_path": "unused", "local_state_path": "unused",
+                   "expected_moments_author_sha256": COMMITMENT,
+                   "expected_source_identity_sha256": "sha256:" + "a" * 64}
+        reader = mock.Mock(account_identity_commitment="a" * 64)
+        with mock.patch.object(cli, "DirectWeChatReader", return_value=reader) as build, \
+                mock.patch.object(cli, "_plaintext_cache_setting", return_value=None), \
+                mock.patch.object(cli, "_helper_emoji_cache_key", return_value=b"synthetic-key-16") as key:
+            self.assertIs(cli._reader(account, 123), reader)
+            key.assert_not_called()
+            self.assertEqual(build.call_args.kwargs["emoticon_cache_key_provider"](), b"synthetic-key-16")
+        with mock.patch.object(cli, "_helper_config_path", return_value=Path("synthetic")), \
+                mock.patch.object(helper, "load_settings", return_value=self.settings), \
+                mock.patch.object(cli, "_helper_expected_identity", return_value=WXID), \
+                mock.patch.object(helper, "read_emoticon_cache_key", side_effect=helper.HelperError(
+                    "helper_emoticon_cache_key_unavailable", diagnosticCode="native_core_fingerprint_mismatch")):
+            with self.assertRaises(cli.ProductError) as caught:
+                cli._helper_emoji_cache_key(account)
+            self.assertEqual(caught.exception.details["diagnosticCode"], "native_core_fingerprint_mismatch")
 
     def test_wrong_native_identity_blocks_before_start(self):
         self.module.account = "wxid_other"

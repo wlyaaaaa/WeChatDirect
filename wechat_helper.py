@@ -108,6 +108,46 @@ def _identity_hash(value):
     return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def read_emoticon_cache_key(settings, *, expected_wxid, expected_sha256) -> bytes:
+    """Read this logged-in account's cache key without constructing a service."""
+    if not hmac.compare_digest(_identity_hash(expected_wxid), expected_sha256):
+        raise HelperError("helper_account_identity_mismatch")
+    stage = "load_cache_key_reader"
+    try:
+        module = native_module(settings)
+        runtime = settings["runtime_path"].resolve()
+        probe = importlib.import_module("run_selftest")
+        cache_reader = importlib.import_module("wxbot_framework.emoticon_account")
+        if (Path(probe.__file__).resolve() != runtime / "native" / "run_selftest.py"
+                or Path(cache_reader.__file__).resolve() != runtime / "wxbot_framework" / "emoticon_account.py"):
+            raise HelperError("helper_runtime_module_conflict")
+        stage = "select_process"
+        pid = module.find_account_process(expected_wxid)
+        core = module.modules(pid).get("weixin.dll")
+        if not core:
+            raise HelperError("helper_emoticon_cache_key_unavailable", diagnosticCode="native_core_not_loaded")
+        stage = "verify_core_fingerprint"
+        baseline = json.loads((runtime / "native" / "compatibility.json").read_text(encoding="utf-8"))
+        if probe.compatible_core(core[1], baseline) is None:
+            raise HelperError("helper_emoticon_cache_key_unavailable", diagnosticCode="native_core_fingerprint_mismatch")
+        if module.inspect_account(pid) != expected_wxid:
+            raise HelperError("helper_account_identity_mismatch")
+        stage = "read_emoticon_cache_key"
+        key = module._inspect_identity(
+            pid, lambda read, base: cache_reader.read_emoticon_cache_key(
+                read, base, expected_account=expected_wxid), expected_core=core,
+        )
+        if module.inspect_account(pid) != expected_wxid or module.modules(pid).get("weixin.dll") != core:
+            raise HelperError("helper_account_identity_mismatch")
+        if not isinstance(key, bytes) or len(key) != 16:
+            raise HelperError("helper_emoticon_cache_key_unavailable")
+        return key
+    except HelperError:
+        raise
+    except Exception as exc:
+        raise HelperError("helper_emoticon_cache_key_unavailable", **_diagnostics(exc, stage)) from exc
+
+
 def _target(value):
     if not isinstance(value, str) or not NATIVE_ID.fullmatch(value):
         raise HelperError("helper_native_target_required")

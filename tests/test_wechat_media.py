@@ -4,18 +4,24 @@ import isolation  # noqa: F401
 
 import hashlib
 import io
+import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 
 from PIL import Image
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from wechat_media import (
     EmojiStoreRecord,
     LocalMedia,
+    emoji_cache_paths,
     fetch_emoji_media,
+    open_cached_emoji_media,
     open_emoji_media,
 )
 
@@ -63,6 +69,69 @@ class _FakeOpener:
 
 
 class EmojiMediaTests(unittest.TestCase):
+    def test_monthly_cache_decrypts_only_verified_message_bytes(self):
+        key = b"synthetic-key-16"
+        md5 = hashlib.md5(GIF, usedforsecurity=False).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for month in ("2026-10", "2026-11"):
+                source = root / "cache" / month / "Emoticon" / md5[:2] / md5
+                source.parent.mkdir(parents=True)
+                padder = padding.PKCS7(128).padder()
+                padded = padder.update(GIF) + padder.finalize()
+                encryptor = Cipher(algorithms.AES(key), modes.CBC(key)).encryptor()
+                source.write_bytes(encryptor.update(padded) + encryptor.finalize())
+            self.assertIn("2026-11", str(emoji_cache_paths(root, md5)[0]))
+            wrong_md5_path = root / "cache" / "2026-11" / "Emoticon" / "00" / ("0" * 32)
+            wrong_md5_path.parent.mkdir(parents=True)
+            wrong_md5_path.write_bytes(source.read_bytes())
+            media = open_cached_emoji_media(account_root=root, emoji_md5=md5,
+                                            cache_key=key, declared_size=len(GIF))
+            self.assertEqual(media, LocalMedia(GIF, "emoji.gif", "image/gif", "original"))
+            for wrong_key, wrong_md5, size in ((b"wrong-key-16byte", md5, len(GIF)),
+                                                (key, "0" * 32, len(GIF)),
+                                                (key, md5, len(GIF) + 1)):
+                with self.subTest(key=wrong_key == key, md5=wrong_md5 == md5, size=size):
+                    self.assertIsNone(open_cached_emoji_media(
+                        account_root=root, emoji_md5=wrong_md5, cache_key=wrong_key,
+                        declared_size=size))
+            # A correct MD5 and padding cannot make non-visual bytes an image.
+            invalid = b"not-a-gif"
+            bad_md5 = hashlib.md5(invalid, usedforsecurity=False).hexdigest()
+            bad = root / "cache" / "2026-11" / "Emoticon" / bad_md5[:2] / bad_md5
+            bad.parent.mkdir(parents=True, exist_ok=True)
+            padder = padding.PKCS7(128).padder()
+            encryptor = Cipher(algorithms.AES(key), modes.CBC(key)).encryptor()
+            bad.write_bytes(encryptor.update(padder.update(invalid) + padder.finalize()) + encryptor.finalize())
+            self.assertIsNone(open_cached_emoji_media(account_root=root, emoji_md5=bad_md5, cache_key=key))
+
+    def test_monthly_cache_never_reads_another_account_or_invalid_md5(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            primary = root / "primary"
+            primary.mkdir()
+            source = root / "secondary" / "cache" / "2026-11" / "Emoticon" / "aa" / EMOJI_MD5
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"private-other-account")
+            with patch.object(Path, "open", side_effect=AssertionError("must not read bytes")):
+                self.assertEqual(emoji_cache_paths(primary, EMOJI_MD5), ())
+                self.assertEqual(emoji_cache_paths(primary, "../" + EMOJI_MD5), ())
+                self.assertIsNone(open_cached_emoji_media(
+                    account_root=primary, emoji_md5=EMOJI_MD5, cache_key=b"synthetic-key-16"))
+            (primary / "cache").mkdir()
+            junction = primary / "cache" / "2026-11"
+            if os.name == "nt":
+                linked = subprocess.run(["cmd", "/c", "mklink", "/J", str(junction),
+                                         str(source.parents[2])], capture_output=True)
+                self.assertEqual(linked.returncode, 0, linked.stderr)
+            else:
+                junction.symlink_to(source.parents[2], target_is_directory=True)
+            try:
+                with patch.object(Path, "open", side_effect=AssertionError("must not follow another account")):
+                    self.assertEqual(emoji_cache_paths(primary, EMOJI_MD5), ())
+            finally:
+                junction.rmdir() if os.name == "nt" else junction.unlink()
+
     def _nonstore_path(self, root: Path, *, thumb: bool = False) -> Path:
         base = root / "business" / "emoticon"
         if thumb:

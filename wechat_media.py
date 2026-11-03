@@ -182,6 +182,71 @@ def open_emoji_media(
     )
 
 
+def emoji_cache_paths(account_root: Path | str, emoji_md5: str) -> tuple[Path, ...]:
+    """Locate only this account's exact MD5 files in native monthly caches."""
+    md5 = _normalize_md5(emoji_md5)
+    if md5 is None:
+        return ()
+    try:
+        root = Path(account_root).resolve(strict=True)
+        cache = root / "cache"
+        cache.resolve(strict=True).relative_to(root)
+        months = sorted(
+            (item for item in cache.iterdir()
+             if re.fullmatch(r"\d{4}-(?:0[1-9]|1[0-2])", item.name)),
+            key=lambda item: item.name, reverse=True,
+        )
+    except (OSError, ValueError):
+        return ()
+    result = []
+    for month in months:
+        try:
+            candidate = (month / "Emoticon" / md5[:2] / md5).resolve(strict=True)
+            candidate.relative_to(root)
+            if candidate.is_file():
+                result.append(candidate)
+        except (OSError, ValueError):
+            continue
+    return tuple(result)
+
+
+def open_cached_emoji_media(
+    *, account_root: Path | str, emoji_md5: str, cache_key: bytes,
+    declared_size: int | None = None,
+) -> LocalMedia | None:
+    """Decrypt one native monthly cache item and verify its message-bound hash."""
+    from cryptography.hazmat.primitives import padding
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    md5 = _normalize_md5(emoji_md5)
+    limit = _remote_size_limit(declared_size)
+    if md5 is None or limit is None or not isinstance(cache_key, bytes) or len(cache_key) != 16:
+        return None
+    cipher_limit = (limit // 16 + 1) * 16
+    for candidate in emoji_cache_paths(account_root, md5):
+        try:
+            if not 0 < candidate.stat().st_size <= cipher_limit:
+                continue
+            with candidate.open("rb") as source:
+                encrypted = source.read(cipher_limit + 1)
+            if not encrypted or len(encrypted) > cipher_limit or len(encrypted) % 16:
+                continue
+            decryptor = Cipher(algorithms.AES(cache_key), modes.CBC(cache_key)).decryptor()
+            padded = decryptor.update(encrypted) + decryptor.finalize()
+            unpadder = padding.PKCS7(128).unpadder()
+            payload = unpadder.update(padded) + unpadder.finalize()
+        except (OSError, ValueError):
+            continue
+        if (not 0 < len(payload) <= limit
+                or declared_size is not None and len(payload) != declared_size
+                or hashlib.md5(payload, usedforsecurity=False).hexdigest() != md5):
+            continue
+        media = _as_local_media(payload, quality="original", aes_key=None, decode_blob=None)
+        if media is not None:
+            return media
+    return None
+
+
 def _open_nonstore_emoji(
     root: Path,
     emoji_md5: str,

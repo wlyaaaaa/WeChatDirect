@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import isolation  # noqa: F401
 
+from contextlib import contextmanager
 import hashlib
 import hmac
 from pathlib import Path
@@ -165,6 +166,111 @@ class SourceFingerprintTests(unittest.TestCase):
 
 
 class ExactIdentityAndMediaTests(unittest.TestCase):
+    @contextmanager
+    def _zero_server_voice(self, rows=None, *, local_index=True):
+        with tempfile.TemporaryDirectory() as temporary:
+            storage = Path(temporary)
+            message_source, voice_source = storage / "message_0.db", storage / "media_0.db"
+            message_source.touch()
+            connection = sqlite3.connect(voice_source)
+            connection.executescript(
+                "CREATE TABLE Name2Id(user_name TEXT);"
+                "CREATE INDEX idx_name ON Name2Id(user_name);"
+                "INSERT INTO Name2Id(rowid,user_name) VALUES(1,'filehelper'),(2,'other');"
+                "CREATE TABLE VoiceInfo(chat_name_id INTEGER,create_time INTEGER,local_id INTEGER,"
+                "svr_id INTEGER,voice_data BLOB,data_index TEXT);"
+                "CREATE INDEX idx_server ON VoiceInfo(chat_name_id,svr_id);"
+            )
+            if local_index:
+                connection.execute("CREATE UNIQUE INDEX idx_local ON VoiceInfo(chat_name_id,create_time,local_id,data_index)")
+            connection.executemany("INSERT INTO VoiceInfo VALUES(?,?,?,?,?,?)", rows if rows is not None else [
+                (1, 1700000000, 7, 0, b"\x02#!SILK_V3synthetic", "0")])
+            connection.commit()
+            connection.close()
+            messages = sqlite3.connect(":memory:")
+            messages.row_factory = sqlite3.Row
+            message = messages.execute(
+                "SELECT 34 AS local_type,7 AS local_id,9 AS server_id,1700000000 AS create_time"
+            ).fetchone()
+            reader = self._plain_reader(storage)
+            try:
+                yield reader, message, message_source, voice_source
+            finally:
+                messages.close()
+                self._close(reader)
+
+    def test_zero_server_voice_opens_without_resource_and_server_match_has_priority(self):
+        with self._zero_server_voice() as (reader, message, source, voice_source):
+            media = reader._media_entries(message, "filehelper", source, "Msg_test", [])
+            locator = media[0]["locator"]
+            self.assertTrue(media[0]["openable"])
+            self.assertEqual(reader.open_locator(locator), b"\x02#!SILK_V3synthetic")
+            self.assertEqual(reader.resolve_locator(locator)["size"], len(b"\x02#!SILK_V3synthetic"))
+            payload = reader._decode_locator(locator)
+            self.assertEqual((payload["voice_server_id"], payload["voice_create_time"]), (0, 1700000000))
+            sibling = sqlite3.connect(voice_source.with_name("media_1.db"))
+            reader._open(voice_source).backup(sibling)
+            sibling.execute("UPDATE VoiceInfo SET svr_id=9,voice_data=?", (b"server-first",))
+            sibling.commit()
+            sibling.close()
+            preferred = reader._media_entries(message, "filehelper", source, "Msg_test", [])
+            self.assertEqual(reader.open_locator(preferred[0]["locator"]), b"server-first")
+
+    def test_zero_server_voice_rejects_other_message_and_conflicting_server_match(self):
+        payload = b"\x02#!SILK_V3synthetic"
+        good = (1, 1700000000, 7, 0, payload, "0")
+        cases = [
+            [(2, 1700000000, 7, 0, payload, "0")],
+            [(1, 1700000001, 7, 0, payload, "0")],
+            [(1, 1700000000, 8, 0, payload, "0")],
+            [(1, 1700000000, 7, 17, payload, "0")],
+            [good, (1, 1700000000, 8, 9, payload, "0")],
+        ]
+        for rows in cases:
+            with self.subTest(rows=rows), self._zero_server_voice(rows) as (reader, message, source, _voice):
+                media = reader._media_entries(message, "filehelper", source, "Msg_test", [])
+                self.assertIsNone(media[0]["openable"])
+                self.assertTrue(media[0]["exact_lookup_unavailable"])
+
+    def test_zero_server_voice_ambiguity_missing_schema_and_index_stay_unprocessed(self):
+        first = (1, 1700000000, 7, 0, b"\x02#!SILK_V3synthetic", "0")
+        for mode in ("segments", "index", "schema"):
+            rows = [first, (*first[:-1], "1")] if mode == "segments" else [first]
+            with self.subTest(mode=mode), self._zero_server_voice(rows, local_index=mode == "segments") as fixture:
+                reader, message, source, voice_source = fixture
+                if mode == "schema":
+                    reader._open(voice_source).execute("ALTER TABLE VoiceInfo DROP COLUMN create_time")
+                media = reader._media_entries(message, "filehelper", source, "Msg_test", [])
+                self.assertIsNone(media[0]["openable"])
+                self.assertEqual(media[0]["processing_state"], "unprocessed")
+
+    def test_zero_server_voice_locator_rejects_changed_source_identity(self):
+        for column, value in (("create_time", 1700000001), ("local_id", 8), ("svr_id", 99), ("chat_name_id", 2)):
+            with self.subTest(column=column), self._zero_server_voice() as (reader, message, source, voice_source):
+                locator = reader._media_entries(message, "filehelper", source, "Msg_test", [])[0]["locator"]
+                reader._open(voice_source).execute(f"UPDATE VoiceInfo SET {column}=?", (value,))
+                for consumer in (reader.resolve_locator, reader.open_locator):
+                    with self.assertRaisesRegex(DirectSchemaError, "voice locator no longer resolves"):
+                        consumer(locator)
+
+    def test_zero_server_voice_locator_rejects_new_matching_rows(self):
+        for mode in ("segment", "sibling", "server"):
+            with self.subTest(mode=mode), self._zero_server_voice() as (reader, message, source, voice_source):
+                locator = reader._media_entries(message, "filehelper", source, "Msg_test", [])[0]["locator"]
+                connection = reader._open(voice_source)
+                if mode == "sibling":
+                    sibling = sqlite3.connect(voice_source.with_name("media_1.db"))
+                    connection.backup(sibling)
+                    sibling.close()
+                else:
+                    connection.execute(
+                        "INSERT INTO VoiceInfo SELECT chat_name_id,create_time,local_id,?,voice_data,'1' FROM VoiceInfo",
+                        (9 if mode == "server" else 0,),
+                    )
+                for consumer in (reader.resolve_locator, reader.open_locator):
+                    with self.assertRaisesRegex(DirectSchemaError, "^voice locator no longer resolves$"):
+                        consumer(locator)
+
     @staticmethod
     def _plain_reader(storage: Path) -> DirectWeChatReader:
         reader = object.__new__(DirectWeChatReader)

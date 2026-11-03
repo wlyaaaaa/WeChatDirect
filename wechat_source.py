@@ -25,7 +25,7 @@ import struct
 from wechat_storage import ScratchDirectory, open_source_read
 import time
 import unicodedata
-from typing import Any, BinaryIO, Iterable, Iterator, Mapping, Sequence
+from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping, Sequence
 from urllib.parse import quote
 import xml.etree.ElementTree as ET
 
@@ -1486,6 +1486,7 @@ class DirectWeChatReader:
         snapshot_cutoff_s: int | None = None,
         expected_self_username_sha256: str | None = None,
         plaintext_cache_root: Path | str | None = None,
+        emoticon_cache_key_provider: Callable[[], bytes] | None = None,
     ):
         account_root, master_hex, identity = load_direct_source_identity(
             config_path, local_state_path
@@ -1498,6 +1499,7 @@ class DirectWeChatReader:
         self._master_hex = master_hex
         self._identity = identity
         self._expected_self_username_sha256 = expected_self_username_sha256
+        self._emoticon_cache_key_provider = emoticon_cache_key_provider
         self.account_identity_commitment = hashlib.sha256(
             identity.encode("utf-8")
         ).hexdigest()
@@ -2815,8 +2817,15 @@ class DirectWeChatReader:
         session_id: str,
         server_id: object,
         message_source: Path,
+        local_id: object = None,
+        create_time: object = None,
+        _local_lookup: bool = False,
     ) -> tuple[list[dict[str, Any]], bool]:
         if server_id in (None, 0, "0"):
+            return [], False
+        if _local_lookup and (
+            _valid_sender_key(local_id) is None or _valid_sender_key(create_time) is None
+        ):
             return [], False
         result: list[dict[str, Any]] = []
         candidates = sorted(message_source.parent.glob("media_*.db"))
@@ -2838,7 +2847,8 @@ class DirectWeChatReader:
                 voice_index = self._index_with_leading_columns(
                     connection,
                     "VoiceInfo",
-                    ("chat_name_id", "svr_id"),
+                    ("chat_name_id", "create_time", "local_id")
+                    if _local_lookup else ("chat_name_id", "svr_id"),
                 )
                 chat_index = self._index_with_leading_columns(
                     connection, "Name2Id", ("user_name",)
@@ -2861,15 +2871,20 @@ class DirectWeChatReader:
                 if not chat_rowids:
                     continue
                 quoted_index = _quote_identifier(voice_index)
+                voice_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(VoiceInfo)")}
+                time_column = "create_time" if "create_time" in voice_columns else "NULL"
+                predicate = "chat_name_id=? AND svr_id=? "
+                if _local_lookup:
+                    predicate = "chat_name_id=? AND create_time=? AND local_id=? AND svr_id=0 "
                 source_voices: list[sqlite3.Row] = []
                 for chat_rowid in chat_rowids:
                     source_voices.extend(
                         connection.execute(
                             "SELECT rowid, chat_name_id, local_id, svr_id, "
-                            "length(voice_data) AS size FROM VoiceInfo INDEXED BY "
-                            f"{quoted_index} WHERE chat_name_id=? AND svr_id=? "
+                            f"length(voice_data) AS size, {time_column} FROM VoiceInfo INDEXED BY "
+                            f"{quoted_index} WHERE {predicate}"
                             "AND voice_data IS NOT NULL AND length(voice_data)>0",
-                            (chat_rowid, server_id),
+                            (chat_rowid, create_time, local_id) if _local_lookup else (chat_rowid, server_id),
                         )
                     )
                 source_voices.sort(key=lambda item: int(item[0]))
@@ -2884,13 +2899,19 @@ class DirectWeChatReader:
                             "server_id": (
                                 str(voice[3])
                                 if voice[3] not in (None, 0, "0")
-                                else None
+                                else voice[3]
                             ),
                             "size": int(voice[4] or 0),
+                            "create_time": voice[5],
                         }
                     )
             except sqlite3.DatabaseError:
                 uncertain_candidate = True
+        if not result and verified_candidate and not uncertain_candidate and not _local_lookup:
+            return self._exact_voice_rows(
+                session_id=session_id, server_id=server_id, message_source=message_source,
+                local_id=local_id, create_time=create_time, _local_lookup=True,
+            ) if local_id is not None and create_time is not None else ([], True)
         result.sort(
             key=lambda item: (
                 str(item["database"]),
@@ -2970,6 +2991,8 @@ class DirectWeChatReader:
                 session_id=session_id,
                 server_id=server_id,
                 message_source=message_source,
+                local_id=local_id,
+                create_time=row["create_time"] if "create_time" in row.keys() else None,
             )
             if not voice_lookup_available:
                 return exact_lookup_unavailable("voice_exact_lookup_unavailable")
@@ -2983,7 +3006,14 @@ class DirectWeChatReader:
                 or expected_server is None
                 or expected_type != 34
                 or _valid_sender_key(voice.get("local_id")) != expected_local
-                or _valid_sender_key(voice.get("server_id")) != expected_server
+                or (
+                    _valid_sender_key(voice.get("server_id")) != expected_server
+                    and not (
+                        voice.get("server_id") in (0, "0")
+                        and "create_time" in row.keys()
+                        and voice.get("create_time") == row["create_time"]
+                    )
+                )
             ):
                 return exact_lookup_unavailable("voice_exact_lookup_identity_mismatch")
             locator_payload = {
@@ -2996,6 +3026,10 @@ class DirectWeChatReader:
                 "voice_chat_id": voice["chat_id"],
                 "voice_session": voice["session_id"],
             }
+            if voice.get("create_time") is not None:
+                locator_payload["voice_create_time"] = voice["create_time"]
+            if voice["server_id"] in (0, "0"):
+                locator_payload["voice_message_server_id"] = server_id
             return [
                 {
                     "kind": "voice",
@@ -3276,7 +3310,7 @@ class DirectWeChatReader:
         return store, aes_key, native_url
 
     def _open_native_media(
-        self, payload: Mapping[str, Any], *, allow_remote: bool = False
+        self, payload: Mapping[str, Any], *, allow_remote: bool = False, materialize: bool = False
     ) -> Any:
         from wechat_image import decode_wechat_dat
         from wechat_media import (
@@ -3302,9 +3336,28 @@ class DirectWeChatReader:
                     data, aes_key=image_aes, xor_key=image_xor
                 ),
             )
-            if result is not None or not allow_remote or not native_url:
+            if result is not None:
                 return result
             declared = attributes.get("len")
+            cache_error = None
+            provider = getattr(self, "_emoticon_cache_key_provider", None)
+            if materialize and provider is not None:
+                from wechat_media import emoji_cache_paths, open_cached_emoji_media
+
+                if emoji_cache_paths(self._storage.parent, attributes["md5"]):
+                    try:
+                        result = open_cached_emoji_media(
+                            account_root=self._storage.parent, emoji_md5=attributes["md5"],
+                            cache_key=provider(), declared_size=int(declared) if declared and declared.isdigit() else None,
+                        )
+                    except Exception as exc:
+                        cache_error = exc
+                    if result is not None:
+                        return result
+            if not allow_remote or not native_url:
+                if cache_error is not None:
+                    raise cache_error
+                return None
             return fetch_emoji_media(
                 emoji_md5=attributes["md5"],
                 native_url=native_url,
@@ -3389,6 +3442,16 @@ class DirectWeChatReader:
                     "materializationSource": media.source,
                 }
             if payload.get("kind") == "emoji" and attributes is not None:
+                if getattr(self, "_emoticon_cache_key_provider", None) is not None:
+                    from wechat_media import emoji_cache_paths
+
+                    if emoji_cache_paths(self._storage.parent, attributes["md5"]):
+                        return {
+                            "openable": None, "materializable": True, "requiresNetwork": False,
+                            "requiresLiveAccount": True, "materializationSource": "local",
+                            "open_status": "not_requested", "processing_state": "unprocessed",
+                            "resolution_gap": "media_materialization_required",
+                        }
                 _, _, native_url = self._emoji_source(attributes)
                 if _is_native_emoji_cdn_url(native_url):
                     return {
@@ -3475,27 +3538,7 @@ class DirectWeChatReader:
         record = payload.get("record")
         kind = str(payload.get("kind") or "unknown")
         if record == "voice":
-            source = self._locator_source(payload.get("voice_database"))
-            connection = self._open(source)
-            try:
-                voice = connection.execute(
-                    "SELECT length(v.voice_data) AS size FROM VoiceInfo v "
-                    "JOIN Name2Id n ON n.rowid=v.chat_name_id "
-                    "WHERE v.rowid=? AND v.chat_name_id=? AND n.user_name=? "
-                    "AND v.local_id IS ? "
-                    "AND (? IS NULL OR CAST(v.svr_id AS TEXT)=?) "
-                    "AND v.voice_data IS NOT NULL AND length(v.voice_data)>0",
-                    (
-                        int(payload["voice_rowid"]),
-                        int(payload["voice_chat_id"]),
-                        str(payload["voice_session"]),
-                        payload.get("voice_local_id"),
-                        payload.get("voice_server_id"),
-                        str(payload.get("voice_server_id")),
-                    ),
-                ).fetchone()
-            except (KeyError, TypeError, ValueError, sqlite3.DatabaseError) as exc:
-                raise DirectSchemaError("voice locator cannot be resolved") from exc
+            voice = self._voice_locator_row(payload)
             if voice is None:
                 raise DirectSchemaError("voice locator no longer resolves")
             return {
@@ -3547,8 +3590,6 @@ class DirectWeChatReader:
             }
             voice_database = payload.get("voice_database")
             voice_rowid = payload.get("voice_rowid")
-            voice_server_id = payload.get("voice_server_id")
-            voice_local_id = payload.get("voice_local_id")
             voice_chat_id = payload.get("voice_chat_id")
             voice_session = payload.get("voice_session")
             if (
@@ -3558,27 +3599,7 @@ class DirectWeChatReader:
                 and voice_chat_id is not None
                 and voice_session is not None
             ):
-                voice_source = self._locator_source(voice_database)
-                voice_connection = self._open(voice_source)
-                try:
-                    voice = voice_connection.execute(
-                        "SELECT length(v.voice_data) AS size FROM VoiceInfo v "
-                        "JOIN Name2Id n ON n.rowid=v.chat_name_id "
-                        "WHERE v.rowid=? AND v.chat_name_id=? AND n.user_name=? "
-                        "AND v.local_id IS ? "
-                        "AND (? IS NULL OR CAST(v.svr_id AS TEXT)=?) "
-                        "AND v.voice_data IS NOT NULL",
-                        (
-                            int(voice_rowid),
-                            int(voice_chat_id),
-                            str(voice_session),
-                            voice_local_id,
-                            voice_server_id,
-                            str(voice_server_id),
-                        ),
-                    ).fetchone()
-                except (TypeError, ValueError, sqlite3.DatabaseError) as exc:
-                    raise DirectSchemaError("voice locator cannot be resolved") from exc
+                voice = self._voice_locator_row(payload)
                 if voice is None:
                     raise DirectSchemaError("voice locator no longer resolves")
                 result.update(
@@ -3630,12 +3651,42 @@ class DirectWeChatReader:
             }
         raise DirectSchemaError("media locator record type is unsupported")
 
+    def _voice_locator_row(self, payload: Mapping[str, Any], *, data: bool = False):
+        source = self._locator_source(payload.get("voice_database"))
+        if payload.get("voice_server_id") in (0, "0") and "voice_message_server_id" in payload:
+            rows, available = self._exact_voice_rows(
+                session_id=payload.get("voice_session"), server_id=payload["voice_message_server_id"],
+                message_source=source, local_id=payload.get("voice_local_id"),
+                create_time=payload.get("voice_create_time"),
+            )
+            if (not available or len(rows) != 1
+                    or (rows[0]["database"], rows[0]["rowid"]) != (payload["voice_database"], payload.get("voice_rowid"))):
+                raise DirectSchemaError("voice locator no longer resolves")
+        connection = self._open(source)
+        timestamp = payload.get("voice_create_time")
+        columns = "v.voice_data" if data else "length(v.voice_data) AS size"
+        time_clause = "AND v.create_time=? " if timestamp is not None else ""
+        try:
+            return connection.execute(
+                f"SELECT {columns} FROM VoiceInfo v "
+                "JOIN Name2Id n ON n.rowid=v.chat_name_id "
+                "WHERE v.rowid=? AND v.chat_name_id=? AND n.user_name=? "
+                "AND v.local_id IS ? AND (? IS NULL OR CAST(v.svr_id AS TEXT)=?) "
+                f"{time_clause}AND v.voice_data IS NOT NULL AND length(v.voice_data)>0",
+                (int(payload["voice_rowid"]), int(payload["voice_chat_id"]),
+                 str(payload["voice_session"]), payload.get("voice_local_id"),
+                 payload.get("voice_server_id"), str(payload.get("voice_server_id")),
+                 *((timestamp,) if timestamp is not None else ())),
+            ).fetchone()
+        except (KeyError, TypeError, ValueError, sqlite3.DatabaseError) as exc:
+            raise DirectSchemaError("voice locator cannot be resolved") from exc
+
     def open_locator(self, locator: str, *, allow_remote: bool = False) -> bytes:
         """Open one bound native media item; remote emoji reads require opt-in."""
 
         payload = self._decode_locator(locator)
         if payload.get("record") == "native_media":
-            media = self._open_native_media(payload, allow_remote=allow_remote)
+            media = self._open_native_media(payload, allow_remote=allow_remote, materialize=True)
             if media is None:
                 raise MediaNotOpenableError(
                     "bound native media is currently unavailable"
@@ -3660,27 +3711,7 @@ class DirectWeChatReader:
                 "media resource is not openable by the direct reader"
             )
         payload = self._decode_locator(locator)
-        source = self._locator_source(payload.get("voice_database"))
-        connection = self._open(source)
-        try:
-            row = connection.execute(
-                "SELECT v.voice_data FROM VoiceInfo v "
-                "JOIN Name2Id n ON n.rowid=v.chat_name_id "
-                "WHERE v.rowid=? AND v.chat_name_id=? AND n.user_name=? "
-                "AND v.local_id IS ? "
-                "AND (? IS NULL OR CAST(v.svr_id AS TEXT)=?) "
-                "AND v.voice_data IS NOT NULL AND length(v.voice_data)>0",
-                (
-                    int(payload["voice_rowid"]),
-                    int(payload["voice_chat_id"]),
-                    str(payload["voice_session"]),
-                    payload.get("voice_local_id"),
-                    payload.get("voice_server_id"),
-                    str(payload.get("voice_server_id")),
-                ),
-            ).fetchone()
-        except (KeyError, TypeError, ValueError, sqlite3.DatabaseError) as exc:
-            raise DirectSchemaError("voice locator cannot be opened") from exc
+        row = self._voice_locator_row(payload, data=True)
         if row is None or not isinstance(
             row["voice_data"], (bytes, bytearray, memoryview)
         ):
@@ -3718,115 +3749,13 @@ class DirectWeChatReader:
             kind = "file"
         if kind not in {"image", "voice", "video", "emoji", "file"}:
             return []
-        server_id = row["server_id"]
-        local_id = row["local_id"]
-        if exact_lookup_only or kind in {"image", "emoji", "video", "file"}:
-            return self._exact_media_entries(
-                row=row,
-                session_id=session_id,
-                message_source=message_source,
-                message_table=message_table,
-                kind=kind,
-            )
-        resources = (
-            self._resource_index().get(
-                ("session_server", session_id, str(server_id)), []
-            )
-            if server_id not in (None, 0, "0")
-            else []
+        return self._exact_media_entries(
+            row=row,
+            session_id=session_id,
+            message_source=message_source,
+            message_table=message_table,
+            kind=kind,
         )
-        if not resources and local_id not in (None, 0, "0"):
-            resources = self._resource_index().get(
-                ("session_local", session_id, str(local_id)), []
-            )
-        voices = (
-            self._voice_index().get(("session_server", session_id, str(server_id)), [])
-            if kind == "voice" and server_id not in (None, 0, "0")
-            else []
-        )
-        if kind == "voice" and not voices and local_id not in (None, 0, "0"):
-            voices = self._voice_index().get(
-                ("session_local", session_id, str(local_id)), []
-            )
-        if not resources:
-            locator = self._make_locator(
-                {
-                    "record": "message",
-                    "kind": kind,
-                    "message_database": message_source.relative_to(
-                        self._storage
-                    ).as_posix(),
-                    "message_table": message_table,
-                    "local_id": local_id,
-                    "server_id": server_id,
-                }
-            )
-            return [
-                {
-                    "kind": kind,
-                    "mediaId": str(server_id or f"{session_id}:{local_id}"),
-                    "locator": locator,
-                    "size": None,
-                    "openable": False,
-                    "open_status": "not_openable",
-                    "processing_state": "unprocessed",
-                    "resolution_gap": "resource_context_unproven",
-                }
-            ]
-
-        emitted_ids: set[str] = set()
-        media: list[dict[str, Any]] = []
-        for resource in resources:
-            detail_kind = _TYPE_NAMES.get(
-                _base_message_type(resource.get("resource_type")) or -1
-            )
-            if detail_kind not in {"image", "voice", "video", "emoji"}:
-                detail_kind = kind
-            native_id = str(
-                resource.get("resource_id")
-                or f"resource:{resource['info_rowid']}:{resource['detail_rowid']}"
-            )
-            if native_id in emitted_ids:
-                native_id = f"{native_id}:detail:{resource['detail_rowid']}"
-            emitted_ids.add(native_id)
-            locator_payload: dict[str, Any] = {
-                "record": "resource",
-                "kind": detail_kind,
-                "resource_database": resource["database"],
-                "resource_session": resource["session_id"],
-                "info_rowid": resource["info_rowid"],
-                "detail_rowid": resource["detail_rowid"],
-            }
-            item: dict[str, Any] = {
-                "kind": detail_kind,
-                "mediaId": native_id,
-                "locator": "",
-                "size": resource.get("size"),
-                "openable": False,
-                "open_status": "not_openable",
-                "processing_state": "unprocessed",
-            }
-            if detail_kind == "voice" and len(voices) == 1:
-                voice = voices[0]
-                locator_payload.update(
-                    voice_database=voice["database"],
-                    voice_rowid=voice["rowid"],
-                    voice_server_id=voice["server_id"],
-                    voice_local_id=voice["local_id"],
-                    voice_chat_id=voice["chat_id"],
-                    voice_session=voice["session_id"],
-                )
-                item.update(
-                    size=voice["size"],
-                    openable=True,
-                    open_status="openable",
-                    processing_state="available",
-                )
-            elif detail_kind == "voice":
-                item["resolution_gap"] = "voice_blob_missing_or_ambiguous"
-            item["locator"] = self._make_locator(locator_payload)
-            media.append(item)
-        return media
 
     @staticmethod
     def _message_row_identity(row: sqlite3.Row) -> tuple[str, str] | None:

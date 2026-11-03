@@ -238,6 +238,7 @@ def _reader(account: Mapping[str, str], cutoff_s: int) -> DirectWeChatReader:
         snapshot_cutoff_s=cutoff_s,
         expected_self_username_sha256=account["expected_moments_author_sha256"],
         plaintext_cache_root=_plaintext_cache_setting(),
+        emoticon_cache_key_provider=lambda: _helper_emoji_cache_key(account),
     )
     actual = "sha256:" + reader.account_identity_commitment
     expected = str(account["expected_source_identity_sha256"])
@@ -4794,6 +4795,19 @@ def _helper_expected_identity(account: Mapping[str, str]) -> str:
     if not hmac.compare_digest(_sha256(wxid.encode("utf-8")), account["expected_moments_author_sha256"]):
         raise ProductError("wechat_moments_identity_binding_mismatch")
     return wxid
+
+
+def _helper_emoji_cache_key(account: Mapping[str, str]) -> bytes:
+    import wechat_helper as helper
+
+    try:
+        settings = helper.load_settings(_helper_config_path())
+        return helper.read_emoticon_cache_key(
+            settings, expected_wxid=_helper_expected_identity(account),
+            expected_sha256=account["expected_moments_author_sha256"],
+        )
+    except helper.HelperError as exc:
+        raise ProductError(str(exc), **exc.details) from exc
 
 
 def _helper_target(args, config, config_path):

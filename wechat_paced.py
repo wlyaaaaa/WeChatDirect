@@ -10,8 +10,8 @@ import time
 
 CHARS_PER_MINUTE = 100.0
 FIRST_THINK_SECONDS = (6.0, 15.0)
-NEXT_THINK_SECONDS = (1.0, 3.0)
-EMOJI_SECONDS = 2.0  # picking one from the emoji panel
+NEXT_THINK_SECONDS = (0.5, 2.0)
+EMOJI_SECONDS = 1.5  # picking one from the emoji panel
 CHECK_LEAD_SECONDS = 2.0  # one local context read takes about this long
 _EMOJI = re.compile(r"\[[^\[\]]{1,6}\]")  # WeChat built-in emoji written as [name]
 

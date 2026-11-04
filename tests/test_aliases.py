@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import wechat_cli
 from test_contact_resolution import DirectoryReader, contact
-from test_wechat_cli import BinaryOutput
+from test_wechat_cli import BinaryOutput, FakeReader
 
 
 def entry(name="我的称呼", native_id="wxid-primary", account="primary"):
@@ -211,6 +211,47 @@ class AliasTests(unittest.TestCase):
         self.assertEqual(code, 0, result)
         self.assertEqual(result["contact"]["resolution"]["matchKind"], "alias")
         self.assertTrue(result["noChange"])
+
+    def test_default_contact_sync_alias_is_incremental_and_other_id_is_separate(self):
+        self.write(entry())
+        argv = ("sync-contact", "--account", "primary", "--contact")
+        fetch = FakeReader.fetch_messages
+        fingerprint = FakeReader.contact_source_fingerprint
+        with (
+            patch("wechat_cli._default_export_root", return_value=self.root / "exports"),
+            patch("wechat_cli._decode_voice_file", side_effect=lambda _source, output: output.write_bytes(b"wav-bytes")),
+            patch.object(DirectoryReader, "fetch_messages", lambda reader, _id, **kw: fetch(reader, f"wxid-{reader.label}", **kw)),
+            patch.object(DirectoryReader, "contact_source_fingerprint", lambda reader, _id: fingerprint(reader, f"wxid-{reader.label}")),
+        ):
+            code, first = self.main(*argv, "联系人primary")
+            self.assertEqual(code, 0, first)
+            code, second = self.main(*argv, "我的称呼")
+            self.assertEqual((code, second["output"], second["mode"]), (0, first["output"], "incremental"))
+            self.contacts["primary"].append(contact("wxid-other", "另一个人"))
+            code, other = self.main(*argv, "另一个人")
+            self.assertEqual((code, other["mode"], other["contact"]["nativeId"]), (0, "full", "wxid-other"))
+            self.assertNotEqual(other["output"], first["output"])
+
+    def test_default_contact_sync_reuses_largest_legacy_hash_archive(self):
+        self.write(entry())
+        argv = ("sync-contact", "--account", "primary", "--contact", "我的称呼")
+        fetch = FakeReader.fetch_messages
+        for old_count in (1, 2):
+            root = self.root / f"exports-{old_count}"
+            legacy = [root / "contacts" / ("auto" if old_count == 1 else "primary") / ("contact-" + wechat_cli.hashlib.sha256(wechat_cli._normalize_name(name).encode()).hexdigest()[:16]) for name in ("联系人primary", "我的称呼")]
+            with self.subTest(old_count=old_count), patch("wechat_cli._default_export_root", return_value=root), patch("wechat_cli._decode_voice_file", side_effect=lambda _source, output: output.write_bytes(b"wav-bytes")):
+                if old_count == 2:
+                    with patch.object(FakeReader, "fetch_messages", lambda reader, *a, **kw: {"messages": fetch(reader, *a, **kw)["messages"][:1]}):
+                        code, small = self.main(*argv, "--output", str(legacy[1]))
+                    self.assertEqual((code, small["totalMessages"]), (0, 1))
+                code, large = self.main(*argv, "--output", str(legacy[0]))
+                self.assertEqual((code, large["totalMessages"]), (0, 2))
+                code, result = self.main(*argv)
+                self.assertEqual(code, 0, result)
+                self.assertEqual(result["output"], str(legacy[0].resolve()))
+                self.assertEqual((result["mode"], result["totalMessages"]), ("incremental", 2))
+                self.assertTrue(result["existingArchiveReused"])
+                self.assertEqual(len(list(legacy[0].parent.iterdir())), old_count)
 
     def test_export_context_and_preserve_resolve_alias(self):
         self.write(entry())

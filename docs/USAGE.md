@@ -110,6 +110,8 @@ wechat-direct context --account auto --contact "<contact-or-group>" --contains "
 
 这是有界读取，不会先做全账号同步。`auto` 合并已配置账号的匹配，无法唯一定位时会停止并返回候选；称呼表有下节所述的默认私聊规则。结果包含消息、发送者方向、可影响含义的媒体关系和缺口。
 
+`messages[]` 每条消息的 `time` 是固定 `+08:00` 的 ISO 北京时间（缺少原生时间时为 `null`），原始 Unix 秒 `createTime` 保留；`time` 仅供展示，不参与消息或清单哈希，也不写入 `sync-contact` 存档。
+
 已知要找群时加 `--chat-type group`，只找私聊则加 `--chat-type private`（包含文件传输助手，不含公众号）。`context`、`export-context` 和 `preserve` 先查称呼表，再依次尝试完整名称或原生 ID、忽略空白和标点符号后的相等名称、不少于两字的部分名称、群成员称呼；每一层会合并所选账号的命中，有有效命中便停止。`sync-contact` 也接受称呼表和 `--chat-type`，之后只用完整名称或原生 ID、宽松相等名称两层，已有档案仍核对原绑定。
 
 非精确选中的 `contact.resolution` 会说明 `matchKind` 和原查询，按成员选群时还有 `matchedMembers`。重名会返回 `status=needs_choice` 和按最近时间排序的 `candidates`，最多列 20 个，更多时看 `candidateTotal`；群成员候选的 `memberCount` 是该群当前可见成员数。没找到时，`suggestions` 最多提供 5 个相似名称供重新选择，`similarity` 越接近 1 越相似，工具不会自动替你选。
@@ -190,6 +192,8 @@ wechat-direct sync-contact --account primary --contact "<contact-or-group>" --fu
 ```
 
 第一次只在全新空目录中为点名对象建立本机可见档案。已有匹配 `manifest.json` 和 `state.json` 的完成态档案时，重复同一命令才会使用来源指纹、游标和有界重叠窗口增量刷新；需要重新核对全部本地历史时，可再次显式使用 `--full-reconcile`。来源未变时仍核验已有档案、媒体和并发变化，但跳过整树复制、暂存副本验证和目录改名；有变化时先在同级事务目录完成构建和校验，再发布。正常失败保留原档案；硬中断使用下文 `recover-export` 检查和恢复。它不是逐消息断点续跑，也不是全账号同步或常驻任务。
+
+未指定 `--output` 时，默认目录为 `exports/contacts/<解析后的账号>/contact-<原生 ID 的 SHA-256 前 16 位>`，同一个联系人换微信名称或登记称呼仍用同一目录。默认目录不存在时，先查该账号目录及旧版 `auto` 目录下完成态档案的 `manifest.json`，沿用清单账号相同且 `contact.nativeId` 相同的目录；多个匹配时选 `messageCount` 最大的，并在结果中返回 `existingArchiveReused: true`；没有匹配才新建。显式 `--output` 的行为不变，沿用档案仍执行原有账号、身份绑定和完整性校验。
 
 说话人编号只在消息所在分片的 `Name2Id` 中解释；本人原生用户名按该账号既有用户名承诺匹配，不从账号目录后缀、昵称或其他数据库推断。主副账号、私聊和群聊共用此规则，消息 `serverId` 与 `nativeId.value` 始终以字符串返回，避免长整数精度丢失。
 

@@ -494,6 +494,15 @@ class WeChatCliTests(unittest.TestCase):
             patch("wechat_cli.time.time", return_value=200),
         ):
             result = wechat_cli._context_result(context_args())
+            output = BinaryOutput()
+            with patch.object(wechat_cli.sys, "stdout", output):
+                self.assertEqual(wechat_cli.command_context(context_args()), 0)
+            rendered = json.loads(output.buffer.getvalue())
+        self.assertEqual([message.pop("time") for message in rendered["messages"]], ["1970-01-01T08:01:40+08:00", "1970-01-01T08:01:50+08:00"])
+        self.assertEqual([message["createTime"] for message in rendered["messages"]], [100, 110])
+        self.assertEqual(rendered, result)
+        for message in rendered["messages"]:
+            self.assertEqual(message["messageSha256"], wechat_cli._sha256(wechat_cli._canonical_bytes({key: value for key, value in message.items() if key not in {"nativeId", "messageSha256", "sender", "_pageKey"}})))
         self.assertEqual(result["account"], "primary")
         self.assertEqual(result["actualVisibleCutoffS"], 110)
         self.assertEqual(result["historyScope"], "bounded_requested_window")

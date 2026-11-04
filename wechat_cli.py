@@ -1643,7 +1643,14 @@ def command_message_part(args: argparse.Namespace) -> int:
 
 
 def command_context(args: argparse.Namespace) -> int:
-    sys.stdout.buffer.write(_canonical_bytes(_context_result(args)))
+    result = _context_result(args)
+    # Display-only timestamps are added after both hashes have been sealed.
+    for message in result["messages"]:
+        message["time"] = (
+            _paced_moment(message["createTime"])
+            if message.get("createTime") is not None else None
+        )
+    sys.stdout.buffer.write(_canonical_bytes(result))
     return 0
 
 
@@ -2847,19 +2854,18 @@ def _verified_archive(output: Path) -> None:
 def _transactional_archive(function):
     @wraps(function)
     def invoke(args):
-        output = (
-            Path(args.output)
-            if args.output
-            else (
-                _default_moments_export_path(
-                    str(args.account),
-                    args.contact,
+        existing_archive_reused = False
+        if not args.output and function.__name__ == "command_sync_contact":
+            output, existing_archive_reused = _resolve_contact_export_path(args)
+        else:
+            output = (
+                Path(args.output)
+                if args.output
+                else _default_moments_export_path(
+                    str(args.account), args.contact,
                     self_requested=bool(getattr(args, "self", False)),
                 )
-                if function.__name__ == "command_sync_moments"
-                else _default_contact_export_path(str(args.account), str(args.contact))
             )
-        )
         output = output.absolute()
         stream = SimpleNamespace(buffer=io.BytesIO())
         copied = argparse.Namespace()
@@ -2900,6 +2906,8 @@ def _transactional_archive(function):
                     receipt = stage
                     receipt["output"] = str(output)
                     receipt["publication"] = "verified_existing_directory"
+                    if existing_archive_reused:
+                        receipt["existingArchiveReused"] = True
                     _write_json_atomic(output / "last-run.json", receipt)
                 else:
                     copied.output = str(stage)
@@ -2913,6 +2921,8 @@ def _transactional_archive(function):
                         raise ProductError("archive_result_invalid") from exc
                     receipt["output"] = str(output)
                     receipt["publication"] = "verified_staged_directory"
+                    if existing_archive_reused:
+                        receipt["existingArchiveReused"] = True
                     _write_json_atomic(stage / "last-run.json", receipt)
             sys.stdout.buffer.write(_canonical_bytes(receipt))
             return 0
@@ -3236,11 +3246,43 @@ def _ordered_messages(values: Mapping[str, Mapping[str, Any]]) -> list[dict[str,
     ]
 
 
-def _default_contact_export_path(account: str, contact_query: str) -> Path:
-    identity = hashlib.sha256(
-        _normalize_name(contact_query).encode("utf-8")
-    ).hexdigest()[:16]
+def _default_contact_export_path(account: str, native_id: str) -> Path:
+    identity = hashlib.sha256(native_id.encode("utf-8")).hexdigest()[:16]
     return _default_export_root() / "contacts" / account / ("contact-" + identity)
+
+
+def _resolve_contact_export_path(args: argparse.Namespace) -> tuple[Path, bool]:
+    config_path = _resolve_config_path(getattr(args, "config", None))
+    label, reader, contact = _resolve_contact(
+        _read_config(config_path), account=args.account, query=args.contact,
+        cutoff_s=int(time.time()), chat_type=getattr(args, "chat_type", None),
+        aliases_path=_aliases_path(config_path),
+    )
+    reader.close()
+    native_id = str(contact["nativeId"])
+    output = _default_contact_export_path(label, native_id)
+    if output.exists():
+        return output, False
+    candidates = []
+    legacy_roots = (output.parent, output.parent.parent / "auto")
+    for path in sorted(path for root in legacy_roots for path in root.glob("*/manifest.json")):
+        try:
+            manifest = _read_json(path) or {}
+        except (ProductError, UnicodeError):
+            continue
+        count = _nonnegative_int(manifest.get("messageCount"))
+        if (
+            manifest.get("format") == "wechat-direct-contact-export.v1"
+            and manifest.get("account") == label
+            and isinstance(manifest.get("contact"), Mapping)
+            and manifest["contact"].get("nativeId") == native_id
+            and (path.parent / "state.json").is_file()
+            and count is not None
+        ):
+            candidates.append((count, path.parent))
+    if candidates:
+        return max(candidates, key=lambda item: item[0])[1], True
+    return output, False
 
 
 def _sync_message_media(
@@ -3486,11 +3528,7 @@ def command_sync_contact(args: argparse.Namespace) -> int:
     config = _read_config(_resolve_config_path(getattr(args, "config", None)))
     aliases_path = _aliases_path(_resolve_config_path(getattr(args, "config", None)))
     aliases = _read_aliases(aliases_path)
-    output = (
-        Path(args.output)
-        if args.output
-        else _default_contact_export_path(str(args.account), str(args.contact))
-    ).resolve()
+    output = Path(args.output).resolve()
     if output.exists() and not output.is_dir():
         raise ProductError("sync_output_is_not_directory")
     state_path = output / "state.json"

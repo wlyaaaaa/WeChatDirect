@@ -5014,9 +5014,10 @@ def command_send_paced(args: argparse.Namespace) -> int:
         def newer(index):
             if target == "filehelper":
                 return []
-            # Before the first bubble, a message typed by hand also means the chat moved on.
+            # Manual self messages also move the chat on; exclude this group's own bubbles after the first.
             return [_paced_brief(message) for message in _paced_read(args, target, "--since", _paced_moment(since))
-                    if message["createTime"] > since and (index == 0 or message.get("senderRole") != "self")]
+                    if message["createTime"] > since and (index == 0 or message.get("senderRole") != "self"
+                                                         or message.get("content") not in args.bubble)]
 
         plan = paced.make_plan(args.bubble, chars_per_minute=args.cpm, next_think=args.think)
         first_at = max(now, start_at) + plan[0]["waitSeconds"]

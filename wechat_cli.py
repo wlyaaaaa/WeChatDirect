@@ -32,6 +32,8 @@ import unicodedata
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
+import wechat_paced as paced
+
 from wechat_source import (
     DirectWeChatReader,
     WeChatDirectError,
@@ -4927,10 +4929,117 @@ def command_helper(args: argparse.Namespace) -> int:
         raise ProductError(str(exc), **exc.details) from exc
 
 
+def _paced_moment(timestamp) -> str:
+    return datetime.fromtimestamp(timestamp, LOCAL_TIMEZONE).isoformat(timespec="seconds")
+
+
+def _paced_read(args, query, *window) -> list[dict[str, Any]]:
+    argv = ["context", "--account", args.account, "--contact", query, "--return-limit", "40",
+            "--byte-limit", "65536", *window]
+    if args.config:
+        argv += ["--config", args.config]
+    if args.chat_type:
+        argv += ["--chat-type", args.chat_type]
+    return _context_result(parser().parse_args(argv)).get("messages", [])
+
+
+def _paced_brief(message, now=None) -> dict[str, Any]:
+    brief = {"time": _paced_moment(message["createTime"]), "role": message.get("senderRole"),
+             "type": message.get("type"), "content": message.get("content")}
+    if now is not None:
+        brief["minutesAgo"] = round((now - message["createTime"]) / 60, 1)
+    return brief
+
+
+def _paced_timing(args, query, now) -> dict[str, Any]:
+    recent = _paced_read(args, query, "--lookback-days", "30")
+    other = [message for message in recent if message.get("senderRole") != "self"]
+    mine = [message for message in recent if message.get("senderRole") == "self"]
+    return {"now": _paced_moment(now),
+            "lastFromOther": _paced_brief(other[-1], now) if other else None,
+            "lastFromSelf": _paced_brief(mine[-1], now) if mine else None}
+
+
+def _paced_session(helper, args, config):
+    account = _account_config(config, args.account)
+    return helper.HelperSession(
+        helper.load_settings(_helper_config_path(args.helper_config)), account=args.account,
+        expected_wxid=_helper_expected_identity(account),
+        expected_sha256=account["expected_moments_author_sha256"],
+        voice_reader=lambda event: _helper_received_voice(account, event))
+
+
+def command_send_paced(args: argparse.Namespace) -> int:
+    import wechat_helper as helper
+
+    def finish(report, code=0):
+        sys.stdout.buffer.write(_canonical_bytes(report))
+        return code
+
+    try:
+        for bubble in args.bubble:
+            helper._text(bubble)
+        config_path = _resolve_config_path(args.config)
+        config = _read_config(config_path)
+        target = _helper_target(args, config, config_path)
+        since = _parse_time(args.since, default=0)
+        start_at = _parse_time(args.not_before, default=0)
+        now = time.time()
+
+        def newer(index):
+            if target == "filehelper":
+                return []
+            # Before the first bubble, a message typed by hand also means the chat moved on.
+            return [_paced_brief(message) for message in _paced_read(args, target, "--since", _paced_moment(since))
+                    if message["createTime"] > since and (index == 0 or message.get("senderRole") != "self")]
+
+        plan = paced.make_plan(args.bubble, chars_per_minute=args.cpm, first_think=args.first_think,
+                               next_think=args.think)
+        first_at = max(now, start_at) + plan[0]["waitSeconds"]
+        report = {"account": args.account, "target": target, **_paced_timing(args, target, now), "plan": plan,
+                  "firstBubbleAt": _paced_moment(first_at),
+                  "lastBubbleAt": _paced_moment(first_at + sum(step["waitSeconds"] for step in plan[1:]))}
+        moved = newer(0)
+        if moved:
+            return finish({**report, "status": "chat_moved", "new": moved, "sent": [], "unsent": args.bubble}, 2)
+        if not args.send:
+            return finish({**report, "status": "plan_only"})
+
+        session = _paced_session(helper, args, config)
+        time.sleep(max(0.0, start_at - time.time()))
+        started = time.time()
+        with redirect_stdout(sys.stderr):
+            try:
+                session.start()
+                result = paced.run_plan(
+                    plan, started_at=started, newer_messages=newer,
+                    send=lambda text: session.execute({"action": "send-text", "target": target, "text": text}))
+            finally:
+                cleanup = session.close()
+        for item in result["sent"]:
+            item["acceptedAt"] = _paced_moment(item["acceptedAt"])
+        sent_texts = [item["text"] for item in result["sent"]]
+        try:
+            back = _paced_read(args, target, "--since", _paced_moment(started - 5))
+            found = [_paced_brief(message) for message in back
+                     if message.get("senderRole") == "self" and message["createTime"] >= int(started) - 5
+                     and message.get("content") in sent_texts]
+            result["readback"] = found
+            result["readbackComplete"] = [item["content"] for item in found] == sent_texts
+            result["newAfterSend"] = [] if target == "filehelper" else [
+                _paced_brief(message) for message in back
+                if message["createTime"] > since and message.get("senderRole") != "self"]
+        except ProductError as exc:
+            result["readback"], result["readbackComplete"], result["readbackError"] = None, False, str(exc)
+        return finish({**report, **result, "cleanup": cleanup}, 0 if result["status"] == "sent" else 2)
+    except helper.HelperError as exc:
+        raise ProductError(str(exc), **exc.details) from exc
+
+
 def _add_helper_commands(commands):
     helper = commands.add_parser("helper", help="on-demand native sends and scoped live sessions")
     actions = helper.add_subparsers(dest="helper_action", required=True, parser_class=ReceiptArgumentParser)
-    action_names = ("status", "capabilities", "session", "send-text", "send-at-text", "send-image",
+    action_names = ("status", "capabilities", "session", "send-text", "send-paced", "send-at-text", "send-image",
                     "send-file", "send-emoticon", "send-voice", "receive", "friend-requests", "accept-friend",
                     "group-members", "invite-group-members", "create-group", "add-friend", "contacts",
                     "read-moments", "publish-moments", "interact-moments")
@@ -4952,6 +5061,15 @@ def _add_helper_commands(commands):
             target.add_argument("--target", help="explicit native WeChat ID or filehelper")
             target.add_argument("--contact", help="exact existing contact name or personal alias")
             command.add_argument("--chat-type", choices=("group", "private"))
+        if action == "send-paced":
+            command.set_defaults(handler=command_send_paced)
+            command.add_argument("--since", required=True, help="last message already read (ISO; naive values use Asia/Shanghai); anything newer stops the send")
+            command.add_argument("--bubble", action="append", required=True, help="one message bubble; repeat in order")
+            command.add_argument("--cpm", type=float, default=paced.CHARS_PER_MINUTE, help="typing speed in characters per minute")
+            command.add_argument("--first-think", type=float, nargs=2, default=paced.FIRST_THINK_SECONDS, help="seconds of thinking before the first bubble (min max)")
+            command.add_argument("--think", type=float, nargs=2, default=paced.NEXT_THINK_SECONDS, help="seconds of thinking before each later bubble (min max)")
+            command.add_argument("--not-before", help="start thinking and typing at this ISO time; naive values use Asia/Shanghai")
+            command.add_argument("--send", action="store_true", help="actually send; without it only print the plan")
         if action in {"send-text", "send-at-text"}:
             text = command.add_mutually_exclusive_group(required=True)
             text.add_argument("--text")

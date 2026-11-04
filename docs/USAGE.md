@@ -284,6 +284,16 @@ wechat-direct helper send-voice --account secondary --target filehelper --path "
 
 发送目标用显式原生 `--target`，或 `--contact` 精确名称/已登记称呼；后者复用原有解析，但拒绝宽松/部分匹配，不猜接收者。查群可加 `--chat-type group`。文本支持 `--text-file` UTF-8 文件，原生单条上限为 1023 UTF-8 字节，中文通常每字 3 字节；空文本、NUL 或超限返回结构化错误，不截断、不自动分段重发。AI 需要分段时自行按字节边界组织，并逐条解释结果。
 
+发给真人的文字用 `send-paced`，像打字很快的人那样一条一条发：
+
+```powershell
+wechat-direct helper send-paced --account secondary --contact "<称呼>" --since "<读到的最后一条的时间>" --bubble "第一条" --bubble "第二条"
+```
+
+不加 `--send` 只打印计划，不连原生服务（约 3 秒）：`now` 是现在几点，`lastFromOther`、`lastFromSelf` 是双方最后一条和过了多少分钟，`plan` 是每条的思考和打字秒数，`firstBubbleAt`、`lastBubbleAt` 是预计发出时间。默认每分钟 100 字，微信自带表情（如 `[旺柴]`）每个算 2 秒，第一条前思考 6–15 秒，之后每条前 1–3 秒；可用 `--cpm`、`--first-think`、`--think` 调整。加 `--not-before <时间>` 则到点才开始思考和打字，第一条发出时间是到点加这段时间；要等较久时放后台跑。
+
+确认后加 `--send`。整组共用一次原生连接，发送前和每条之间都读本机记录：`--since` 之后对方有新消息返回 `chat_moved` 和没发的 `unsent`；第一条发出前本人自己发了消息同样算。读不到记录返回 `check_failed`，不盲发。回执不明返回 `send_uncertain`，`uncertain` 是那一条，不自动重发。发完读回，结果在 `readback`、`readbackComplete`，发送期间对方的新消息在 `newAfterSend`。`filehelper` 不做新消息检查，可用来试样子。
+
 若已登记称呼失效，`--contact` 不会沿同名联系人继续发送，而在启动原生服务前返回 `helper_stale_alias_requires_resolution`；应先核对并显式指定 `--target`，或修复称呼后再执行。正常精确名称、仍有效的称呼及显式 `--target` 保持可用，不自动修改或删除称呼。
 
 图片与动态 GIF 表情分别对应 `send-image` 和 `send-emoticon`。文件、语音沿用上游 `prepare_file`/`prepare_voice` 的上下文快照和清理，不直接绕过媒体生命周期。语音支持 Tencent SILK；单声道 16-bit PCM WAV 要求上游可选编码器 `pysilk`（发行包 `silk-python`），缺少时明确报错，可先用已有的 Python 3.11/pilk 路线转为 SILK。现有阅读端语音解码配置不会自动变成 helper 的 WAV 编码器。

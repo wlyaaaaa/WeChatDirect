@@ -27,6 +27,38 @@ class WaitTests(unittest.TestCase):
         result = self.run_wait(lambda _t: [{"is_self": False}])
         self.assertEqual((result["status"], result["waitedSeconds"]), ("new_messages", 61))
 
+    def test_owner_reply_cancels_until_other_speaks_again(self):
+        for events, expected in (
+                ({1001: [False], 1002: [True]}, ("timed_out", 60)),
+                ({1001: [False], 1002: [True], 1003: [False]}, ("new_messages", 18)),
+                ({1001: [True, False]}, ("new_messages", 16)),
+                ({1001: [False, True]}, ("timed_out", 60)),
+                ({1001: [None]}, ("new_messages", 16))):
+            with self.subTest(events=events):
+                result = self.run_wait(lambda t: [{"is_self": role} if role is not None else {}
+                                                 for role in events.get(t, [])], max_minutes=1)
+                self.assertEqual((result["status"], result["waitedSeconds"]), expected)
+
+    def test_initial_read_uses_last_timestamp_and_preserves_both_roles(self):
+        for role, status in (("self", "timed_out"), ("other", "new_messages")):
+            messages = [{"createTime": 1001, "senderRole": role},
+                        {"createTime": 1000, "senderRole": "other" if role == "self" else "self"}]
+            result = self.run_wait(read=lambda: messages, max_minutes=1)
+            self.assertEqual(result["status"], status)
+            self.assertEqual(result["new"], sorted(messages, key=lambda m: m["createTime"]))
+
+    def test_long_settle_waits_for_full_interval(self):
+        for continuous in (False, True):
+            result = self.run_wait(lambda t: [{"is_self": False}] if continuous or t == 1001 else [],
+                                   settle_seconds=120)
+            self.assertEqual((result["status"], result["waitedSeconds"]), ("new_messages", 121))
+
+    def test_include_self_still_triggers_and_extends_quiet_period(self):
+        result = self.run_wait(lambda t: [{"is_self": False}, {"is_self": True}] if t == 1002 else [],
+                               read=lambda: [{"createTime": 1001, "senderRole": "self"}],
+                               include_self=True, max_minutes=1)
+        self.assertEqual((result["status"], result["waitedSeconds"]), ("new_messages", 17))
+
     def test_timeout_and_self_trigger_option(self):
         for is_self in (None, True):
             result = self.run_wait(lambda t: [{"is_self": is_self}]

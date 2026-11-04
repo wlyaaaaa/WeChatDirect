@@ -292,7 +292,7 @@ wechat-direct helper send-paced --account secondary --contact "<称呼>" --since
 
 不加 `--send` 只打印计划，不连原生服务（约 3 秒）：`now` 是现在几点，`lastFromOther`、`lastFromSelf` 是双方最后一条和过了多少分钟，`plan` 是每条的思考和打字秒数，`firstBubbleAt`、`lastBubbleAt` 是预计发出时间。第一条的思考、打字、等待秒数都是0，通过发送前检查后立即发；之后每条按默认每分钟100字打字，加0.5–2秒思考，微信自带表情（如 `[旺柴]`）每个算1.5秒，可用 `--cpm`、`--think` 调整。加 `--not-before <时间>` 则到点立即开始首条发送前检查，不再人为等待；本机读取和原生调用仍有实际耗时，要等较久时放后台跑。
 
-确认后加 `--send`。整组共用一次原生连接，发送前和每条之间都读本机记录：`--since` 之后对方有新消息返回 `chat_moved` 和没发的 `unsent`；整组发送前和发送期间本人自己发了新消息同样算，第一条之后排除内容属于本组气泡列表的本人消息。读不到记录返回 `check_failed`，不盲发。回执不明返回 `send_uncertain`，`uncertain` 是那一条，不自动重发。发完读回，结果在 `readback`、`readbackComplete`，发送期间对方的新消息在 `newAfterSend`。`filehelper` 不做新消息检查，可用来试样子。
+确认后加 `--send`。整组共用一次原生连接，发送前和每条之间都读本机记录：`--since` 之后对方有新消息返回 `chat_moved` 和没发的 `unsent`；整组发送前和发送期间本人自己发了新消息同样算，第一条之后按时间顺序用本组已发出的气泡逐条抵消同内容的本人消息，每条气泡只抵消一次，多出的本人消息仍停发，即使内容与后面尚未发送的气泡相同。读不到记录返回 `check_failed`，不盲发。回执不明返回 `send_uncertain`，`uncertain` 是那一条，不自动重发。发完读回，结果在 `readback`、`readbackComplete`，发送期间对方的新消息在 `newAfterSend`。`filehelper` 不做新消息检查，可用来试样子。
 
 若已登记称呼失效，`--contact` 不会沿同名联系人继续发送，而在启动原生服务前返回 `helper_stale_alias_requires_resolution`；应先核对并显式指定 `--target`，或修复称呼后再执行。正常精确名称、仍有效的称呼及显式 `--target` 保持可用，不自动修改或删除称呼。
 
@@ -353,7 +353,7 @@ AI 需要等指定聊天来消息后再开始处理时，把下面的命令交�
 wechat-direct wait-new --account secondary --target "<原生ID>" --since "2026-01-01T10:00:00+08:00" --stop-file "<绝对路径>/wait.stop"
 ```
 
-`--account` 必须明确选 primary 或 secondary；`--target` 和 `--contact` 二选一，称呼只允许精确联系人或已登记别名，可加 `--chat-type group|private`。`--config` 指定账号配置。`--since` 是上次读到的最后一条消息时间，不带时区按北京时间解释。默认 `--settle-seconds 15`：收到对方消息后等连续15秒没有更新再返回，从首条触发起最多等60秒。`--max-minutes` 默认1440，到点结束一次，由人决定是否再挂。`--include-self` 也允许本人事件触发，仅用于从手机发到文件传输助手验收。
+`--account` 必须明确选 primary 或 secondary；`--target` 和 `--contact` 二选一，称呼只允许精确联系人或已登记别名，可加 `--chat-type group|private`。`--config` 指定账号配置。`--since` 是上次读到的最后一条消息时间，不带时区按北京时间解释。默认 `--settle-seconds 15`：收到对方消息后等连续15秒没有更新再返回，从首条触发起最多等 `max(60, settle_seconds)` 秒。等静默期间本人自己回了，这一轮不叫醒，继续等对方下一条。本人正在自己聊时用 `--settle-seconds 120`，对方说完两分钟本人没接才叫醒。`--max-minutes` 默认1440，到点结束一次，由人决定是否再挂。`--include-self` 也允许本人事件触发，仅用于从手机发到文件传输助手验收。
 
 命令使用一个经过登录身份核对的原生连接，接收范围仅为指定原生ID，不加载语音识别。连接后先读一次本机记录补齐 `--since` 到连上之间的消息；等待期间只接收实时事件；退出先关闭连接，再读一次记录取得发送时间和全部新增消息。没有定时读记录或断线降级。
 

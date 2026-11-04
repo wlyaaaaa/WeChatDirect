@@ -138,9 +138,13 @@ class CommandTests(unittest.TestCase):
         with self.assertRaisesRegex(cli.ProductError, "helper_text_utf8_limit"):
             args.handler(args)
 
-    def test_self_message_between_bubbles_stops_only_for_unplanned_text(self):
-        for inserted in (None, "synthetic manual message"):
-            with self.subTest(inserted=inserted):
+    def test_self_messages_cancel_only_one_matching_sent_bubble_each(self):
+        for inserted, bubbles in ((None, ["一二三", "四五六"]),
+                                  ("synthetic manual message", ["一二三", "四五六"]),
+                                  ("四五六", ["一二三", "四五六"]),
+                                  ("一二三", ["一二三", "四五六"]),
+                                  (None, ["一二三", "一二三", "四五六"])):
+            with self.subTest(inserted=inserted, bubbles=bubbles):
                 session = mock.Mock()
                 session.execute.return_value = {"status": "success", "wechatAccepted": True}
                 session.close.return_value = {}
@@ -154,13 +158,14 @@ class CommandTests(unittest.TestCase):
                       mock.patch.object(cli, "_paced_session", return_value=session),
                       mock.patch.object(cli, "_paced_read", side_effect=read),
                       mock.patch.object(paced, "make_plan", return_value=[
-                          {"text": text, "waitSeconds": 0} for text in ("一二三", "四五六")]),
+                          {"text": text, "waitSeconds": 0} for text in bubbles]),
                       mock.patch.object(cli.time, "sleep")):
-                    code, report, _settings = self.run_command([], "--send", "--bubble", "四五六")
+                    code, report, _settings = self.run_command(
+                        [], "--send", *[arg for text in bubbles[1:] for arg in ("--bubble", text)])
                 self.assertEqual((code, report["status"]), (2, "chat_moved") if inserted else (0, "sent"))
                 self.assertEqual([call.args[0]["text"] for call in session.execute.call_args_list],
-                                 ["一二三"] if inserted else ["一二三", "四五六"])
-                self.assertEqual(report.get("unsent", []), ["四五六"] if inserted else [])
+                                 bubbles[:1] if inserted else bubbles)
+                self.assertEqual(report.get("unsent", []), bubbles[1:] if inserted else [])
 
     def test_initial_lock_never_connects_or_sends(self):
         for command in (None, ["wait-new", "--account", "secondary", "--target", "filehelper", "--since", "1970-01-01T08:00:00"]):

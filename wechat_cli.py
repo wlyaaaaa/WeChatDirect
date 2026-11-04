@@ -1465,7 +1465,17 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
     result = _context_result_raw(args)
     if getattr(args, "_materializing", False):
         return result
-    if len(_canonical_bytes(result)) <= budget:
+
+    def output_size() -> int:
+        # Reserve display-only members without adding them to either hash.
+        size = len(_canonical_bytes(result))
+        for message in result["messages"]:
+            value = (_paced_moment(message["createTime"])
+                     if message.get("createTime") is not None else None)
+            size += len(b',"time":') + len(_canonical_bytes(value))
+        return size
+
+    if output_size() <= budget:
         return result
     copied = argparse.Namespace()
     vars(copied).update(vars(args))
@@ -1476,10 +1486,10 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
     copied.since = (
         epoch + timedelta(seconds=result["requestedWindow"]["sinceS"])
     ).isoformat()
-    while len(_canonical_bytes(result)) > budget and copied.return_limit > 1:
+    while output_size() > budget and copied.return_limit > 1:
         copied.return_limit = max(1, copied.return_limit // 2)
         result = _context_result_raw(copied)
-    if len(_canonical_bytes(result)) <= budget:
+    if output_size() <= budget:
         return result
     query = {
         key: getattr(copied, key, None)
@@ -1546,7 +1556,7 @@ def _context_result(args: argparse.Namespace) -> dict[str, Any]:
     result["coverage"]["textDelivery"] = "explicit_segments_with_lossless_continuation"
     result.pop("manifestSha256", None)
     result["manifestSha256"] = _sha256(_canonical_bytes(result))
-    if len(_canonical_bytes(result)) > budget:
+    if output_size() > budget:
         raise ProductError("context_metadata_too_large_use_export_context")
     return result
 

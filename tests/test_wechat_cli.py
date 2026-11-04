@@ -498,6 +498,26 @@ class WeChatCliTests(unittest.TestCase):
             with patch.object(wechat_cli.sys, "stdout", output):
                 self.assertEqual(wechat_cli.command_context(context_args()), 0)
             rendered = json.loads(output.buffer.getvalue())
+            near_limit = context_args(byte_limit=32768)
+            padding = "x" * (near_limit.byte_limit - len(wechat_cli._canonical_bytes(result)) - 1)
+            original_fetch = FakeReader.fetch_messages
+            def padded(reader, *args, **kwargs):
+                fetched = original_fetch(reader, *args, **kwargs)
+                fetched["messages"][0]["content"] += padding
+                return fetched
+
+            bounded_output = BinaryOutput()
+            with patch.object(FakeReader, "fetch_messages", padded), patch.object(wechat_cli.sys, "stdout", bounded_output):
+                self.assertEqual(len(wechat_cli._canonical_bytes(wechat_cli._context_result_raw(near_limit))), near_limit.byte_limit - 1)
+                wechat_cli.command_context(near_limit)
+            self.assertLessEqual(len(bounded_output.buffer.getvalue()), near_limit.byte_limit)
+            bounded = json.loads(bounded_output.buffer.getvalue())
+            for message in bounded["messages"]:
+                message.pop("time")
+                expected = wechat_cli._sha256(wechat_cli._canonical_bytes({key: value for key, value in message.items() if key not in {"nativeId", "messageSha256", "sender", "_pageKey"}}))
+                self.assertEqual(message["messageSha256"], expected)
+            digest = bounded.pop("manifestSha256")
+            self.assertEqual(digest, wechat_cli._sha256(wechat_cli._canonical_bytes(bounded)))
         self.assertEqual([message.pop("time") for message in rendered["messages"]], ["1970-01-01T08:01:40+08:00", "1970-01-01T08:01:50+08:00"])
         self.assertEqual([message["createTime"] for message in rendered["messages"]], [100, 110])
         self.assertEqual(rendered, result)

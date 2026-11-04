@@ -292,7 +292,7 @@ wechat-direct helper send-paced --account secondary --contact "<称呼>" --since
 
 不加 `--send` 只打印计划，不连原生服务（约 3 秒）：`now` 是现在几点，`lastFromOther`、`lastFromSelf` 是双方最后一条和过了多少分钟，`plan` 是每条的思考和打字秒数，`firstBubbleAt`、`lastBubbleAt` 是预计发出时间。第一条的思考、打字、等待秒数都是0，通过发送前检查后立即发；之后每条按默认每分钟100字打字，加0.5–2秒思考，微信自带表情（如 `[旺柴]`）每个算1.5秒，可用 `--cpm`、`--think` 调整。加 `--not-before <时间>` 则到点立即开始首条发送前检查，不再人为等待；本机读取和原生调用仍有实际耗时，要等较久时放后台跑。
 
-确认后加 `--send`。整组共用一次原生连接，发送前和每条之间都读本机记录：`--since` 之后对方有新消息返回 `chat_moved` 和没发的 `unsent`；第一条发出前本人自己发了消息同样算。读不到记录返回 `check_failed`，不盲发。回执不明返回 `send_uncertain`，`uncertain` 是那一条，不自动重发。发完读回，结果在 `readback`、`readbackComplete`，发送期间对方的新消息在 `newAfterSend`。`filehelper` 不做新消息检查，可用来试样子。
+确认后加 `--send`。整组共用一次原生连接，发送前和每条之间都读本机记录：`--since` 之后对方有新消息返回 `chat_moved` 和没发的 `unsent`；整组发送前和发送期间本人自己发了新消息同样算，第一条之后排除内容属于本组气泡列表的本人消息。读不到记录返回 `check_failed`，不盲发。回执不明返回 `send_uncertain`，`uncertain` 是那一条，不自动重发。发完读回，结果在 `readback`、`readbackComplete`，发送期间对方的新消息在 `newAfterSend`。`filehelper` 不做新消息检查，可用来试样子。
 
 若已登记称呼失效，`--contact` 不会沿同名联系人继续发送，而在启动原生服务前返回 `helper_stale_alias_requires_resolution`；应先核对并显式指定 `--target`，或修复称呼后再执行。正常精确名称、仍有效的称呼及显式 `--target` 保持可用，不自动修改或删除称呼。
 

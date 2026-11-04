@@ -303,6 +303,7 @@ class HelperSession:
                 "native_message_id", "wx_type", "image_path", "image_status", "file_path", "file_status",
                 "voice_path", "voice_status", "voice_duration_ms", "voice_size", "app_type")
         event = {key: data[key] for key in keys if isinstance(data.get(key), (str, int, bool))}
+        event["received_at"] = int(time.time())
         if data.get("wx_type") == 1:
             event["text"] = str(data.get("msg") or data.get("content") or "")
         with self._event_lock:

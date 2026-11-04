@@ -82,6 +82,8 @@ class RealtimeContextTests(unittest.TestCase):
         self.assertEqual(first["elapsed"], 2)
         self.assertEqual(first["request_id"], second["request_id"])
         self.assertEqual(first["messages"][0]["contentSource"], "wechat_native_cache")
+        self.assertEqual(first["messages"][0]["createTime"], 1)
+        self.assertEqual(second["messages"][0]["createTime"], 1)
         self.assertTrue(Path(first["messages"][0]["media_manifest"][0]["output"]).is_file())
         reader.fetch_message_by_server_id.assert_called_once_with("peer", "123", exact_media_lookup=True)
         local.transcribe.assert_not_called()

@@ -333,6 +333,8 @@ wechat-direct helper session --account secondary --event-target filehelper --rea
 
 `read-context` 返回精确消息、引用、原媒体路径、缺口与首个完整的语音转写候选。同一消息已有微信原生转写缓存时直接读取；没有缓存时，已就绪本地模型与云端双路并行，保留来源，后到候选用同一 `request_id` 调 `context-results` 读取，不重新发送云请求；云请求有界完成。
 
+`receive.events[].received_at` 是本机收到该次回调的整数秒 Unix 时间戳，上游未提供发送时间；精确消息的原生发送时间见 `read-context.messages[].createTime`（同为秒级时间戳），不能用收到时刻代替。
+
 `observedAt` 从原生事件首次观测起计时，`elapsed`、`onTime`、`late` 如实记录；15 秒完整上下文仍须真实链路验收，接口接线与模拟测试不代表已达标。图片和动图的 `materialComplete=true`、`ready_for_vision` 只表示材料齐备可供阅读；`visualRead=false` 时不得声明 `complete` 或 `onTime=true`，AI 必须实际打开内容看过，再判断图意与完整上下文是否按时获得。
 
 只处理显式目标，不做全账号同步或自动回复，不开服务端口；`close` 或 stdin EOF 清理本任务启动的识别及辅助进程。

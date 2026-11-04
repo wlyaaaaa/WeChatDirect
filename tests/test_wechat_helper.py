@@ -328,10 +328,14 @@ class HelperTests(unittest.TestCase):
 
     def test_callback_before_receive_is_retained_and_consumed_once(self):
         self.session.start()
-        self.module.service.handler(123, 11046, {"chat_id": "filehelper", "wx_type": 1, "msg": "先到的合成消息"}, None)
-        first = self.session.execute({"action": "receive", "seconds": 0, "limit": 10})
+        with mock.patch.object(helper.time, "time", return_value=1700000000.75) as clock:
+            self.module.service.handler(123, 11046, {"chat_id": "filehelper", "wx_type": 1, "msg": "先到的合成消息"}, None)
+            clock.return_value = 1700000010
+            first = self.session.execute({"action": "receive", "seconds": 0, "limit": 10})
         second = self.session.execute({"action": "receive", "seconds": 0, "limit": 10})
         self.assertEqual(first["events"][0]["text"], "先到的合成消息")
+        self.assertEqual(first["events"][0]["received_at"], 1700000000)
+        self.assertNotIn("create_time", first["events"][0])
         self.assertEqual(second["events"], [])
         self.session.close()
 

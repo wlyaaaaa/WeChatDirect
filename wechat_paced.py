@@ -41,8 +41,6 @@ def run_plan(plan, *, started_at, send, newer_messages, now=time.time, sleep=tim
         try:
             newer = newer_messages(index)
         except Exception as exc:
-            if getattr(exc, "details", {}).get("status") == "locked":
-                return {**exc.details, "sent": sent, "unsent": unsent}
             return {"status": "check_failed", "error": str(exc), "sent": sent, "unsent": unsent}
         if newer:
             return {"status": "chat_moved", "new": newer, "sent": sent, "unsent": unsent}
@@ -50,8 +48,6 @@ def run_plan(plan, *, started_at, send, newer_messages, now=time.time, sleep=tim
         try:
             receipt = send(step["text"])
         except Exception as exc:
-            if getattr(exc, "details", {}).get("status") == "locked":
-                return {**exc.details, "sent": sent, "unsent": unsent}
             receipt = {"status": "unknown", "error": str(exc)}
         last = now()
         if receipt.get("status") != "success" or receipt.get("wechatAccepted") is not True:

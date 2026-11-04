@@ -359,7 +359,7 @@ wechat-direct wait-new --account secondary --target "<原生ID>" --since "2026-0
 
 标准输出是一份JSON：`status` 为 `new_messages` 时退出码0，`timed_out`、`locked`、`read_failed`、`connection_lost`、`stopped` 时退出码2。`now`、`since`、`nextSince` 和每条 `new[].time` 都是北京时间；`waitedSeconds` 为本次耗时；`new` 含期间双方全部消息的 `role`、`type`、`content`、`minutesAgo`。没有新消息时 `nextSince` 等于原时间。`pushAvailable`、`connectedSeconds` 说明连接情况；有事件时附首事件收到时间及与本机记录发送时间的秒差，尚无法匹配时差为null。`cleanup.dllUnloaded` 单独说明原生桥接是否卸载成功。图片和语音仍需原有媒体命令阅读，不把文字投影当完整媒体语境。
 
-可选本机设置 `personal_data_access` 必须是检查模块的绝对路径：每次读记录或接收事件前现查 `check_access("factor")`，只有字典中的 `status=pass` 放行；文件缺失、检查异常、锁定均立即停止并返回 `locked` 和 `required_action`。不配置时不检查，便于其他使用者使用。`helper send-paced` 同样在读取和发送前检查，中途上锁不再发送。本机真实路径不写入仓库。
+可选本机设置 `personal_data_access` 必须是检查模块的绝对路径：`wait-new` 在命令开始、关闭实时连接后最终读记录之前各查一次 `check_access("factor")`，接收事件期间不反复检查；`helper send-paced` 只在命令开始检查一次。只有字典中的 `status=pass` 放行；文件缺失、检查异常、锁定均返回 `locked` 和 `required_action`。最终读取前锁定时不输出消息正文，`new` 为空、`nextSince` 保持原 `since`。不配置时不检查，便于其他使用者使用。本机真实路径不写入仓库。
 
 后台安全停止：在另一个命令中创建 `--stop-file` 指定的文件，等待命令将在下一次接收检查时返回 `stopped` 并关闭连接；该文件由调用方维护，复用前先清理。前台可按Ctrl-C。正常结束、到点结束和Ctrl-C都会调用关闭。上游有独立隐藏清理进程，在持有者被单独强杀后尝试卸载，下一次启动也会清理遗留桥接；清理可能失败，不能保证任意强杀后绝无残留，避免强杀整个进程树而同时杀掉清理进程。
 

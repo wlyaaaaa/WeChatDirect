@@ -4959,10 +4959,9 @@ def _paced_read(args, query, *window) -> list[dict[str, Any]]:
         argv += ["--chat-type", args.chat_type]
     messages, request = [], parser().parse_args(argv)
     while True:
-        _check_personal_access()
         result = _context_result(request)
         messages = result.get("messages", []) + messages
-        if not result.get("continuation"):
+        if "--since" not in window or not result.get("continuation"):
             return messages
         request.cursor = result["continuation"]["cursor"]
 
@@ -5038,11 +5037,9 @@ def command_send_paced(args: argparse.Namespace) -> int:
                 session.start()
                 result = paced.run_plan(
                     plan, started_at=started, newer_messages=newer,
-                    send=lambda text: _check_personal_access() or session.execute({"action": "send-text", "target": target, "text": text}))
+                    send=lambda text: session.execute({"action": "send-text", "target": target, "text": text}))
             finally:
                 cleanup = session.close()
-        if result["status"] == "locked":
-            return finish({**result, "cleanup": cleanup}, 2)
         for item in result["sent"]:
             item["acceptedAt"] = _paced_moment(item["acceptedAt"])
         sent_texts = [item["text"] for item in result["sent"]]
@@ -5057,8 +5054,6 @@ def command_send_paced(args: argparse.Namespace) -> int:
                 _paced_brief(message) for message in back
                 if message["createTime"] > since and message.get("senderRole") != "self"]
         except ProductError as exc:
-            if exc.details.get("status") == "locked":
-                return finish({**result, **exc.details, "cleanup": cleanup}, 2)
             result["readback"], result["readbackComplete"], result["readbackError"] = None, False, str(exc)
         return finish({**report, **result, "cleanup": cleanup}, 0 if result["status"] == "sent" else 2)
     except ProductError as exc:
@@ -5077,7 +5072,6 @@ def command_wait_new(args):
     def read():
         return [m for m in _paced_read(args, target, "--since", _paced_moment(since)) if m["createTime"] > since]
     def event(seconds):
-        _check_personal_access()
         if args.stop_file and args.stop_file.exists():
             raise ProductError("wait_stopped", status="stopped")
         receipt = session.execute({"action": "receive", "seconds": seconds, "limit": 100})
@@ -5085,7 +5079,7 @@ def command_wait_new(args):
             raise ProductError("event_buffer_overflow", status="connection_lost")
         events = receipt.get("events", [])
         if events and "firstEventReceivedAt" not in info:
-            info["firstEventReceivedAt"], info["firstEventId"] = events[0]["received_at"], events[0].get("native_message_id")
+            info["firstEventReceivedAt"], info["firstEventId"] = events[0]["received_at"], str(events[0].get("native_message_id") or "")
         return events
     try:
         _check_personal_access()
@@ -5101,6 +5095,7 @@ def command_wait_new(args):
                     settle_seconds=args.settle_seconds, max_minutes=args.max_minutes, include_self=args.include_self)
             finally:
                 info["cleanup"] = session.close()
+        _check_personal_access()
         if result["status"] not in {"locked", "connection_lost", "stopped", "read_failed"}:
             result["new"] = wechat_wait.read_new(read, since)
     except (Exception, KeyboardInterrupt) as exc:

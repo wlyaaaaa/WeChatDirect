@@ -1,7 +1,6 @@
 """Synthetic waits and fail-closed access checks; no native connection or chats."""
 import isolation
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 import wechat_cli as cli
 from wechat_wait import wait_new
@@ -44,12 +43,6 @@ class WaitTests(unittest.TestCase):
             self.assertEqual(result["status"], expected)
             self.assertEqual(reader.call_count, 3)
 
-    def test_lock_stops_wait_immediately(self):
-        reader = mock.Mock(side_effect=cli.ProductError("locked", status="locked", required_action="verify"))
-        result = self.run_wait(read=reader)
-        self.assertEqual((result["status"], result["required_action"]), ("locked", "verify"))
-        reader.assert_called_once()
-
     def test_broken_or_blocked_access_never_reads(self):
         bodies = ("return {'status': 'blocked', 'required_action': 'verify'}", "return []",
                   "raise RuntimeError('synthetic')", "syntax !", None)
@@ -57,12 +50,10 @@ class WaitTests(unittest.TestCase):
             path = isolation.ROOT / f"synthetic_access_{index}.py"
             if body is not None:
                 path.write_text(f"def check_access(level):\n    assert level == 'factor'\n    {body}\n", encoding="utf-8")
-            with (mock.patch.object(cli, "_local_settings", return_value={"personal_data_access": str(path)}),
-                  mock.patch.object(cli, "_context_result") as read):
+            with mock.patch.object(cli, "_local_settings", return_value={"personal_data_access": str(path)}):
                 with self.assertRaises(cli.ProductError) as caught:
-                    cli._paced_read(SimpleNamespace(account="secondary", config=None, chat_type=None), "synthetic")
+                    cli._check_personal_access()
                 self.assertEqual(caught.exception.details["status"], "locked")
-                read.assert_not_called()
 
     def test_connection_failure_is_reported(self):
         events = mock.Mock(side_effect=OSError("synthetic-disconnect"))

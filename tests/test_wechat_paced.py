@@ -37,20 +37,10 @@ class PacingTests(unittest.TestCase):
 
     def test_first_bubble_has_no_wait_and_followup_keeps_typing_speed(self):
         rng = mock.Mock()
-        rng.uniform.side_effect = lambda low, high: low
-        plan = paced.make_plan(["一二", "三"], rng=rng)
-        self.assertEqual(plan[0]["thinkSeconds"], 0)
-        self.assertEqual(plan[0]["typingSeconds"], 0)
-        self.assertEqual(plan[1]["thinkSeconds"], paced.NEXT_THINK_SECONDS[0])
-        self.assertEqual(plan[0]["waitSeconds"], 0)
-        self.assertEqual(plan[1]["waitSeconds"], 1.1)
-
-    def test_followup_nine_characters_and_emoji_waits_at_most_ten_seconds(self):
-        rng = mock.Mock()
         rng.uniform.side_effect = lambda low, high: high
-        plan = paced.make_plan(["先发", "一二三四五六七八九[旺柴]"], rng=rng)
-        self.assertEqual(plan[1]["waitSeconds"], 8.9)
-        self.assertLessEqual(plan[1]["waitSeconds"], 10)
+        plan = paced.make_plan(["一二", "一二三四五六七八九[旺柴]"], rng=rng)
+        self.assertEqual(tuple(plan[0][key] for key in ("thinkSeconds", "typingSeconds", "waitSeconds")), (0, 0, 0))
+        self.assertEqual((plan[1]["thinkSeconds"], plan[1]["waitSeconds"]), (paced.NEXT_THINK_SECONDS[1], 8.9))
 
     def test_first_bubble_sends_at_start_then_followup_waits(self):
         clock = Clock()
@@ -62,8 +52,7 @@ class PacingTests(unittest.TestCase):
 
         result = paced.run_plan(paced.make_plan(["一二", "三"], next_think=(0.5, 0.5)), started_at=clock.now(), send=send,
                                 newer_messages=lambda _index: [], now=clock.now, sleep=clock.sleep)
-        self.assertEqual(result["status"], "sent")
-        self.assertEqual(sent_at, [1000.0, 1001.1])
+        self.assertEqual((result["status"], sent_at), ("sent", [1000.0, 1001.1]))
 
     def test_new_message_stops_and_returns_unsent(self):
         clock = Clock()
@@ -109,8 +98,8 @@ class PacingTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
-    def run_command(self, messages, *extra):
-        args = cli.parser().parse_args([
+    def run_command(self, messages, *extra, command=None):
+        args = cli.parser().parse_args(command or [
             "helper", "send-paced", "--account", "secondary", "--target", "wxid_synthetic",
             "--since", "2026-01-01T10:00:00", "--bubble", "一二三", "--config", "synthetic.json", *extra])
         output = io.BytesIO()
@@ -128,8 +117,7 @@ class CommandTests(unittest.TestCase):
     def test_default_only_prints_the_plan_with_the_current_time(self):
         code, report, settings = self.run_command([
             {"createTime": cli._parse_time("2026-01-01T09:00:00", default=0), "senderRole": "other", "content": "早"}])
-        self.assertEqual(code, 0)
-        self.assertEqual(report["status"], "plan_only")
+        self.assertEqual((code, report["status"]), (0, "plan_only"))
         self.assertIn("now", report)
         self.assertEqual(report["lastFromOther"]["content"], "早")
         self.assertIsNone(report["lastFromSelf"])
@@ -137,18 +125,11 @@ class CommandTests(unittest.TestCase):
         settings.assert_not_called()
 
     def test_new_message_is_reported_before_any_send(self):
-        code, report, settings = self.run_command([
-            {"createTime": cli._parse_time("2026-01-01T10:00:01", default=0), "senderRole": "other", "content": "新"}],
-            "--send")
-        self.assertEqual(code, 2)
-        self.assertEqual(report["status"], "chat_moved")
-        self.assertEqual(report["unsent"], ["一二三"])
-        settings.assert_not_called()
-
-    def test_hand_typed_message_also_stops_the_first_bubble(self):
-        code, report, _settings = self.run_command([
-            {"createTime": cli._parse_time("2026-01-01T10:00:01", default=0), "senderRole": "self", "content": "手打"}])
-        self.assertEqual((code, report["status"]), (2, "chat_moved"))
+        for role in ("other", "self"):
+            code, report, settings = self.run_command([{"createTime": cli._parse_time("2026-01-01T10:00:01", default=0), "senderRole": role, "content": "新"}], "--send")
+            self.assertEqual((code, report["status"]), (2, "chat_moved"))
+            self.assertEqual(report["unsent"], ["一二三"])
+            settings.assert_not_called()
 
     def test_oversized_bubble_is_rejected_before_anything_runs(self):
         args = cli.parser().parse_args([
@@ -158,24 +139,51 @@ class CommandTests(unittest.TestCase):
             args.handler(args)
 
     def test_initial_lock_never_connects_or_sends(self):
-        with mock.patch.object(cli, "_check_personal_access", side_effect=cli.ProductError(
-                "locked", status="locked", required_action="verify")):
-            code, report, settings = self.run_command([], "--send")
-        self.assertEqual((code, report["status"]), (2, "locked"))
-        settings.assert_not_called()
+        for command in (None, ["wait-new", "--account", "secondary", "--target", "filehelper", "--since", "1970-01-01T08:00:00"]):
+            with (mock.patch.object(cli, "_check_personal_access", side_effect=cli.ProductError(
+                    "locked", status="locked", required_action="verify")), mock.patch.object(cli, "_paced_read") as read):
+                code, report, settings = self.run_command([], "--send", command=command)
+            self.assertEqual((code, report["status"], settings.call_count, read.call_count), (2, "locked", 0, 0))
 
-    def test_lock_while_waiting_never_sends_or_reads_back(self):
-        locked = cli.ProductError("locked", status="locked", required_action="verify")
+    def test_send_checks_access_only_once(self):
         session = mock.Mock()
         session.execute.return_value = {"status": "success", "wechatAccepted": True}
-        with (mock.patch.object(cli, "_paced_read", side_effect=[[], [], [], locked]) as read,
+        with (mock.patch.object(cli, "_check_personal_access") as access,
               mock.patch.object(cli, "_paced_session", return_value=session),
-              mock.patch.object(cli.time, "sleep"),
-              mock.patch.object(paced, "make_plan", return_value=steps(0, 0))):
-            code, report, _settings = self.run_command([], "--send", "--bubble", "四五六")
-        self.assertEqual((code, report["status"]), (2, "locked"))
-        self.assertEqual((read.call_count, len(report["sent"]), report["unsent"]), (4, 1, ["bubble1"]))
+              mock.patch.object(cli.time, "sleep")):
+            code, report, _settings = self.run_command([], "--send")
+        self.assertEqual((code, report["status"], access.call_count), (0, "sent", 1))
         session.execute.assert_called_once()
+
+    def test_wait_integer_event_id_and_access_boundaries(self):
+        message = {"serverId": "987", "createTime": 1000, "content": "stale-body"}
+        for status in ("new_messages", "stopped", "connection_lost"):
+            session = mock.Mock()
+            session.execute.return_value = {"events": [{"native_message_id": 987, "received_at": 1002}]}
+            def wait(**kwargs):
+                kwargs["read"]()
+                kwargs["event"](0)
+                return {"status": status, "new": [message]}
+            ending = None if status == "new_messages" else cli.ProductError("locked", status="locked")
+            with (mock.patch.object(cli, "_check_personal_access", side_effect=[None, ending]) as access,
+                  mock.patch.object(cli, "_paced_session", return_value=session),
+                  mock.patch.object(cli, "_paced_read", side_effect=lambda *args: [message] if session.close.called else []) as read,
+                  mock.patch("wechat_wait.wait_new", side_effect=wait)):
+                code, report, _settings = self.run_command([], command=["wait-new", "--account", "secondary", "--target", "filehelper", "--since", "1970-01-01T08:00:00"])
+            self.assertEqual(access.call_count, 2)
+            if status == "new_messages":
+                self.assertEqual((code, report["firstEventDelaySeconds"], read.call_count), (0, 2, 2))
+            else:
+                self.assertEqual((code, report["status"], report["new"], report["nextSince"], read.call_count), (2, "locked", [], report["since"], 1))
+            session.close.assert_called_once()
+
+    def test_timing_first_page_and_since_full_pagination(self):
+        args = mock.Mock(account="secondary", config=None, chat_type=None)
+        for window, count in ((("--lookback-days", "30"), 1), (("--since", "1970-01-01T08:00:00"), 2)):
+            with mock.patch.object(cli, "_context_result", side_effect=[
+                    {"messages": [2], "continuation": {"cursor": "synthetic"}}, {"messages": [1]}]) as read:
+                messages = cli._paced_read(args, "synthetic", *window)
+            self.assertEqual((read.call_count, messages), (count, [2] if count == 1 else [1, 2]))
 
 
 if __name__ == "__main__":

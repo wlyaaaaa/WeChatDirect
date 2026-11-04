@@ -44,6 +44,13 @@ class PacingTests(unittest.TestCase):
         self.assertEqual(plan[1]["thinkSeconds"], paced.NEXT_THINK_SECONDS[0])
         self.assertEqual(plan[0]["waitSeconds"], round(paced.FIRST_THINK_SECONDS[0] + 1.2, 1))
 
+    def test_followup_nine_characters_and_emoji_waits_at_most_ten_seconds(self):
+        rng = mock.Mock()
+        rng.uniform.side_effect = lambda low, high: high
+        plan = paced.make_plan(["先发", "一二三四五六七八九[旺柴]"], rng=rng)
+        self.assertEqual(plan[1]["waitSeconds"], 8.9)
+        self.assertLessEqual(plan[1]["waitSeconds"], 10)
+
     def test_first_bubble_still_waits_after_the_scheduled_start(self):
         clock = Clock()
         sent_at = []

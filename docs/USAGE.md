@@ -290,7 +290,7 @@ wechat-direct helper send-voice --account secondary --target filehelper --path "
 wechat-direct helper send-paced --account secondary --contact "<称呼>" --since "<读到的最后一条的时间>" --bubble "第一条" --bubble "第二条"
 ```
 
-不加 `--send` 只打印计划，不连原生服务（约 3 秒）：`now` 是现在几点，`lastFromOther`、`lastFromSelf` 是双方最后一条和过了多少分钟，`plan` 是每条的思考和打字秒数，`firstBubbleAt`、`lastBubbleAt` 是预计发出时间。默认每分钟 100 字，微信自带表情（如 `[旺柴]`）每个算 1.5 秒，第一条前思考 6–15 秒，之后每条前 0.5–2 秒；可用 `--cpm`、`--first-think`、`--think` 调整。加 `--not-before <时间>` 则到点才开始思考和打字，第一条发出时间是到点加这段时间；要等较久时放后台跑。
+不加 `--send` 只打印计划，不连原生服务（约 3 秒）：`now` 是现在几点，`lastFromOther`、`lastFromSelf` 是双方最后一条和过了多少分钟，`plan` 是每条的思考和打字秒数，`firstBubbleAt`、`lastBubbleAt` 是预计发出时间。第一条的思考、打字、等待秒数都是0，通过发送前检查后立即发；之后每条按默认每分钟100字打字，加0.5–2秒思考，微信自带表情（如 `[旺柴]`）每个算1.5秒，可用 `--cpm`、`--think` 调整。加 `--not-before <时间>` 则到点立即开始首条发送前检查，不再人为等待；本机读取和原生调用仍有实际耗时，要等较久时放后台跑。
 
 确认后加 `--send`。整组共用一次原生连接，发送前和每条之间都读本机记录：`--since` 之后对方有新消息返回 `chat_moved` 和没发的 `unsent`；第一条发出前本人自己发了消息同样算。读不到记录返回 `check_failed`，不盲发。回执不明返回 `send_uncertain`，`uncertain` 是那一条，不自动重发。发完读回，结果在 `readback`、`readbackComplete`，发送期间对方的新消息在 `newAfterSend`。`filehelper` 不做新消息检查，可用来试样子。
 
@@ -344,6 +344,24 @@ wechat-direct helper session --account secondary --event-target filehelper --rea
 普通动作执行后在 finally 中 stop；会话 close/EOF 也清理并卸载桥接，EOF 额外输出最终 close 清理回执。会话启动、输入循环或卸载失败时进程退出码非零；可恢复的单条请求失败仍以逐条 JSON 回执为准，不累计为整个连接失败，正常 EOF/close 且卸载成功可退出 0。没有全局 daemon（常驻服务）、HTTP 端口、命令队列或任务结束后保留的服务。当前 `.13` 的主动加好友、完整联系人扫描及 helper 朋友圈读/发/互动明确返回不可用；原有数据库 `moments`/`sync-moments` 保持可用。
 
 回执中 `invocationCompleted` 表示适配调用是否返回，`wechatAccepted` 只在上游原生完成回执明确成功时为 true，`actualReadback=not_checked` 表示还没有从微信数据库或客户端验收实际结果。超时、异常或回执丢失返回 `status=unknown`、`retryable=false`，会话阻止继续发送，应先精确读回目标再决定后续；不自动重试。`cleanup` 单独报告卸载结果，发送已受理但清理失败为 partial，不能当作全成功。失败时上游可能留下其 `.runtime/native_requests` 报告或桥接，应按上游清理流程核实，不能强杀后直接重发。
+
+## 后台等新消息
+
+AI 需要等指定聊天来消息后再开始处理时，把下面的命令交给宿主的后台执行功能；宿主在命令结束后通知原对话。命令只等待和报告，不思考、不发送，也不自动重挂：
+
+```powershell
+wechat-direct wait-new --account secondary --target "<原生ID>" --since "2026-01-01T10:00:00+08:00" --stop-file "<绝对路径>/wait.stop"
+```
+
+`--account` 必须明确选 primary 或 secondary；`--target` 和 `--contact` 二选一，称呼只允许精确联系人或已登记别名，可加 `--chat-type group|private`。`--config` 指定账号配置。`--since` 是上次读到的最后一条消息时间，不带时区按北京时间解释。默认 `--settle-seconds 15`：收到对方消息后等连续15秒没有更新再返回，从首条触发起最多等60秒。`--max-minutes` 默认1440，到点结束一次，由人决定是否再挂。`--include-self` 也允许本人事件触发，仅用于从手机发到文件传输助手验收。
+
+命令使用一个经过登录身份核对的原生连接，接收范围仅为指定原生ID，不加载语音识别。连接后先读一次本机记录补齐 `--since` 到连上之间的消息；等待期间只接收实时事件；退出先关闭连接，再读一次记录取得发送时间和全部新增消息。没有定时读记录或断线降级。
+
+标准输出是一份JSON：`status` 为 `new_messages` 时退出码0，`timed_out`、`locked`、`read_failed`、`connection_lost`、`stopped` 时退出码2。`now`、`since`、`nextSince` 和每条 `new[].time` 都是北京时间；`waitedSeconds` 为本次耗时；`new` 含期间双方全部消息的 `role`、`type`、`content`、`minutesAgo`。没有新消息时 `nextSince` 等于原时间。`pushAvailable`、`connectedSeconds` 说明连接情况；有事件时附首事件收到时间及与本机记录发送时间的秒差，尚无法匹配时差为null。`cleanup.dllUnloaded` 单独说明原生桥接是否卸载成功。图片和语音仍需原有媒体命令阅读，不把文字投影当完整媒体语境。
+
+可选本机设置 `personal_data_access` 必须是检查模块的绝对路径：`wait-new` 在命令开始、关闭实时连接后最终读记录之前各查一次 `check_access("factor")`，接收事件期间不反复检查；`helper send-paced` 只在命令开始检查一次。只有字典中的 `status=pass` 放行；文件缺失、检查异常、锁定均返回 `locked` 和 `required_action`。最终读取前锁定时不输出消息正文，`new` 为空、`nextSince` 保持原 `since`。不配置时不检查，便于其他使用者使用。本机真实路径不写入仓库。
+
+后台安全停止：在另一个命令中创建 `--stop-file` 指定的文件，等待命令将在下一次接收检查时返回 `stopped` 并关闭连接；该文件由调用方维护，复用前先清理。前台可按Ctrl-C。正常结束、到点结束和Ctrl-C都会调用关闭。上游有独立隐藏清理进程，在持有者被单独强杀后尝试卸载，下一次启动也会清理遗留桥接；清理可能失败，不能保证任意强杀后绝无残留，避免强杀整个进程树而同时杀掉清理进程。
 
 ## 故障与恢复边界
 

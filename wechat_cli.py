@@ -52,7 +52,7 @@ from wechat_storage import (
 LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 ACCOUNT_LABELS = ("primary", "secondary")
 LOCAL_SETTINGS_PATH = Path(__file__).with_name(".wechatdirect.local.json")
-LOCAL_SETTINGS_KEYS = frozenset({"config", "export_root", "aliases", "plaintextCacheRoot", "helper_config"})
+LOCAL_SETTINGS_KEYS = frozenset({"config", "export_root", "aliases", "plaintextCacheRoot", "helper_config", "personal_data_access"})
 DEFAULT_APP_DIRECTORY = "WeChatDirect"
 MAX_SCAN_MESSAGES = 500
 MAX_RETURN_MESSAGES = 80
@@ -103,7 +103,7 @@ def _local_settings() -> dict[str, str]:
         raise ProductError("wechat_local_settings_invalid")
     result: dict[str, str] = {}
     for key, item in value.items():
-        if not isinstance(item, str) or not item.strip():
+        if not isinstance(item, str) or not item.strip() or (key == "personal_data_access" and not Path(item).is_absolute()):
             raise ProductError("wechat_local_settings_invalid")
         result[key] = item
     return result
@@ -4933,6 +4933,23 @@ def _paced_moment(timestamp) -> str:
     return datetime.fromtimestamp(timestamp, LOCAL_TIMEZONE).isoformat(timespec="seconds")
 
 
+def _check_personal_access():
+    try:
+        path = _local_settings().get("personal_data_access")
+        if not path:
+            return
+        spec = importlib.util.spec_from_file_location("wechat_personal_access", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        result = module.check_access("factor")
+        if isinstance(result, dict) and result.get("status") == "pass":
+            return
+    except Exception:
+        result = {}
+    raise ProductError("personal_data_locked", status="locked", required_action=(
+        result.get("required_action") if isinstance(result, dict) else None) or "unlock_personal_data")
+
+
 def _paced_read(args, query, *window) -> list[dict[str, Any]]:
     argv = ["context", "--account", args.account, "--contact", query, "--return-limit", "40",
             "--byte-limit", "65536", *window]
@@ -4940,7 +4957,13 @@ def _paced_read(args, query, *window) -> list[dict[str, Any]]:
         argv += ["--config", args.config]
     if args.chat_type:
         argv += ["--chat-type", args.chat_type]
-    return _context_result(parser().parse_args(argv)).get("messages", [])
+    messages, request = [], parser().parse_args(argv)
+    while True:
+        result = _context_result(request)
+        messages = result.get("messages", []) + messages
+        if "--since" not in window or not result.get("continuation"):
+            return messages
+        request.cursor = result["continuation"]["cursor"]
 
 
 def _paced_brief(message, now=None) -> dict[str, Any]:
@@ -4960,10 +4983,11 @@ def _paced_timing(args, query, now) -> dict[str, Any]:
             "lastFromSelf": _paced_brief(mine[-1], now) if mine else None}
 
 
-def _paced_session(helper, args, config):
+def _paced_session(helper, args, config, *, event_targets=("filehelper",)):
     account = _account_config(config, args.account)
     return helper.HelperSession(
         helper.load_settings(_helper_config_path(args.helper_config)), account=args.account,
+        event_targets=event_targets,
         expected_wxid=_helper_expected_identity(account),
         expected_sha256=account["expected_moments_author_sha256"],
         voice_reader=lambda event: _helper_received_voice(account, event))
@@ -4979,6 +5003,7 @@ def command_send_paced(args: argparse.Namespace) -> int:
     try:
         for bubble in args.bubble:
             helper._text(bubble)
+        _check_personal_access()
         config_path = _resolve_config_path(args.config)
         config = _read_config(config_path)
         target = _helper_target(args, config, config_path)
@@ -4993,8 +5018,7 @@ def command_send_paced(args: argparse.Namespace) -> int:
             return [_paced_brief(message) for message in _paced_read(args, target, "--since", _paced_moment(since))
                     if message["createTime"] > since and (index == 0 or message.get("senderRole") != "self")]
 
-        plan = paced.make_plan(args.bubble, chars_per_minute=args.cpm, first_think=args.first_think,
-                               next_think=args.think)
+        plan = paced.make_plan(args.bubble, chars_per_minute=args.cpm, next_think=args.think)
         first_at = max(now, start_at) + plan[0]["waitSeconds"]
         report = {"account": args.account, "target": target, **_paced_timing(args, target, now), "plan": plan,
                   "firstBubbleAt": _paced_moment(first_at),
@@ -5032,8 +5056,61 @@ def command_send_paced(args: argparse.Namespace) -> int:
         except ProductError as exc:
             result["readback"], result["readbackComplete"], result["readbackError"] = None, False, str(exc)
         return finish({**report, **result, "cleanup": cleanup}, 0 if result["status"] == "sent" else 2)
+    except ProductError as exc:
+        if exc.details.get("status") == "locked":
+            return finish(exc.details, 2)
+        raise
     except helper.HelperError as exc:
         raise ProductError(str(exc), **exc.details) from exc
+
+
+def command_wait_new(args):
+    import wechat_helper as helper
+    import wechat_wait
+    started, since = time.time(), _parse_time(args.since, default=0)
+    info, session, result = {"pushAvailable": False}, None, {}
+    def read():
+        return [m for m in _paced_read(args, target, "--since", _paced_moment(since)) if m["createTime"] > since]
+    def event(seconds):
+        if args.stop_file and args.stop_file.exists():
+            raise ProductError("wait_stopped", status="stopped")
+        receipt = session.execute({"action": "receive", "seconds": seconds, "limit": 100})
+        if receipt.get("dropped"):
+            raise ProductError("event_buffer_overflow", status="connection_lost")
+        events = receipt.get("events", [])
+        if events and "firstEventReceivedAt" not in info:
+            info["firstEventReceivedAt"], info["firstEventId"] = events[0]["received_at"], str(events[0].get("native_message_id") or "")
+        return events
+    try:
+        _check_personal_access()
+        config_path = _resolve_config_path(args.config)
+        config = _read_config(config_path)
+        target = _helper_target(args, config, config_path)
+        session = _paced_session(helper, args, config, event_targets=(target,))
+        with redirect_stdout(sys.stderr):
+            try:
+                session.start()
+                info.update(pushAvailable=True, connectedSeconds=round(time.time() - started, 3))
+                result = wechat_wait.wait_new(since=since, read=read, event=event,
+                    settle_seconds=args.settle_seconds, max_minutes=args.max_minutes, include_self=args.include_self)
+            finally:
+                info["cleanup"] = session.close()
+        _check_personal_access()
+        if result["status"] not in {"locked", "connection_lost", "stopped", "read_failed"}:
+            result["new"] = wechat_wait.read_new(read, since)
+    except (Exception, KeyboardInterrupt) as exc:
+        result = {"status": "stopped" if isinstance(exc, KeyboardInterrupt) else ("read_failed" if info["pushAvailable"] else "connection_lost"),
+                  "error": str(exc), **getattr(exc, "details", {})}
+    finished, messages = time.time(), result.get("new", [])
+    first = next((m for m in messages if str(m.get("serverId")) == info.get("firstEventId")), None)
+    if "firstEventReceivedAt" in info:
+        info["firstEventDelaySeconds"] = info["firstEventReceivedAt"] - first["createTime"] if first else None
+        info["firstEventReceivedAt"] = _paced_moment(info["firstEventReceivedAt"])
+    result.update(now=_paced_moment(finished), since=_paced_moment(since), waitedSeconds=round(finished - started, 3),
+                  new=[_paced_brief(m, finished) for m in messages],
+                  nextSince=_paced_moment(max((m["createTime"] for m in messages), default=since)), **info)
+    sys.stdout.buffer.write(_canonical_bytes(result))
+    return 0 if result["status"] == "new_messages" else 2
 
 
 def _add_helper_commands(commands):
@@ -5066,9 +5143,8 @@ def _add_helper_commands(commands):
             command.add_argument("--since", required=True, help="last message already read (ISO; naive values use Asia/Shanghai); anything newer stops the send")
             command.add_argument("--bubble", action="append", required=True, help="one message bubble; repeat in order")
             command.add_argument("--cpm", type=float, default=paced.CHARS_PER_MINUTE, help="typing speed in characters per minute")
-            command.add_argument("--first-think", type=float, nargs=2, default=paced.FIRST_THINK_SECONDS, help="seconds of thinking before the first bubble (min max)")
             command.add_argument("--think", type=float, nargs=2, default=paced.NEXT_THINK_SECONDS, help="seconds of thinking before each later bubble (min max)")
-            command.add_argument("--not-before", help="start thinking and typing at this ISO time; naive values use Asia/Shanghai")
+            command.add_argument("--not-before", help="send the first bubble at this ISO time; naive values use Asia/Shanghai")
             command.add_argument("--send", action="store_true", help="actually send; without it only print the plan")
         if action in {"send-text", "send-at-text"}:
             text = command.add_mutually_exclusive_group(required=True)
@@ -5146,6 +5222,19 @@ def parser() -> argparse.ArgumentParser:
         dest="command", required=True, parser_class=ReceiptArgumentParser
     )
     _add_helper_commands(commands)
+    wait = commands.add_parser("wait-new", help="wait for scoped native events, then return local message context")
+    _add_config_argument(wait)
+    wait.add_argument("--account", choices=ACCOUNT_LABELS, required=True)
+    target = wait.add_mutually_exclusive_group(required=True)
+    target.add_argument("--target")
+    target.add_argument("--contact")
+    wait.add_argument("--chat-type", choices=("group", "private"))
+    wait.add_argument("--since", required=True)
+    wait.add_argument("--settle-seconds", type=float, default=15)
+    wait.add_argument("--max-minutes", type=float, default=1440)
+    wait.add_argument("--include-self", action="store_true")
+    wait.add_argument("--stop-file", type=Path, help="exit cleanly when this file exists")
+    wait.set_defaults(handler=command_wait_new, helper_config=None)
     commitments = commands.add_parser(
         "identity-commitments",
         help="derive account and Moments SHA-256 commitments from one existing protected source carrier",

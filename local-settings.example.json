@@ -1,5 +1,6 @@
 {
   "config": "<path-to-accounts.json>",
   "export_root": "<path-to-export-root>",
-  "helper_config": "<path-to-ignored-local-helper-config.json>"
+  "helper_config": "<path-to-ignored-local-helper-config.json>",
+  "personal_data_access": "<absolute-path-to-personal-data-access.py>"
 }

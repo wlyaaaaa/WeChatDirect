@@ -1,0 +1,43 @@
+import time
+
+def read_new(read, since):
+    for attempt in range(3):
+        try:
+            return [m for m in read() if m["createTime"] > since]
+        except Exception as exc:
+            if attempt == 2 or getattr(exc, "details", {}).get("status") == "locked":
+                raise
+
+def wait_new(*, since, read, event=None, settle_seconds=15, max_minutes=1440,
+             include_self=False, now=time.time, sleep=time.sleep):
+    if not all(0 < value < float("inf") for value in (settle_seconds, max_minutes)):
+        raise ValueError("wait_intervals_must_be_positive_and_finite")
+    started = now()
+    deadline = started + max_minutes * 60
+    first = last = None
+    new, extra = [], {}
+    status = "read_failed"
+    try:
+        new = read_new(read, since)
+        status = "timed_out"
+        if any(include_self or m.get("senderRole") != "self" for m in new):
+            first = last = now()
+        while now() < deadline:
+            current = now()
+            if first is not None and current >= min(last + settle_seconds, first + 60):
+                status = "new_messages"
+                break
+            due = min(deadline, current + 1, min(last + settle_seconds, first + 60) if first is not None else deadline)
+            events = event(max(0, due - current)) if event else sleep(max(0, due - current)) or []
+            if events:
+                last = now()
+                if first is None and any(include_self or not e.get("is_self") for e in events):
+                    first = last
+    except Exception as exc:
+        extra = {"error": str(exc), **getattr(exc, "details", {})}
+        status = extra.pop("status", "connection_lost" if status == "timed_out" else "read_failed")
+        if status == "locked":
+            new = []
+    new.sort(key=lambda m: m["createTime"])
+    return {"status": status, "now": now(), "since": since, "waitedSeconds": round(now() - started, 3),
+            "new": new, "nextSince": max((m["createTime"] for m in new), default=since), **extra}

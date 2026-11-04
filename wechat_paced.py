@@ -1,7 +1,7 @@
 """Timing and stop rules for sending chat bubbles at a fast human typing pace.
 
-Pure logic: wechat_cli wires in the real reader and native send. Every bubble waits for
-thinking plus typing time, including the first one after a scheduled start. New messages
+Pure logic: wechat_cli wires in the real reader and native send. The first bubble is
+immediate; later bubbles wait for thinking plus typing time. New messages
 stop the run and hand the unsent bubbles back; an uncertain send stops and is never resent.
 """
 import random
@@ -9,7 +9,6 @@ import re
 import time
 
 CHARS_PER_MINUTE = 100.0
-FIRST_THINK_SECONDS = (6.0, 15.0)
 NEXT_THINK_SECONDS = (0.5, 2.0)
 EMOJI_SECONDS = 1.5  # picking one from the emoji panel
 CHECK_LEAD_SECONDS = 2.0  # one local context read takes about this long
@@ -21,12 +20,11 @@ def typing_seconds(text, chars_per_minute=CHARS_PER_MINUTE):
     return len(plain) * 60 / chars_per_minute + len(_EMOJI.findall(text)) * EMOJI_SECONDS
 
 
-def make_plan(bubbles, *, chars_per_minute=CHARS_PER_MINUTE, first_think=FIRST_THINK_SECONDS,
-              next_think=NEXT_THINK_SECONDS, rng=random):
+def make_plan(bubbles, *, chars_per_minute=CHARS_PER_MINUTE, next_think=NEXT_THINK_SECONDS, rng=random):
     plan = []
     for index, text in enumerate(bubbles):
-        think = rng.uniform(*(first_think if index == 0 else next_think))
-        typing = typing_seconds(text, chars_per_minute)
+        think = rng.uniform(*next_think) if index else 0
+        typing = typing_seconds(text, chars_per_minute) if index else 0
         plan.append({"text": text, "thinkSeconds": round(think, 1), "typingSeconds": round(typing, 1),
                      "waitSeconds": round(think + typing, 1)})
     return plan
@@ -43,6 +41,8 @@ def run_plan(plan, *, started_at, send, newer_messages, now=time.time, sleep=tim
         try:
             newer = newer_messages(index)
         except Exception as exc:
+            if getattr(exc, "details", {}).get("status") == "locked":
+                return {**exc.details, "sent": sent, "unsent": unsent}
             return {"status": "check_failed", "error": str(exc), "sent": sent, "unsent": unsent}
         if newer:
             return {"status": "chat_moved", "new": newer, "sent": sent, "unsent": unsent}
@@ -50,6 +50,8 @@ def run_plan(plan, *, started_at, send, newer_messages, now=time.time, sleep=tim
         try:
             receipt = send(step["text"])
         except Exception as exc:
+            if getattr(exc, "details", {}).get("status") == "locked":
+                return {**exc.details, "sent": sent, "unsent": unsent}
             receipt = {"status": "unknown", "error": str(exc)}
         last = now()
         if receipt.get("status") != "success" or receipt.get("wechatAccepted") is not True:

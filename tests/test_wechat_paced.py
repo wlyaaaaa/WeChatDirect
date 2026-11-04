@@ -2,7 +2,6 @@
 
 import isolation  # noqa: F401
 
-import contextlib
 import io
 import json
 import unittest
@@ -36,13 +35,15 @@ class PacingTests(unittest.TestCase):
         self.assertAlmostEqual(paced.typing_seconds("一二三四五[旺柴]"), 3.0 + paced.EMOJI_SECONDS)
         self.assertAlmostEqual(paced.typing_seconds("一二三四五六七八九十", 200), 3.0)
 
-    def test_plan_thinks_longer_before_the_first_bubble(self):
+    def test_first_bubble_has_no_wait_and_followup_keeps_typing_speed(self):
         rng = mock.Mock()
         rng.uniform.side_effect = lambda low, high: low
         plan = paced.make_plan(["一二", "三"], rng=rng)
-        self.assertEqual(plan[0]["thinkSeconds"], paced.FIRST_THINK_SECONDS[0])
+        self.assertEqual(plan[0]["thinkSeconds"], 0)
+        self.assertEqual(plan[0]["typingSeconds"], 0)
         self.assertEqual(plan[1]["thinkSeconds"], paced.NEXT_THINK_SECONDS[0])
-        self.assertEqual(plan[0]["waitSeconds"], round(paced.FIRST_THINK_SECONDS[0] + 1.2, 1))
+        self.assertEqual(plan[0]["waitSeconds"], 0)
+        self.assertEqual(plan[1]["waitSeconds"], 1.1)
 
     def test_followup_nine_characters_and_emoji_waits_at_most_ten_seconds(self):
         rng = mock.Mock()
@@ -51,7 +52,7 @@ class PacingTests(unittest.TestCase):
         self.assertEqual(plan[1]["waitSeconds"], 8.9)
         self.assertLessEqual(plan[1]["waitSeconds"], 10)
 
-    def test_first_bubble_still_waits_after_the_scheduled_start(self):
+    def test_first_bubble_sends_at_start_then_followup_waits(self):
         clock = Clock()
         sent_at = []
 
@@ -59,10 +60,10 @@ class PacingTests(unittest.TestCase):
             sent_at.append(clock.now())
             return {"status": "success", "wechatAccepted": True}
 
-        result = paced.run_plan(steps(10.0, 4.0), started_at=clock.now(), send=send,
+        result = paced.run_plan(paced.make_plan(["一二", "三"], next_think=(0.5, 0.5)), started_at=clock.now(), send=send,
                                 newer_messages=lambda _index: [], now=clock.now, sleep=clock.sleep)
         self.assertEqual(result["status"], "sent")
-        self.assertEqual(sent_at, [1010.0, 1014.0])
+        self.assertEqual(sent_at, [1000.0, 1001.1])
 
     def test_new_message_stops_and_returns_unsent(self):
         clock = Clock()
@@ -101,7 +102,7 @@ class PacingTests(unittest.TestCase):
         def broken(_index):
             raise cli.ProductError("synthetic_read_failed")
 
-        result = paced.run_plan(steps(1.0), started_at=clock.now(), send=send, newer_messages=broken,
+        result = paced.run_plan(steps(0.0), started_at=clock.now(), send=send, newer_messages=broken,
                                 now=clock.now, sleep=clock.sleep)
         self.assertEqual(result["status"], "check_failed")
         send.assert_not_called()
@@ -155,6 +156,26 @@ class CommandTests(unittest.TestCase):
             "--since", "2026-01-01T10:00:00", "--bubble", "字" * 400])
         with self.assertRaisesRegex(cli.ProductError, "helper_text_utf8_limit"):
             args.handler(args)
+
+    def test_initial_lock_never_connects_or_sends(self):
+        with mock.patch.object(cli, "_check_personal_access", side_effect=cli.ProductError(
+                "locked", status="locked", required_action="verify")):
+            code, report, settings = self.run_command([], "--send")
+        self.assertEqual((code, report["status"]), (2, "locked"))
+        settings.assert_not_called()
+
+    def test_lock_while_waiting_never_sends_or_reads_back(self):
+        locked = cli.ProductError("locked", status="locked", required_action="verify")
+        session = mock.Mock()
+        session.execute.return_value = {"status": "success", "wechatAccepted": True}
+        with (mock.patch.object(cli, "_paced_read", side_effect=[[], [], [], locked]) as read,
+              mock.patch.object(cli, "_paced_session", return_value=session),
+              mock.patch.object(cli.time, "sleep"),
+              mock.patch.object(paced, "make_plan", return_value=steps(0, 0))):
+            code, report, _settings = self.run_command([], "--send", "--bubble", "四五六")
+        self.assertEqual((code, report["status"]), (2, "locked"))
+        self.assertEqual((read.call_count, len(report["sent"]), report["unsent"]), (4, 1, ["bubble1"]))
+        session.execute.assert_called_once()
 
 
 if __name__ == "__main__":

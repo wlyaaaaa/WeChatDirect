@@ -50,12 +50,93 @@ OWNER_RELOGIN = "owner_relogin"  # only the owner can fix this: log the account 
 LOGIN_DIAGNOSTICS = frozenset({"bound_account_not_logged_in", "native_account_mismatch", "native_account_not_ready"})
 IDENTITY_READ_ATTEMPTS = 3  # an empty read during a login switch can be momentary
 IDENTITY_READ_GAP_SECONDS = 0.3
+BRIDGE_BUSY = "bridge_busy"  # upstream allows one connection per WeChat process
+BRIDGE_WAIT_SECONDS = 60  # a yielding wait unloads in seconds, up to about 30 with a native task running
+BRIDGE_RETRY_SECONDS = 0.25
 
 
 class HelperError(RuntimeError):
     def __init__(self, message, **details):
         super().__init__(message)
         self.details = details
+
+
+class NamedLock:
+    """Windows named mutex. The system drops it when the process dies, so a crash leaves nothing stuck."""
+
+    def __init__(self, name):
+        self.kernel = _kernel32()
+        self.owned = False
+        self.handle = self.kernel.CreateMutexW(None, False, name)
+        if not self.handle:
+            raise HelperError("helper_named_lock_unavailable")
+
+    def acquire(self, seconds):
+        status = self.kernel.WaitForSingleObject(self.handle, int(seconds * 1000))
+        self.owned = status in (0, 0x80)  # 0x80: the previous holder died
+        return self.owned
+
+    def close(self):
+        if self.handle:
+            if self.owned:
+                self.kernel.ReleaseMutex(self.handle)
+            self.kernel.CloseHandle(self.handle)
+        self.handle, self.owned = None, False
+
+
+def _kernel32():
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel.CreateMutexW.restype = wintypes.HANDLE
+    kernel.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel.OpenMutexW.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    return kernel
+
+
+def named_lock_exists(name):
+    """True while any live process holds this lock open; never takes it."""
+    kernel = _kernel32()
+    handle = kernel.OpenMutexW(0x100000, False, name)  # SYNCHRONIZE
+    if handle:
+        kernel.CloseHandle(handle)
+    return bool(handle)
+
+
+def send_turn_name(account):
+    return f"Local\\WeChatDirect.Send.{account}"
+
+
+def waiter_name(account, target):
+    return f"Local\\WeChatDirect.Wait.{account}.{hashlib.sha256(target.encode('utf-8')).hexdigest()[:32]}"
+
+
+def take_send_turn(account, seconds=BRIDGE_WAIT_SECONDS):
+    """Ask any wait on this account to step aside; held until the sender has disconnected."""
+    lock = NamedLock(send_turn_name(account))
+    if not lock.acquire(seconds):
+        lock.close()
+        raise HelperError("helper_bridge_busy", diagnosticCode=BRIDGE_BUSY, retryable=False,
+                          nextAction="another_send_is_running_nothing_was_sent")
+    return lock
+
+
+def start_when_free(session, *, seconds=BRIDGE_WAIT_SECONDS, stopped=lambda: False):
+    """Connect, giving the current connection time to finish unloading."""
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            return session.start()
+        except HelperError as exc:
+            if exc.details.get("diagnosticCode") != BRIDGE_BUSY or time.monotonic() >= deadline or stopped():
+                raise
+        time.sleep(BRIDGE_RETRY_SECONDS)
 
 
 def load_settings(path: Path) -> dict:
@@ -226,6 +307,7 @@ def _diagnostics(exc, stage):
         "语音缓存目录必须是无链接的绝对本地路径": "native_media_path_requires_resolved_path",
         "voice_receiver_inactive": "voice_receiver_inactive",
         "voice_payload_unavailable": "exact_voice_payload_unavailable",
+        "这个微信进程已有机器人连接，请先正常退出另一实例": BRIDGE_BUSY,
     }
     message = str(exc)
     result = {"stage": stage, "exceptionType": type(exc).__name__,
@@ -602,7 +684,7 @@ def run_once(session, request):
     try:
         if isinstance(request, dict) and request.get("action") in LIVE_SESSION_ACTIONS:
             raise HelperError("helper_live_session_required", nextAction="use_friend_requests_and_accept_friend_in_the_same_live_helper_session")
-        session.start()
+        start_when_free(session)
         receipt = session.execute(request)
     except (Exception, KeyboardInterrupt) as exc:
         receipt = _error_receipt(exc)

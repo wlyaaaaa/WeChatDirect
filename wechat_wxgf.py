@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import subprocess
 from typing import Final
 
@@ -166,6 +167,30 @@ def _to_gif(hevc: bytes) -> bytes | None:
     return result if result and result.startswith((b"GIF87a", b"GIF89a")) else None
 
 
+def _decode_in_process(hevc: bytes) -> tuple[int, bytes] | None:
+    """Frame count and first frame as PNG, without launching the large ffmpeg programs.
+
+    Anything unexpected returns ``None`` so the caller uses the ffmpeg route.
+    """
+
+    try:
+        import av
+
+        count, first = 0, None
+        with av.open(io.BytesIO(hevc), format="hevc") as container:
+            for frame in container.decode(video=0):
+                count += 1
+                if first is None:
+                    first = frame.to_image()
+        if first is None:
+            return None
+        output = io.BytesIO()
+        first.save(output, "PNG")
+        return count, output.getvalue()
+    except Exception:
+        return None
+
+
 def wxgf_to_image(payload: bytes) -> bytes | None:
     """Convert one decrypted WXGF payload to PNG/GIF or return ``None``.
 
@@ -184,6 +209,9 @@ def wxgf_to_image(payload: bytes) -> bytes | None:
     if len(partitions) != 1:
         return None
     hevc = partitions[0]
+    decoded = _decode_in_process(hevc)
+    if decoded is not None:
+        return decoded[1] if decoded[0] == 1 else _to_gif(hevc)
     frame_count = _frame_count(hevc)
     if frame_count is None:
         return None

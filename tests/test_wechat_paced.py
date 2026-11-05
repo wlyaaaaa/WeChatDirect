@@ -293,6 +293,97 @@ class CommandTests(unittest.TestCase):
         self.assertEqual((code, report["status"], report["unsent"]), (2, "stop_file_exists", ["一二三"]))
         make.assert_not_called()
 
+    def test_wait_steps_aside_while_a_send_holds_the_turn_then_reconnects(self):
+        account = "secondary"
+        args = cli.parser().parse_args(["wait-new", "--account", account, "--target", "filehelper", "--since", "1970-01-01T08:00:00"])
+        session = mock.Mock()
+        session.execute.return_value = {"events": [], "dropped": 0}
+        order = []
+        session.close.side_effect = lambda: order.append("close")
+        session.start.side_effect = lambda: order.append("start")
+        calls = []
+
+        def wait(**kwargs):
+            turn = helper.take_send_turn(account, seconds=0)
+
+            def sender_finishes(_seconds):
+                order.append("hold")
+                turn.close()
+            with mock.patch.object(cli.time, "sleep", side_effect=sender_finishes):
+                calls.append(kwargs["event"](1))
+            return {"status": "timed_out", "new": []}
+
+        with mock.patch("wechat_wait.wait_new", side_effect=wait):
+            cli._wait_on_session(args, session, "filehelper", 0, lambda: [], {"pushAvailable": True})
+        self.assertEqual(calls, [[{"resync": True}]])
+        self.assertEqual(order, ["close", "hold", "start"])
+        session.execute.assert_not_called()
+
+    def test_no_send_means_no_stepping_aside(self):
+        args = cli.parser().parse_args(["wait-new", "--account", "primary", "--target", "filehelper", "--since", "1970-01-01T08:00:00"])
+        session = mock.Mock()
+        session.execute.return_value = {"events": [], "dropped": 0}
+        with mock.patch("wechat_wait.wait_new", side_effect=lambda **kwargs: {"events": kwargs["event"](1)}):
+            self.assertEqual(cli._wait_on_session(args, session, "filehelper", 0, lambda: [], {}), {"events": []})
+        session.close.assert_not_called()
+
+    def test_send_leaves_waiting_to_the_wait_already_on_this_chat(self):
+        session = mock.Mock()
+        session.execute.return_value = {"status": "success", "wechatAccepted": True}
+        session.close.return_value = {}
+        stamp = cli._parse_time("2026-01-01T10:00:02", default=0)
+        presence = helper.NamedLock(helper.waiter_name("secondary", "wxid_synthetic"))
+        self.addCleanup(presence.close)
+        def read(*_args):
+            return ([{"createTime": stamp, "senderRole": "self", "content": "一二三"}]
+                    if session.execute.call_count else [])
+        code, report, _make = self.wait_after(session, read)
+        self.assertEqual((code, report["status"], report["wait"]["status"]), (0, "sent", "existing_waiter"))
+        self.assertEqual(report["wait"]["nextSince"], cli._paced_moment(stamp))
+        self.assertEqual(session.execute.call_count, 1)  # sent, and never received
+
+    def test_busy_connection_sends_nothing_and_hands_every_bubble_back(self):
+        session = mock.Mock()
+        session.start.side_effect = helper.HelperError("helper_start_failed", diagnosticCode=helper.BRIDGE_BUSY)
+        session.close.return_value = {"status": "not_needed"}
+        with mock.patch.object(helper, "BRIDGE_WAIT_SECONDS", 0), mock.patch.object(helper, "start_when_free", side_effect=lambda s, **_k: s.start()):
+            code, report, _make = self.wait_after(session, lambda *_args: [])
+        self.assertEqual((code, report["status"], report["sent"], report["unsent"]), (2, "bridge_busy", [], ["一二三"]))
+        session.execute.assert_not_called()
+
+    def test_start_retries_only_while_the_connection_is_busy(self):
+        busy = helper.HelperError("x", diagnosticCode=helper.BRIDGE_BUSY)
+        session = mock.Mock()
+        session.start.side_effect = [busy, busy, True]
+        with mock.patch.object(helper.time, "sleep"):
+            self.assertTrue(helper.start_when_free(session))
+        self.assertEqual(session.start.call_count, 3)
+        session = mock.Mock()
+        session.start.side_effect = helper.HelperError("x", diagnosticCode="native_exception")
+        with self.assertRaises(helper.HelperError):
+            helper.start_when_free(session)
+        self.assertEqual(session.start.call_count, 1)
+
+    def test_upstream_busy_message_is_recognised(self):
+        details = helper._diagnostics(RuntimeError("这个微信进程已有机器人连接，请先正常退出另一实例"), "start_native_service")
+        self.assertEqual(details["diagnosticCode"], helper.BRIDGE_BUSY)
+
+    def test_named_lock_is_visible_only_while_held(self):
+        name = "Local\\WeChatDirect.Test.synthetic"
+        self.assertFalse(helper.named_lock_exists(name))
+        lock = helper.NamedLock(name)
+        self.assertTrue(lock.acquire(0))
+        self.assertTrue(helper.named_lock_exists(name))
+        lock.close()
+        self.assertFalse(helper.named_lock_exists(name))
+
+    def test_wake_report_carries_what_media_open_needs(self):
+        brief = cli._paced_brief({"createTime": 1, "senderRole": "other", "type": "emoji", "content": "",
+                                  "media_manifest": [{"kind": "emoji", "locator": "loc", "openable": True, "secret": "x"},
+                                                     {"kind": "image"}]})
+        self.assertEqual(brief["media"], [{"kind": "emoji", "locator": "loc", "openable": True}])
+        self.assertNotIn("media", cli._paced_brief({"createTime": 1, "content": "text"}))
+
     def test_failed_send_does_not_start_waiting(self):
         session = mock.Mock()
         session.execute.return_value = {"status": "unknown", "wechatAccepted": None}

@@ -18,7 +18,7 @@ WeChatDirect 主要供 AI 调用，是一个 Windows-only 的本地工具：从�
 - 朋友圈读取的是当前本机缓存；缓存中没有目标时，工具会报告未命中，并要求在同一账号中由用户先完成必要的本机操作后再重试。
 - 图片通过消息原生 MD5 与 `hardlink.db` 精确定位，使用现有保护配置中的媒体密钥解开 V1/V2 DAT；可读原件优先，缩略图会明确标记。表情保留原 PNG/GIF 等格式及每次出现的位置；本机封装无法读取时，显式物化可尝试同条消息已记录的原生 CDN，原生 MD5/大小不符就保留缺口。
 - `VoiceInfo` 语音仍按同消息精确取出，按需派生 WAV；通话状态不是可转写的语音文件。视频、文件仅在消息 MD5 能通过本机原生索引定位到实际文件时交付；本机缺失、封装不可解或来源不一致时不猜内容。
-- `WXGF` 图像封装需要本机 PATH 中可用的 `ffmpeg` 与 `ffprobe`；仅在分区和帧数可证明时转成 PNG 或保留动作的 GIF。复杂多分区/透明度关系未能证明时明确保留缺口，不把第一帧冒充完整动图。
+- `WXGF` 图像封装先用进程内的 PyAV（依赖 `av`）解码：静态图不启动外部程序，比启动 `ffmpeg`/`ffprobe` 快得多（本机两者各 227 MB，每启动一次 2.5–4 秒）；动图仍用 PATH 中的 `ffmpeg` 转 GIF，PyAV 缺失或解码失败时退回 `ffprobe` + `ffmpeg`。仅在分区和帧数可证明时转成 PNG 或保留动作的 GIF。复杂多分区/透明度关系未能证明时明确保留缺口，不把第一帧冒充完整动图。
 
 ## 安装
 
@@ -231,7 +231,13 @@ wechat-direct media-open --account primary --locator "<media-locator>" --output 
 
 目标输出必须不存在，包括发布前被另一进程创建的情况。图片会交付标准可读格式，表情保留静态或动画；语音普通调用保留 SILK，`--voice-wav` 使用上文的 Python 3.11 + `pilk` 派生 WAV。stdout 回执给出实际类型、质量、来源、字节数和 SHA-256。
 
-准确优先、速度其次：图片/表情必须实际打开让当前 AI 看见内容，文件存在或解码成功不代表已经看过含义；GIF/WebP/WXGF 保留动画，先按时间顺序看覆盖完整过程的帧（短动画可全帧），动作/文字快变或结尾反转处按需补密，不能为快漏掉关键变化或用首帧代表完整动作，未覆盖的片段如实说明。语音先用 `media-open --voice-wav` 取得 WAV，再按 `chinese-asr` 当前云优先配置取得真实转写，复用同段音频已有有效结果省时，转写疑点仍保留不确定，不能把提示音或静音当成语音转写成功。
+图片和表情的文件后缀跟实际内容走：`--output emo` 或 `--output emo.jpg` 而内容是 GIF 时，实际写成 `emo.gif`，以回执的 `output` 为准。回执的 `view.path` 是该打开的那一个文件，不用自己抽帧、改后缀：
+
+- 静态 PNG/JPEG/WebP：就是原文件。单帧 GIF 或每帧都一样的“动图”：同目录的 `<名字>.still.png`，`animated=false`。
+- 真动图：同目录的 `<名字>.frames.png`，一张拼图，不同的帧按时间排好并标出帧号和秒数，透明背景铺白。`distinctFrames` 是不同的帧数，`framesShown` 是拼进去的帧数（最多 25，首尾都在），`complete=false` 表示有帧没拼进去。
+- `view=null` 和 `viewError` 表示没做出来，原文件仍已交付，按原文件处理。
+
+准确优先、速度其次：图片/表情必须实际打开让当前 AI 看见内容，文件存在或解码成功不代表已经看过含义；动图看 `view.path` 的拼图，`complete=false` 且动作/文字快变或结尾反转处看不清时，再按需从保留动画的原文件补密，不能用首帧代表完整动作，未覆盖的片段如实说明。语音先用 `media-open --voice-wav` 取得 WAV，再按 `chinese-asr` 当前云优先配置取得真实转写，复用同段音频已有有效结果省时，转写疑点仍保留不确定，不能把提示音或静音当成语音转写成功。
 
 helper 新发的语音也可按同一消息精确读回。优先匹配原生服务器 ID；语音记录尚无服务器 ID 时，只补查当前账号中同聊天、本地消息 ID 与时间的唯一记录，不改源库。仍须实际读取媒体验收，发送回执的 `wechatAccepted` 本身不代表已读回。
 
@@ -300,6 +306,12 @@ wechat-direct helper send-paced --account secondary --contact "<称呼>" --since
 
 对方常秒回时加 `--wait-after`（与 `--send` 一起用，放后台跑）：发完不断开，同一条连接接着等回复，省去一次重连，发送和等待之间没有空档。结果多一个 `wait`，内容与 `wait-new` 的输出相同，但 `new` 不含本组刚发的气泡，`wait.nextSince` 已排在这些气泡之后；可用 `--settle-seconds`、`--max-minutes`、`--include-self`、`--stop-file`，含义同 `wait-new`。`--stop-file` 已存在时返回 `stop_file_exists`，什么都不发；发送途中或 `--not-before` 等待时出现则不再发后面的气泡，返回 `stopped` 和 `unsent`（不加 `--wait-after` 也一样）。没发完（`chat_moved`、`send_uncertain` 等）不进入等待。
 
+**等待挂着也能直接发。** 一个微信进程同时只能有一条原生连接（上游的进程级占用锁 `Local\WxBotBridge.<pid>`；第二条连接若不被拒绝，会把正在用的桥接当遗留物卸载），所以发送和等待不能真的同时连着。发送命令会自己处理：它占住本账号的“发送轮次”，正在等待的 `wait-new` 或 `--wait-after` 在1秒左右看到后断开，等发送结束再重连接着等，同一进程不退出、不叫醒 AI，回报里 `steppedAsideForSend` 记让路次数。使用方不用建停止文件、等退出、再重挂。发送方中途崩溃时系统自动收回轮次，等待不会卡住。让路期间靠发前和每条之间的本机记录检查发现新消息（`chat_moved`），等待重连后也会读记录，3秒后补读一次，所以她这段时间发的不漏；本组刚发的气泡是本人消息，不会叫醒，等她回复时它们和回复一起出现在 `new` 里，`role=self`。实测主号文件传输助手：等待挂着时第一条约 7.3 秒发出，没挂时约 5.5 秒。
+
+加 `--wait-after` 时不用先判断有没有等待：这个聊天已有等待在挂，发完 `wait.status=existing_waiter` 并立即退出，由原来的等待接着等，`wait.nextSince` 已排在本组气泡之后；没有就自己接着等。等的是同号另一个聊天时，发完本命令接着占连接，那个等待重连不上，60 秒后报 `connection_lost` 交回 AI。
+
+60 秒内连不上（另一组发送还没结束、`helper session` 占着连接，或等待是这版之前启动的、不会让路）返回 `status=bridge_busy`，什么都没发，全部气泡在 `unsent`。`helper send-text` 等一次性动作同样会请等待让路，连不上时返回 `helper_bridge_busy`。常驻的 `helper session` 不会让路。
+
 账号已退出登录时不发送（微信升级后读不出账号也会这样报，那时重新登录解决不了），返回 `login_required` 和 `requiredAction=owner_relogin`，`sent` 是已发的，`unsent` 是还没发的；发送途中退出的那条若已调用原生接口，仍按 `send_uncertain` 处理，不自动重发。
 
 若已登记称呼失效，`--contact` 不会沿同名联系人继续发送，而在启动原生服务前返回 `helper_stale_alias_requires_resolution`；应先核对并显式指定 `--target`，或修复称呼后再执行。正常精确名称、仍有效的称呼及显式 `--target` 保持可用，不自动修改或删除称呼。
@@ -367,7 +379,7 @@ wechat-direct wait-new --account secondary --target "<原生ID>" --since "2026-0
 
 账号退出登录时返回 `status=login_required`、`requiredAction=owner_relogin`，并带回本机记录里已到的消息，这时只有本人能重新登录。调用方通知本人后，加 `--wait-login` 重挂：账号未登录时只读核对登录状态（每5秒一次，不向微信加载任何东西），本人登录后立刻返回 `login_restored` 和期间的新消息，调用方按 `nextSince` 正常重挂并接着处理没发的内容；账号本来就在线则与普通等待相同。到 `--max-minutes` 仍未登录再返回一次 `login_required`，收到 `--stop-file` 返回 `stopped`。
 
-标准输出是一份JSON：`status` 为 `new_messages`、`timed_out`、`stopped`、`login_restored` 时退出码0（正常结束，具体看 `status`），`locked`、`read_failed`、`connection_lost`、`login_required` 时退出码2。`now`、`since`、`nextSince` 和每条 `new[].time` 都是北京时间；`waitedSeconds` 为本次耗时；`new` 含期间双方全部消息的 `role`、`type`、`content`、`minutesAgo`。没有新消息时 `nextSince` 等于原时间。`pushAvailable`、`connectedSeconds` 说明连接情况；有事件时附首事件收到时间及与本机记录发送时间的秒差，尚无法匹配时差为null。`cleanup.dllUnloaded` 单独说明原生桥接是否卸载成功。图片和语音仍需原有媒体命令阅读，不把文字投影当完整媒体语境。
+标准输出是一份JSON：`status` 为 `new_messages`、`timed_out`、`stopped`、`login_restored` 时退出码0（正常结束，具体看 `status`），`locked`、`read_failed`、`connection_lost`、`login_required` 时退出码2。`now`、`since`、`nextSince` 和每条 `new[].time` 都是北京时间；`waitedSeconds` 为本次耗时；`new` 含期间双方全部消息的 `role`、`type`、`content`、`minutesAgo`；带媒体的消息另有 `media[]`（`kind`、`locator` 等），可直接交给 `media-open`，不用再跑 `context` 查编号；语音已有微信自己的转文字时 `content` 是该文字，`contentSource=wechat_native_cache`。没有新消息时 `nextSince` 等于原时间。`pushAvailable`、`connectedSeconds` 说明连接情况；有事件时附首事件收到时间及与本机记录发送时间的秒差，尚无法匹配时差为null。`cleanup.dllUnloaded` 单独说明原生桥接是否卸载成功。图片和语音仍需原有媒体命令阅读，不把文字投影当完整媒体语境。
 
 可选本机设置 `personal_data_access` 必须是检查模块的绝对路径：`wait-new` 在命令开始、关闭实时连接后最终读记录之前各查一次 `check_access("factor")`，接收事件期间不反复检查；`helper send-paced` 只在命令开始检查一次。只有字典中的 `status=pass` 放行；文件缺失、检查异常、锁定均返回 `locked` 和 `required_action`。最终读取前锁定时不输出消息正文，`new` 为空、`nextSince` 保持原 `since`。不配置时不检查，便于其他使用者使用。本机真实路径不写入仓库。
 

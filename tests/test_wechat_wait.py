@@ -26,6 +26,24 @@ class WaitTests(unittest.TestCase):
         self.assertEqual(result["new"], [])
         self.assertEqual(read.call_count, 2)  # connect, then the record check just before waking
 
+    def test_after_stepping_aside_own_bubbles_do_not_wake(self):
+        bubbles = [{"createTime": 1005, "senderRole": "self", "content": "mine"}]
+        result = self.run_wait(lambda t: [{"resync": True}] if t == 1004 else [],
+                               read=lambda: bubbles, max_minutes=1)
+        self.assertEqual((result["status"], [m["content"] for m in result["new"]]), ("timed_out", ["mine"]))
+
+    def test_after_stepping_aside_a_reply_in_the_gap_wakes(self):
+        record = [{"createTime": 1005, "senderRole": "self", "content": "mine"},
+                  {"createTime": 1006, "senderRole": "other", "content": "reply"}]
+        result = self.run_wait(lambda t: [{"resync": True}] if t == 1004 else [], read=lambda: record, max_minutes=1)
+        self.assertEqual((result["status"], result["new"][-1]["content"]), ("new_messages", "reply"))
+
+    def test_stepping_aside_rechecks_a_pending_wake_instead_of_losing_it(self):
+        # Her message has an event but has not reached the record yet: the wake must still happen.
+        result = self.run_wait(lambda t: {1001: [{"is_self": False}], 1002: [{"resync": True}]}.get(t, []),
+                               read=lambda: [], max_minutes=1)
+        self.assertEqual(result["status"], "new_messages")
+
     def test_continuous_burst_has_sixty_second_cap(self):
         result = self.run_wait(lambda _t: [{"is_self": False}])
         self.assertEqual((result["status"], result["waitedSeconds"]), ("new_messages", 61))

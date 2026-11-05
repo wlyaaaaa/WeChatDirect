@@ -1990,8 +1990,7 @@ def command_media_open(args: argparse.Namespace) -> int:
     output = Path(args.output)
     if output.exists():
         raise ProductError("media_output_already_exists")
-    temporary = output.with_name(output.name + ".incomplete")
-    if temporary.exists():
+    if output.with_name(output.name + ".incomplete").exists():
         raise ProductError("media_output_incomplete_exists")
     cutoff_s = int(time.time())
     config = _read_config(_resolve_config_path(getattr(args, "config", None)))
@@ -2006,6 +2005,14 @@ def command_media_open(args: argparse.Namespace) -> int:
             else reader.open_locator(args.locator)
         )
         resolved = reader.resolve_locator(args.locator)
+        visual = resolved.get("kind") in {"image", "emoji"}
+        if visual:
+            output = _output_matching_content(output, data, resolved.get("kind"))
+            if output.exists():
+                raise ProductError("media_output_already_exists")
+        temporary = output.with_name(output.name + ".incomplete")
+        if temporary.exists():
+            raise ProductError("media_output_incomplete_exists")
         output.parent.mkdir(parents=True, exist_ok=True)
         if args.voice_wav:
             if not _is_tencent_silk(data):
@@ -2045,8 +2052,35 @@ def command_media_open(args: argparse.Namespace) -> int:
             "quality": resolved.get("quality"),
             "materializationSource": resolved.get("materializationSource", "local"),
         }
+        if visual:
+            receipt.update(_media_view(output, data))
     sys.stdout.buffer.write(_canonical_bytes(receipt))
     return 0
+
+
+def _output_matching_content(output: Path, data: bytes, kind: object) -> Path:
+    """Readers pick their decoder by file suffix, so the suffix must say what the bytes are."""
+    actual = _media_extension(data, kind)
+    current = output.suffix.lower()
+    if actual == ".bin" or current == actual or {current, actual} == {".jpg", ".jpeg"}:
+        return output
+    return output.with_suffix(actual) if current else output.with_name(output.name + actual)
+
+
+def _media_view(output: Path, data: bytes) -> dict[str, Any]:
+    """The one file to open, so a still is never cut into frames. Failure here keeps the delivered original."""
+    from wechat_view import build_view
+
+    try:
+        facts, view, view_kind = build_view(data)
+        path = output
+        if view is not None:
+            path = output.with_name(f"{output.stem}.{view_kind}.png")
+            with path.open("xb") as stream:
+                stream.write(view)
+    except Exception as exc:
+        return {"view": None, "viewError": type(exc).__name__}
+    return {"view": {"path": os.fspath(path.resolve()), **facts}}
 
 
 def _module_available(name: str) -> bool:
@@ -4970,7 +5004,11 @@ def command_helper(args: argparse.Namespace) -> int:
             if getattr(args, "member", None):
                 request["members"] = args.member
             with redirect_stdout(sys.stderr):
-                receipt = helper.run_once(session, request)
+                turn = helper.take_send_turn(args.account)
+                try:
+                    receipt = helper.run_once(session, request)
+                finally:
+                    turn.close()
         sys.stdout.buffer.write(_canonical_bytes(receipt))
         return 0 if receipt["status"] == "success" else 2
     except helper.HelperError as exc:
@@ -5017,6 +5055,13 @@ def _paced_read(args, query, *window) -> list[dict[str, Any]]:
 def _paced_brief(message, now=None) -> dict[str, Any]:
     brief = {"time": _paced_moment(message["createTime"]), "role": message.get("senderRole"),
              "type": message.get("type"), "content": message.get("content")}
+    if message.get("contentSource"):
+        brief["contentSource"] = message["contentSource"]
+    # Everything media-open needs, so a woken reader goes straight to the media.
+    media = [{key: item[key] for key in ("kind", "locator", "openable", "materializable") if key in item}
+             for item in message.get("media_manifest") or [] if item.get("locator")]
+    if media:
+        brief["media"] = media
     if now is not None:
         brief["minutesAgo"] = round((now - message["createTime"]) / 60, 1)
     return brief
@@ -5110,7 +5155,7 @@ def command_send_paced(args: argparse.Namespace) -> int:
         if stop_requested():
             return finish({**report, "status": "stopped", "sent": [], "unsent": args.bubble})
         started = time.time()
-        waited, wait_info = None, {"pushAvailable": True}
+        waited, wait_info, turn, watched = None, {"pushAvailable": True}, None, False
         own_echoes = [_bubble_key(text) for text in args.bubble]
 
         def other_event(event):
@@ -5125,24 +5170,37 @@ def command_send_paced(args: argparse.Namespace) -> int:
 
         with redirect_stdout(sys.stderr):
             try:
-                session.start()
+                # Any wait on this account sees the turn, disconnects, and reconnects once it is released.
+                turn = helper.take_send_turn(args.account)
+                helper.start_when_free(session, stopped=stop_requested)
                 result = paced.run_plan(
                     plan, started_at=started, newer_messages=newer, sleep=pause, stopped=stop_requested,
                     send=lambda text: session.execute({"action": "send-text", "target": target, "text": text}))
-                if args.wait_after and result["status"] == "sent":
+                watched = args.wait_after and helper.named_lock_exists(helper.waiter_name(args.account, target))
+                if args.wait_after and result["status"] == "sent" and not watched:
+                    turn.close()  # sending is done: from here this command is an ordinary wait
                     # Same connection: nothing the other side sends after the last bubble falls in a gap.
                     try:
-                        waited = _wait_on_session(args, session, since, read_after_send, wait_info, keep_event=other_event)
+                        waited = _wait_on_session(args, session, target, since, read_after_send, wait_info, keep_event=other_event)
                     except KeyboardInterrupt:
                         waited = {"status": "stopped", "since": since, "new": []}
                     except Exception as exc:  # the bubbles are out: keep that in the report
                         waited = {"status": "read_failed", "since": since, "new": [], "error": str(exc)}
             except helper.HelperError as exc:
-                if exc.details.get("requiredAction") != helper.OWNER_RELOGIN:
+                if exc.details.get("diagnosticCode") == helper.BRIDGE_BUSY:
+                    result = {"status": "bridge_busy", "error": str(exc), **exc.details, "sent": [], "unsent": args.bubble}
+                elif exc.details.get("requiredAction") == helper.OWNER_RELOGIN:
+                    result = {"status": "login_required", "error": str(exc), **exc.details, "sent": [], "unsent": args.bubble}
+                else:
                     raise
-                result = {"status": "login_required", "error": str(exc), **exc.details, "sent": [], "unsent": args.bubble}
             finally:
                 cleanup = session.close()
+                if turn is not None:
+                    turn.close()
+        if watched and result["status"] == "sent":
+            # The wait already hanging on this chat carries on, so this command does not wait as well.
+            result["wait"] = {"status": "existing_waiter", "since": _paced_moment(since), "new": [],
+                              "nextSince": _paced_moment(since)}
         locked = None
         if waited is not None:
             try:
@@ -5190,15 +5248,33 @@ def command_send_paced(args: argparse.Namespace) -> int:
         raise ProductError(str(exc), **exc.details) from exc
 
 
-WAIT_OK_STATUSES = ("new_messages", "stopped", "timed_out", "login_restored")
+WAIT_OK_STATUSES = ("new_messages", "stopped", "timed_out", "login_restored", "existing_waiter")
+SEND_TURN_POLL_SECONDS = 0.2
 
 
-def _wait_on_session(args, session, since, read, info, keep_event=lambda _event: True):
+def _connect_after_send_turn(helper, session, args):
+    """Connect once no send on this account is running; a stop file ends the hold."""
+    stopped = lambda: bool(args.stop_file and args.stop_file.exists())  # noqa: E731
+    while helper.named_lock_exists(helper.send_turn_name(args.account)):
+        if stopped():
+            raise ProductError("wait_stopped", status="stopped")
+        time.sleep(SEND_TURN_POLL_SECONDS)
+    helper.start_when_free(session, stopped=stopped)
+
+
+def _wait_on_session(args, session, target, since, read, info, keep_event=lambda _event: True):
+    import wechat_helper as helper
     import wechat_wait
 
     def event(seconds):
         if args.stop_file and args.stop_file.exists():
             raise ProductError("wait_stopped", status="stopped")
+        if helper.named_lock_exists(helper.send_turn_name(args.account)):
+            # One connection per WeChat process: step aside, then let the record cover the gap.
+            info["steppedAsideForSend"] = info.get("steppedAsideForSend", 0) + 1
+            session.close()
+            _connect_after_send_turn(helper, session, args)
+            return [{"resync": True}]
         receipt = session.execute({"action": "receive", "seconds": seconds, "limit": 100})
         if receipt.get("dropped"):
             raise ProductError("event_buffer_overflow", status="connection_lost")
@@ -5206,8 +5282,13 @@ def _wait_on_session(args, session, since, read, info, keep_event=lambda _event:
         if events and "firstEventReceivedAt" not in info:
             info["firstEventReceivedAt"], info["firstEventId"] = events[0]["received_at"], str(events[0].get("native_message_id") or "")
         return events
-    return wechat_wait.wait_new(since=since, read=read, event=event, settle_seconds=args.settle_seconds,
-                                max_minutes=args.max_minutes, include_self=args.include_self)
+    # Lets a send on this chat know the wait carries on after it.
+    presence = helper.NamedLock(helper.waiter_name(args.account, target))
+    try:
+        return wechat_wait.wait_new(since=since, read=read, event=event, settle_seconds=args.settle_seconds,
+                                    max_minutes=args.max_minutes, include_self=args.include_self)
+    finally:
+        presence.close()
 
 
 def _finish_wait(result, read):
@@ -5259,9 +5340,9 @@ def command_wait_new(args):
                         ready=session.login_ready, max_minutes=args.max_minutes,
                         stopped=lambda: bool(args.stop_file and args.stop_file.exists()))
                 if login == "logged_in":
-                    session.start()
+                    _connect_after_send_turn(helper, session, args)
                     info.update(pushAvailable=True, connectedSeconds=round(time.time() - started, 3))
-                    result = _wait_on_session(args, session, since, read, info)
+                    result = _wait_on_session(args, session, target, since, read, info)
                 elif login == "timed_out":
                     result = {"status": "login_required", "since": since, "new": [],
                               "error": "helper_account_logged_out", "requiredAction": helper.OWNER_RELOGIN}

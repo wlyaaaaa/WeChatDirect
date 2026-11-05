@@ -73,7 +73,12 @@ def wait_new(*, since, read, event=None, settle_seconds=15, max_minutes=1440,
             due = min(deadline, current + 1, min(last + settle_seconds, first + cap) if first is not None else deadline)
             events = event(max(0, due - current)) if event else sleep(max(0, due - current)) or []
             for e in events or []:
-                if not include_self and e.get("is_self"):
+                if e.get("resync"):
+                    # Reconnected after stepping aside for a send: the record decides what happened meanwhile.
+                    # A wake already pending stays pending; its own check reads the record when due.
+                    if first is None:
+                        recheck_at = now() + RECHECK_SECONDS
+                elif not include_self and e.get("is_self"):
                     # The event only hints: recheck so an unmatched self echo cannot swallow the other side's message.
                     first = last = None
                     recheck_at = now() + RECHECK_SECONDS

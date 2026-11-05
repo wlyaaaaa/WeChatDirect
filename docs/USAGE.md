@@ -298,6 +298,10 @@ wechat-direct helper send-paced --account secondary --contact "<称呼>" --since
 
 确认后加 `--send`。整组共用一次原生连接，发送前和每条之间都读本机记录：`--since` 之后对方有新消息返回 `chat_moved` 和没发的 `unsent`；整组发送前和发送期间本人自己发了新消息同样算，第一条之后按时间顺序用本组已发出的气泡逐条抵消同内容的本人消息，每条气泡只抵消一次，多出的本人消息仍停发，即使内容与后面尚未发送的气泡相同。读不到记录返回 `check_failed`，不盲发。回执不明返回 `send_uncertain`，`uncertain` 是那一条，不自动重发。发完读回，结果在 `readback`、`readbackComplete`，发送期间对方的新消息在 `newAfterSend`。`filehelper` 不做新消息检查，可用来试样子。
 
+对方常秒回时加 `--wait-after`（与 `--send` 一起用，放后台跑）：发完不断开，同一条连接接着等回复，省去一次重连，发送和等待之间没有空档。结果多一个 `wait`，内容与 `wait-new` 的输出相同，但 `new` 不含本组刚发的气泡，`wait.nextSince` 已排在这些气泡之后；可用 `--settle-seconds`、`--max-minutes`、`--include-self`、`--stop-file`，含义同 `wait-new`。`--stop-file` 已存在时返回 `stop_file_exists`，什么都不发；发送途中或 `--not-before` 等待时出现则不再发后面的气泡，返回 `stopped` 和 `unsent`（不加 `--wait-after` 也一样）。没发完（`chat_moved`、`send_uncertain` 等）不进入等待。
+
+账号已退出登录时不发送（微信升级后读不出账号也会这样报，那时重新登录解决不了），返回 `login_required` 和 `requiredAction=owner_relogin`，`sent` 是已发的，`unsent` 是还没发的；发送途中退出的那条若已调用原生接口，仍按 `send_uncertain` 处理，不自动重发。
+
 若已登记称呼失效，`--contact` 不会沿同名联系人继续发送，而在启动原生服务前返回 `helper_stale_alias_requires_resolution`；应先核对并显式指定 `--target`，或修复称呼后再执行。正常精确名称、仍有效的称呼及显式 `--target` 保持可用，不自动修改或删除称呼。
 
 图片与动态 GIF 表情分别对应 `send-image` 和 `send-emoticon`。文件、语音沿用上游 `prepare_file`/`prepare_voice` 的上下文快照和清理，不直接绕过媒体生命周期。语音支持 Tencent SILK；单声道 16-bit PCM WAV 要求上游可选编码器 `pysilk`（发行包 `silk-python`），缺少时明确报错，可先用已有的 Python 3.11/pilk 路线转为 SILK。现有阅读端语音解码配置不会自动变成 helper 的 WAV 编码器。
@@ -359,9 +363,11 @@ wechat-direct wait-new --account secondary --target "<原生ID>" --since "2026-0
 
 `--account` 必须明确选 primary 或 secondary；`--target` 和 `--contact` 二选一，称呼只允许精确联系人或已登记别名，可加 `--chat-type group|private`。`--config` 指定账号配置。`--since` 是上次读到的最后一条消息时间，不带时区按北京时间解释。默认 `--settle-seconds 15`：收到对方消息后等连续15秒没有更新再返回，从首条触发起最多等 `max(60, settle_seconds)` 秒。等静默期间本人自己回了，这一轮不叫醒，继续等对方下一条。本人正在自己聊时用 `--settle-seconds 120`，对方说完两分钟本人没接才叫醒。`--max-minutes` 默认1440，到点结束一次，由人决定是否再挂。`--include-self` 也允许本人事件触发，仅用于从手机发到文件传输助手验收。
 
-命令使用一个经过登录身份核对的原生连接，接收范围仅为指定原生ID，不加载语音识别。连接后先读一次本机记录补齐 `--since` 到连上之间的消息；等待期间只接收实时事件；退出先关闭连接，再读一次记录取得发送时间和全部新增消息。没有定时读记录或断线降级。
+命令使用一个经过登录身份核对的原生连接，接收范围仅为指定原生ID，不加载语音识别。连接后先读一次本机记录补齐 `--since` 到连上之间的消息，3秒后再补读一次，防止连上前到达、当时还没写进记录的消息漏掉；之后只接收实时事件，到点准备叫醒前再读一次，记录最后一条是本人发的就不叫醒（私聊里本人的消息没有实时事件）；退出先关闭连接，再读一次记录取得发送时间和全部新增消息（`connection_lost`、`login_required` 也读，读失败记在 `finalReadError`，`stopped` 不读）。没有定时读记录或断线降级。补读失败不中断等待，记在 `recheckError`。`--since` 按秒比较，与它同一秒的新消息不算新；发完马上等回复请用 `helper send-paced --wait-after`。
 
-标准输出是一份JSON：`status` 为 `new_messages` 时退出码0，`timed_out`、`locked`、`read_failed`、`connection_lost`、`stopped` 时退出码2。`now`、`since`、`nextSince` 和每条 `new[].time` 都是北京时间；`waitedSeconds` 为本次耗时；`new` 含期间双方全部消息的 `role`、`type`、`content`、`minutesAgo`。没有新消息时 `nextSince` 等于原时间。`pushAvailable`、`connectedSeconds` 说明连接情况；有事件时附首事件收到时间及与本机记录发送时间的秒差，尚无法匹配时差为null。`cleanup.dllUnloaded` 单独说明原生桥接是否卸载成功。图片和语音仍需原有媒体命令阅读，不把文字投影当完整媒体语境。
+账号退出登录时返回 `status=login_required`、`requiredAction=owner_relogin`，并带回本机记录里已到的消息，这时只有本人能重新登录。调用方通知本人后，加 `--wait-login` 重挂：账号未登录时只读核对登录状态（每5秒一次，不向微信加载任何东西），本人登录后立刻返回 `login_restored` 和期间的新消息，调用方按 `nextSince` 正常重挂并接着处理没发的内容；账号本来就在线则与普通等待相同。到 `--max-minutes` 仍未登录再返回一次 `login_required`，收到 `--stop-file` 返回 `stopped`。
+
+标准输出是一份JSON：`status` 为 `new_messages`、`timed_out`、`stopped`、`login_restored` 时退出码0（正常结束，具体看 `status`），`locked`、`read_failed`、`connection_lost`、`login_required` 时退出码2。`now`、`since`、`nextSince` 和每条 `new[].time` 都是北京时间；`waitedSeconds` 为本次耗时；`new` 含期间双方全部消息的 `role`、`type`、`content`、`minutesAgo`。没有新消息时 `nextSince` 等于原时间。`pushAvailable`、`connectedSeconds` 说明连接情况；有事件时附首事件收到时间及与本机记录发送时间的秒差，尚无法匹配时差为null。`cleanup.dllUnloaded` 单独说明原生桥接是否卸载成功。图片和语音仍需原有媒体命令阅读，不把文字投影当完整媒体语境。
 
 可选本机设置 `personal_data_access` 必须是检查模块的绝对路径：`wait-new` 在命令开始、关闭实时连接后最终读记录之前各查一次 `check_access("factor")`，接收事件期间不反复检查；`helper send-paced` 只在命令开始检查一次。只有字典中的 `status=pass` 放行；文件缺失、检查异常、锁定均返回 `locked` 和 `required_action`。最终读取前锁定时不输出消息正文，`new` 为空、`nextSince` 保持原 `since`。不配置时不检查，便于其他使用者使用。本机真实路径不写入仓库。
 

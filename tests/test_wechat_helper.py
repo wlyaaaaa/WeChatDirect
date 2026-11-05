@@ -179,6 +179,45 @@ class HelperTests(unittest.TestCase):
             receipt = helper.run_once(self.session, {"action": "send-text", "target": "filehelper", "text": "合成"})
         self.assertNotIn("private-ticket-body", json.dumps(receipt))
 
+    def test_logout_is_named_as_logout_and_asks_for_the_owner(self):
+        self.session.start()
+        self.module.account = None
+        with mock.patch.object(helper.time, "sleep"), self.assertRaises(helper.HelperError) as caught:
+            self.session.execute({"action": "send-text", "target": "filehelper", "text": "合成"})
+        self.assertEqual((str(caught.exception), caught.exception.details["requiredAction"]),
+                         ("helper_account_logged_out", "owner_relogin"))
+        self.assertEqual(self.module.service.calls, [])
+
+    def test_momentary_empty_identity_read_does_not_end_the_session(self):
+        self.session.start()
+        answers = iter([None, WXID])
+        with mock.patch.object(self.module, "inspect_account", side_effect=lambda _pid: next(answers)), \
+                mock.patch.object(helper.time, "sleep"):
+            self.session._verify_identity()
+        self.assertFalse(self.session.poisoned)
+
+    def test_receive_thread_stop_reports_logout_as_the_cause(self):
+        self.session.start()
+        self.module.account = None
+        with mock.patch.object(helper.time, "sleep"), self.assertRaisesRegex(helper.HelperError, "account_logged_out"):
+            self.session._raise_service_stopped()
+        self.module.account = WXID
+        with self.assertRaisesRegex(helper.HelperError, "receive_service_stopped"):
+            self.session._raise_service_stopped()
+
+    def test_login_failures_at_start_ask_for_the_owner_others_do_not(self):
+        self.assertEqual(helper._diagnostics(RuntimeError("等待绑定的机器人账号登录"), "select_process")["requiredAction"], "owner_relogin")
+        self.assertNotIn("requiredAction", helper._diagnostics(RuntimeError("微信核心模块尚未加载"), "select_process"))
+
+    def test_login_ready_reads_without_constructing_a_service(self):
+        self.assertTrue(self.session.login_ready())
+        with mock.patch.object(self.module, "find_account_process", side_effect=RuntimeError("等待绑定的机器人账号登录")):
+            self.assertFalse(self.session.login_ready())
+        with mock.patch.object(self.module, "find_account_process", side_effect=RuntimeError("同一个机器人账号对应多个微信进程，等待唯一的登录会话")), \
+                self.assertRaises(RuntimeError):
+            self.session.login_ready()
+        self.assertIsNone(self.module.service)
+
     def test_account_switch_before_send_blocks_and_closes(self):
         self.session.start()
         self.module.account = "wxid_other"

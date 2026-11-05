@@ -46,6 +46,10 @@ REQUEST_KEYS = {
     "invite-group-members": {"target", "members"}, "create-group": {"members"},
     "close": set(), "status": set(),
 }
+OWNER_RELOGIN = "owner_relogin"  # only the owner can fix this: log the account back in on this computer
+LOGIN_DIAGNOSTICS = frozenset({"bound_account_not_logged_in", "native_account_mismatch", "native_account_not_ready"})
+IDENTITY_READ_ATTEMPTS = 3  # an empty read during a login switch can be momentary
+IDENTITY_READ_GAP_SECONDS = 0.3
 
 
 class HelperError(RuntimeError):
@@ -230,6 +234,8 @@ def _diagnostics(exc, stage):
         value = getattr(exc, name, None)
         if type(value) is int:
             result[name] = value
+    if result["diagnosticCode"] in LOGIN_DIAGNOSTICS:
+        result["requiredAction"] = OWNER_RELOGIN
     match = re.fullmatch(r"接收 Hook 启动失败：(\d+)", message)
     if match:
         result.update(diagnosticCode="native_listen_rejected", nativeCode=int(match[1]))
@@ -258,12 +264,44 @@ class HelperSession:
         self._event_buffer = deque(maxlen=200)
         self._event_dropped = 0
 
+    def _read_identity(self):
+        for attempt in range(IDENTITY_READ_ATTEMPTS):
+            try:
+                actual = self.module.inspect_account(self.service.pid)
+            except OSError:  # the process went away with its login
+                actual = None
+            if isinstance(actual, str) and actual:
+                return actual
+            if attempt + 1 < IDENTITY_READ_ATTEMPTS:
+                time.sleep(IDENTITY_READ_GAP_SECONDS)
+        return None
+
     def _verify_identity(self):
-        actual = self.module.inspect_account(self.service.pid)
-        if not isinstance(actual, str) or not hmac.compare_digest(
-                _identity_hash(actual), self.expected_sha256):
+        actual = self._read_identity()
+        if actual is None:
             self.poisoned = True
-            raise HelperError("helper_account_identity_mismatch")
+            raise HelperError("helper_account_logged_out", diagnosticCode="account_logged_out",
+                              requiredAction=OWNER_RELOGIN)
+        if not hmac.compare_digest(_identity_hash(actual), self.expected_sha256):
+            self.poisoned = True
+            raise HelperError("helper_account_identity_mismatch", requiredAction=OWNER_RELOGIN)
+
+    def _raise_service_stopped(self):
+        # The upstream receive thread also stops on logout; report that as the cause when it is.
+        self._verify_identity()
+        self.poisoned = True
+        raise HelperError("helper_receive_service_stopped", retryable=False)
+
+    def login_ready(self):
+        """Read-only: is the bound account logged in? Loads no bridge into WeChat."""
+        self.module = self.module or native_module(self.settings)
+        try:
+            self.module.find_account_process(self.expected_wxid)
+        except RuntimeError as exc:
+            if _diagnostics(exc, "select_process")["diagnosticCode"] in LOGIN_DIAGNOSTICS:
+                return False
+            raise
+        return True
 
     def start(self):
         # The owner creates this configured root while managed storage is open.
@@ -344,8 +382,7 @@ class HelperSession:
             raise HelperError("helper_session_unavailable", retryable=False)
         self._verify_identity()
         if self.service.last_error is not None:
-            self.poisoned = True
-            raise HelperError("helper_receive_service_stopped", retryable=False)
+            self._raise_service_stopped()
         if action == "status":
             return {"status": "success", "action": action, "account": self.account,
                     "connected": True, "eventTargets": sorted(self.event_targets)}
@@ -420,11 +457,11 @@ class HelperSession:
             if len(events) >= limit or time.monotonic() >= deadline:
                 break
             if self.service.last_error is not None:
-                raise HelperError("helper_receive_service_stopped")
+                self._raise_service_stopped()
             time.sleep(min(0.05, max(0, deadline - time.monotonic())))
         self._verify_identity()
         if self.service.last_error is not None:
-            raise HelperError("helper_receive_service_stopped")
+            self._raise_service_stopped()
         try:
             for event in events:
                 self._recover_received_voice(event)

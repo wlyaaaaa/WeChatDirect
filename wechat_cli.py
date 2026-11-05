@@ -5041,6 +5041,11 @@ def _paced_session(helper, args, config, *, event_targets=("filehelper",)):
         voice_reader=lambda event: _helper_received_voice(account, event))
 
 
+def _bubble_key(text) -> str:
+    # The reader strips message ends, so compare bubbles the same way.
+    return (text or "").strip()
+
+
 def command_send_paced(args: argparse.Namespace) -> int:
     import wechat_helper as helper
 
@@ -5058,21 +5063,34 @@ def command_send_paced(args: argparse.Namespace) -> int:
         since = _parse_time(args.since, default=0)
         start_at = _parse_time(args.not_before, default=0)
         now = time.time()
+        if args.wait_after and not all(0 < value < float("inf") for value in (args.settle_seconds, args.max_minutes)):
+            raise ProductError("wait_intervals_must_be_positive_and_finite")
 
-        def newer(index):
-            if target == "filehelper":
-                return []
-            remaining = list(args.bubble[:index])
+        def stop_requested():
+            return bool(args.stop_file and args.stop_file.exists())
+
+        def pause(seconds):
+            # Short steps so the stop file can cancel a scheduled send.
+            while seconds > 0 and not stop_requested():
+                step = min(seconds, 1.0)
+                time.sleep(step)
+                seconds -= step
+
+        def unplanned(index):
+            remaining = [_bubble_key(text) for text in args.bubble[:index]]
             moved = []
             for message in sorted(_paced_read(args, target, "--since", _paced_moment(since)),
                                   key=lambda message: message["createTime"]):
                 if message["createTime"] <= since:
                     continue
-                if message.get("senderRole") == "self" and message.get("content") in remaining:
-                    remaining.remove(message["content"])
+                if message.get("senderRole") == "self" and _bubble_key(message.get("content")) in remaining:
+                    remaining.remove(_bubble_key(message.get("content")))
                 else:
-                    moved.append(_paced_brief(message))
+                    moved.append(message)
             return moved
+
+        def newer(index):
+            return [] if target == "filehelper" else [_paced_brief(message) for message in unplanned(index)]
 
         plan = paced.make_plan(args.bubble, chars_per_minute=args.cpm, next_think=args.think)
         first_at = max(now, start_at) + plan[0]["waitSeconds"]
@@ -5085,39 +5103,139 @@ def command_send_paced(args: argparse.Namespace) -> int:
         if not args.send:
             return finish({**report, "status": "plan_only"})
 
-        session = _paced_session(helper, args, config)
-        time.sleep(max(0.0, start_at - time.time()))
+        if stop_requested():
+            return finish({**report, "status": "stop_file_exists", "sent": [], "unsent": args.bubble}, 2)
+        session = _paced_session(helper, args, config, event_targets=(target,) if args.wait_after else ("filehelper",))
+        pause(max(0.0, start_at - time.time()))
+        if stop_requested():
+            return finish({**report, "status": "stopped", "sent": [], "unsent": args.bubble})
         started = time.time()
+        waited, wait_info = None, {"pushAvailable": True}
+        own_echoes = [_bubble_key(text) for text in args.bubble]
+
+        def other_event(event):
+            # Our own bubbles coming back must not read as the owner replying by hand.
+            if event.get("is_self") and _bubble_key(event.get("text")) in own_echoes:
+                own_echoes.remove(_bubble_key(event.get("text")))
+                return False
+            return True
+
+        def read_after_send():
+            return unplanned(len(args.bubble))
+
         with redirect_stdout(sys.stderr):
             try:
                 session.start()
                 result = paced.run_plan(
-                    plan, started_at=started, newer_messages=newer,
+                    plan, started_at=started, newer_messages=newer, sleep=pause, stopped=stop_requested,
                     send=lambda text: session.execute({"action": "send-text", "target": target, "text": text}))
+                if args.wait_after and result["status"] == "sent":
+                    # Same connection: nothing the other side sends after the last bubble falls in a gap.
+                    try:
+                        waited = _wait_on_session(args, session, since, read_after_send, wait_info, keep_event=other_event)
+                    except KeyboardInterrupt:
+                        waited = {"status": "stopped", "since": since, "new": []}
+                    except Exception as exc:  # the bubbles are out: keep that in the report
+                        waited = {"status": "read_failed", "since": since, "new": [], "error": str(exc)}
+            except helper.HelperError as exc:
+                if exc.details.get("requiredAction") != helper.OWNER_RELOGIN:
+                    raise
+                result = {"status": "login_required", "error": str(exc), **exc.details, "sent": [], "unsent": args.bubble}
             finally:
                 cleanup = session.close()
+        locked = None
+        if waited is not None:
+            try:
+                waited = _finish_wait(waited, read_after_send)
+            except Exception as exc:
+                # The bubbles are already out: never let this end as an error that reads like "not sent".
+                details = getattr(exc, "details", {})
+                if details.get("status") == "locked":
+                    locked = waited = {"new": [], "error": str(exc), **details}
+                else:
+                    waited = {**waited, "status": "read_failed", "error": str(exc), **details}
+            result["wait"] = _wait_report(waited, since, wait_info, started)
+        if locked:
+            result["readback"], result["readbackComplete"], result["newAfterSend"] = None, False, []
+            return finish({**report, "lastFromOther": None, "lastFromSelf": None, **result, "cleanup": cleanup}, 2)
         for item in result["sent"]:
             item["acceptedAt"] = _paced_moment(item["acceptedAt"])
-        sent_texts = [item["text"] for item in result["sent"]]
+        sent_texts = [_bubble_key(item["text"]) for item in result["sent"]]
         try:
             back = _paced_read(args, target, "--since", _paced_moment(started - 5))
             found = [_paced_brief(message) for message in back
                      if message.get("senderRole") == "self" and message["createTime"] >= int(started) - 5
-                     and message.get("content") in sent_texts]
+                     and _bubble_key(message.get("content")) in sent_texts]
             result["readback"] = found
-            result["readbackComplete"] = [item["content"] for item in found] == sent_texts
+            # A long --wait-after can also read back later identical messages from the owner.
+            result["readbackComplete"] = [_bubble_key(item["content"]) for item in found][:len(sent_texts)] == sent_texts
             result["newAfterSend"] = [] if target == "filehelper" else [
                 _paced_brief(message) for message in back
                 if message["createTime"] > since and message.get("senderRole") != "self"]
-        except ProductError as exc:
+            if "wait" in result:
+                # Move past our own bubbles only: a later message not in wait.new must still come up next time.
+                result["wait"]["nextSince"] = _paced_moment(max(
+                    [_parse_time(result["wait"]["nextSince"], default=0)]
+                    + [message["createTime"] for message in back if message.get("senderRole") == "self"
+                       and _bubble_key(message.get("content")) in sent_texts]))
+        except Exception as exc:  # whatever fails here, the send result above must still be reported
             result["readback"], result["readbackComplete"], result["readbackError"] = None, False, str(exc)
-        return finish({**report, **result, "cleanup": cleanup}, 0 if result["status"] == "sent" else 2)
+        ok = result["status"] in ("sent", "stopped") and result.get("wait", {}).get("status") in (None, *WAIT_OK_STATUSES)
+        return finish({**report, **result, "cleanup": cleanup}, 0 if ok else 2)
     except ProductError as exc:
         if exc.details.get("status") == "locked":
             return finish(exc.details, 2)
         raise
     except helper.HelperError as exc:
         raise ProductError(str(exc), **exc.details) from exc
+
+
+WAIT_OK_STATUSES = ("new_messages", "stopped", "timed_out", "login_restored")
+
+
+def _wait_on_session(args, session, since, read, info, keep_event=lambda _event: True):
+    import wechat_wait
+
+    def event(seconds):
+        if args.stop_file and args.stop_file.exists():
+            raise ProductError("wait_stopped", status="stopped")
+        receipt = session.execute({"action": "receive", "seconds": seconds, "limit": 100})
+        if receipt.get("dropped"):
+            raise ProductError("event_buffer_overflow", status="connection_lost")
+        events = [item for item in receipt.get("events", []) if keep_event(item)]
+        if events and "firstEventReceivedAt" not in info:
+            info["firstEventReceivedAt"], info["firstEventId"] = events[0]["received_at"], str(events[0].get("native_message_id") or "")
+        return events
+    return wechat_wait.wait_new(since=since, read=read, event=event, settle_seconds=args.settle_seconds,
+                                max_minutes=args.max_minutes, include_self=args.include_self)
+
+
+def _finish_wait(result, read):
+    """After the connection closes: recheck access, then read what the wait ended on."""
+    import wechat_wait
+
+    _check_personal_access()
+    since = result.get("since", 0)
+    if result["status"] in {"new_messages", "timed_out", "login_restored"}:
+        result["new"] = wechat_wait.read_new(read, since)
+    elif result["status"] in {"connection_lost", "login_required"}:
+        # The local record does not need the login, and the caller still needs what arrived.
+        try:
+            result["new"] = wechat_wait.read_new(read, since)
+        except Exception as exc:
+            result["finalReadError"] = str(exc)
+    return result
+
+
+def _wait_report(result, since, info, started):
+    finished, messages = time.time(), result.get("new", [])
+    first = next((m for m in messages if str(m.get("serverId")) == info.get("firstEventId")), None)
+    if "firstEventReceivedAt" in info:
+        info["firstEventDelaySeconds"] = info["firstEventReceivedAt"] - first["createTime"] if first else None
+        info["firstEventReceivedAt"] = _paced_moment(info["firstEventReceivedAt"])
+    return {**result, **info, "now": _paced_moment(finished), "since": _paced_moment(since),
+            "waitedSeconds": round(finished - started, 3), "new": [_paced_brief(m, finished) for m in messages],
+            "nextSince": _paced_moment(max((m["createTime"] for m in messages), default=since))}
 
 
 def command_wait_new(args):
@@ -5127,16 +5245,6 @@ def command_wait_new(args):
     info, session, result = {"pushAvailable": False}, None, {}
     def read():
         return [m for m in _paced_read(args, target, "--since", _paced_moment(since)) if m["createTime"] > since]
-    def event(seconds):
-        if args.stop_file and args.stop_file.exists():
-            raise ProductError("wait_stopped", status="stopped")
-        receipt = session.execute({"action": "receive", "seconds": seconds, "limit": 100})
-        if receipt.get("dropped"):
-            raise ProductError("event_buffer_overflow", status="connection_lost")
-        events = receipt.get("events", [])
-        if events and "firstEventReceivedAt" not in info:
-            info["firstEventReceivedAt"], info["firstEventId"] = events[0]["received_at"], str(events[0].get("native_message_id") or "")
-        return events
     try:
         _check_personal_access()
         config_path = _resolve_config_path(args.config)
@@ -5145,28 +5253,38 @@ def command_wait_new(args):
         session = _paced_session(helper, args, config, event_targets=(target,))
         with redirect_stdout(sys.stderr):
             try:
-                session.start()
-                info.update(pushAvailable=True, connectedSeconds=round(time.time() - started, 3))
-                result = wechat_wait.wait_new(since=since, read=read, event=event,
-                    settle_seconds=args.settle_seconds, max_minutes=args.max_minutes, include_self=args.include_self)
+                login = "logged_in"
+                if args.wait_login:
+                    login = wechat_wait.wait_login(
+                        ready=session.login_ready, max_minutes=args.max_minutes,
+                        stopped=lambda: bool(args.stop_file and args.stop_file.exists()))
+                if login == "logged_in":
+                    session.start()
+                    info.update(pushAvailable=True, connectedSeconds=round(time.time() - started, 3))
+                    result = _wait_on_session(args, session, since, read, info)
+                elif login == "timed_out":
+                    result = {"status": "login_required", "since": since, "new": [],
+                              "error": "helper_account_logged_out", "requiredAction": helper.OWNER_RELOGIN}
+                else:
+                    result = {"status": login, "since": since, "new": []}
             finally:
                 info["cleanup"] = session.close()
-        _check_personal_access()
-        if result["status"] not in {"locked", "connection_lost", "stopped", "read_failed"}:
-            result["new"] = wechat_wait.read_new(read, since)
+        result = _finish_wait(result, read)
     except (Exception, KeyboardInterrupt) as exc:
-        result = {"status": "stopped" if isinstance(exc, KeyboardInterrupt) else ("read_failed" if info["pushAvailable"] else "connection_lost"),
-                  "error": str(exc), **getattr(exc, "details", {})}
-    finished, messages = time.time(), result.get("new", [])
-    first = next((m for m in messages if str(m.get("serverId")) == info.get("firstEventId")), None)
-    if "firstEventReceivedAt" in info:
-        info["firstEventDelaySeconds"] = info["firstEventReceivedAt"] - first["createTime"] if first else None
-        info["firstEventReceivedAt"] = _paced_moment(info["firstEventReceivedAt"])
-    result.update(now=_paced_moment(finished), since=_paced_moment(since), waitedSeconds=round(finished - started, 3),
-                  new=[_paced_brief(m, finished) for m in messages],
-                  nextSince=_paced_moment(max((m["createTime"] for m in messages), default=since)), **info)
+        details = getattr(exc, "details", {})
+        failed = "login_required" if details.get("requiredAction") == helper.OWNER_RELOGIN else (
+            "read_failed" if info["pushAvailable"] else "connection_lost")
+        result = {"status": "stopped" if isinstance(exc, KeyboardInterrupt) else failed, "error": str(exc), **details}
+    result = _wait_report(result, since, info, started)
     sys.stdout.buffer.write(_canonical_bytes(result))
-    return 0 if result["status"] == "new_messages" else 2
+    return 0 if result["status"] in WAIT_OK_STATUSES else 2
+
+
+def _add_wait_arguments(command):
+    command.add_argument("--settle-seconds", type=float, default=15)
+    command.add_argument("--max-minutes", type=float, default=1440)
+    command.add_argument("--include-self", action="store_true")
+    command.add_argument("--stop-file", type=Path, help="exit cleanly when this file exists")
 
 
 def _add_helper_commands(commands):
@@ -5202,6 +5320,8 @@ def _add_helper_commands(commands):
             command.add_argument("--think", type=float, nargs=2, default=paced.NEXT_THINK_SECONDS, help="seconds of thinking before each later bubble (min max)")
             command.add_argument("--not-before", help="send the first bubble at this ISO time; naive values use Asia/Shanghai")
             command.add_argument("--send", action="store_true", help="actually send; without it only print the plan")
+            command.add_argument("--wait-after", action="store_true", help="after sending, keep the same connection and wait for the reply like wait-new")
+            _add_wait_arguments(command)
         if action in {"send-text", "send-at-text"}:
             text = command.add_mutually_exclusive_group(required=True)
             text.add_argument("--text")
@@ -5286,10 +5406,8 @@ def parser() -> argparse.ArgumentParser:
     target.add_argument("--contact")
     wait.add_argument("--chat-type", choices=("group", "private"))
     wait.add_argument("--since", required=True)
-    wait.add_argument("--settle-seconds", type=float, default=15)
-    wait.add_argument("--max-minutes", type=float, default=1440)
-    wait.add_argument("--include-self", action="store_true")
-    wait.add_argument("--stop-file", type=Path, help="exit cleanly when this file exists")
+    _add_wait_arguments(wait)
+    wait.add_argument("--wait-login", action="store_true", help="if the account is logged out, hold without connecting and return login_restored once it is back")
     wait.set_defaults(handler=command_wait_new, helper_config=None)
     commitments = commands.add_parser(
         "identity-commitments",

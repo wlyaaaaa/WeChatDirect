@@ -30,7 +30,7 @@ def make_plan(bubbles, *, chars_per_minute=CHARS_PER_MINUTE, next_think=NEXT_THI
     return plan
 
 
-def run_plan(plan, *, started_at, send, newer_messages, now=time.time, sleep=time.sleep):
+def run_plan(plan, *, started_at, send, newer_messages, now=time.time, sleep=time.sleep, stopped=lambda: False):
     """Send each step at its due time; newer_messages(index) lists what stops the run."""
     sent = []
     last = started_at
@@ -45,9 +45,14 @@ def run_plan(plan, *, started_at, send, newer_messages, now=time.time, sleep=tim
         if newer:
             return {"status": "chat_moved", "new": newer, "sent": sent, "unsent": unsent}
         sleep(max(0.0, due - now()))
+        if stopped():
+            return {"status": "stopped", "sent": sent, "unsent": unsent}
         try:
             receipt = send(step["text"])
         except Exception as exc:
+            details = getattr(exc, "details", {})
+            if details.get("requiredAction"):  # raised before the native call, so this bubble did not go out
+                return {"status": "login_required", "error": str(exc), **details, "sent": sent, "unsent": unsent}
             receipt = {"status": "unknown", "error": str(exc)}
         last = now()
         if receipt.get("status") != "success" or receipt.get("wechatAccepted") is not True:

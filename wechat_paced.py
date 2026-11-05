@@ -11,6 +11,7 @@ import time
 CHARS_PER_MINUTE = 100.0
 NEXT_THINK_SECONDS = (0.5, 2.0)
 EMOJI_SECONDS = 1.5  # picking one from the emoji panel
+TYPING_SPREAD = (0.7, 1.3)  # each bubble gets its own speed, so equal lengths do not take equal time
 CHECK_LEAD_SECONDS = 2.0  # one local context read takes about this long
 _EMOJI = re.compile(r"\[[^\[\]]{1,6}\]")  # WeChat built-in emoji written as [name]
 
@@ -20,11 +21,12 @@ def typing_seconds(text, chars_per_minute=CHARS_PER_MINUTE):
     return len(plain) * 60 / chars_per_minute + len(_EMOJI.findall(text)) * EMOJI_SECONDS
 
 
-def make_plan(bubbles, *, chars_per_minute=CHARS_PER_MINUTE, next_think=NEXT_THINK_SECONDS, rng=random):
+def make_plan(bubbles, *, chars_per_minute=CHARS_PER_MINUTE, next_think=NEXT_THINK_SECONDS,
+              typing_spread=TYPING_SPREAD, rng=random):
     plan = []
     for index, text in enumerate(bubbles):
         think = rng.uniform(*next_think) if index else 0
-        typing = typing_seconds(text, chars_per_minute) if index else 0
+        typing = typing_seconds(text, chars_per_minute) * rng.uniform(*typing_spread) if index else 0
         plan.append({"text": text, "thinkSeconds": round(think, 1), "typingSeconds": round(typing, 1),
                      "waitSeconds": round(think + typing, 1)})
     return plan

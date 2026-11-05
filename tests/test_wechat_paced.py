@@ -38,9 +38,16 @@ class PacingTests(unittest.TestCase):
     def test_first_bubble_has_no_wait_and_followup_keeps_typing_speed(self):
         rng = mock.Mock()
         rng.uniform.side_effect = lambda low, high: high
-        plan = paced.make_plan(["一二", "一二三四五六七八九[旺柴]"], rng=rng)
+        plan = paced.make_plan(["一二", "一二三四五六七八九[旺柴]"], typing_spread=(1, 1), rng=rng)
         self.assertEqual(tuple(plan[0][key] for key in ("thinkSeconds", "typingSeconds", "waitSeconds")), (0, 0, 0))
         self.assertEqual((plan[1]["thinkSeconds"], plan[1]["waitSeconds"]), (paced.NEXT_THINK_SECONDS[1], 8.9))
+
+    def test_equal_length_bubbles_get_their_own_typing_speed(self):
+        rng = mock.Mock()
+        rng.uniform.side_effect = lambda low, high: low if rng.uniform.call_count % 4 == 0 else high
+        plan = paced.make_plan(["一", "一二三四五六七八九十", "一二三四五六七八九十"], next_think=(1, 1), rng=rng)
+        self.assertEqual(plan[0]["typingSeconds"], 0)
+        self.assertEqual([plan[1]["typingSeconds"], plan[2]["typingSeconds"]], [7.8, 4.2])
 
     def test_first_bubble_sends_at_start_then_followup_waits(self):
         clock = Clock()
@@ -50,7 +57,7 @@ class PacingTests(unittest.TestCase):
             sent_at.append(clock.now())
             return {"status": "success", "wechatAccepted": True}
 
-        result = paced.run_plan(paced.make_plan(["一二", "三"], next_think=(0.5, 0.5)), started_at=clock.now(), send=send,
+        result = paced.run_plan(paced.make_plan(["一二", "三"], next_think=(0.5, 0.5), typing_spread=(1, 1)), started_at=clock.now(), send=send,
                                 newer_messages=lambda _index: [], now=clock.now, sleep=clock.sleep)
         self.assertEqual((result["status"], sent_at), ("sent", [1000.0, 1001.1]))
 

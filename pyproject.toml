@@ -39,5 +39,5 @@ target-version = "py314"
 [tool.ruff.lint]
 # Preserve the project's established correctness checks across Ruff updates.
 # Ruff 0.16 expanded its defaults substantially; style-policy changes are
-# separate from runtime compatibility and must not silently redefine CI.
+# separate from runtime compatibility and must not silently redefine validation.
 select = ["E4", "E7", "E9", "F"]

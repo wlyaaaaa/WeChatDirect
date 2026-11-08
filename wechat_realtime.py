@@ -132,7 +132,7 @@ class RealtimeContextSession:
                 if item["kind"] == "image":
                     details = reader.resolve_locator(item["locator"])
                     ranks = {"thumbnail": 0, "standard": 1, "original": 2}
-                    if previous and ranks.get(previous.get("quality"), -1) > ranks.get(details.get("quality"), -1):
+                    if previous and ranks.get(previous.get("quality"), -1) >= ranks.get(details.get("quality"), -1):
                         item.update(previous)
                         continue
                     item.update(details)

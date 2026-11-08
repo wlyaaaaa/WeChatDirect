@@ -263,7 +263,7 @@ class NativeMediaSourceTests(unittest.TestCase):
         self.assertTrue(_failure_details(caught.exception)["retryable"])
         self.assertIn("open_this_chat", _failure_details(caught.exception)["nextAction"])
 
-    def test_image_paths_cannot_cross_chat_or_account(self):
+    def test_image_path_boundaries_follow_native_source(self):
         folder, locator = self.packed_image()
         outside = self.root.parent / "escape.dat"
         outside.write_bytes(self.png)
@@ -273,9 +273,30 @@ class NativeMediaSourceTests(unittest.TestCase):
         sibling = self.root / "msg/attach" / ("a" * 32) / "2026-10/Img/image.dat"
         sibling.parent.mkdir(parents=True)
         sibling.write_bytes(self.png)
-        with patch.object(self.reader, "_hardlink_media_paths", return_value=[(sibling, "original")]):
+        resolve = Path.resolve
+        def redirected(path):
+            return sibling if path.name == self.md5 + ".dat" else resolve(path)
+        with patch.object(Path, "resolve", redirected):
             with self.assertRaises(MediaNotOpenableError):
                 self.reader.open_locator(locator)
+
+    def test_hardlink_other_chat_full_image_beats_local_thumbnail_and_keeps_local_tie(self):
+        folder, locator = self.packed_image()
+        (folder / (self.md5 + "_t.dat")).write_bytes(self.png)
+        other_chat = "a" * 32
+        self.hardlink.execute("UPDATE dir2id SET username=? WHERE rowid=1", (other_chat,))
+        self.hardlink.execute("INSERT INTO image_hardlink_info_v4 VALUES (?,?,1,2,200)", (self.md5, self.md5 + ".dat"))
+        other = self.root / "msg/attach" / other_chat / "2026-09/Img" / (self.md5 + ".dat")
+        other.parent.mkdir(parents=True)
+        other.write_bytes(self.png)
+        self.assertEqual(self.reader.open_locator(locator), self.png)
+        self.assertEqual(self.reader.resolve_locator(locator)["quality"], "standard")
+        payload = self.reader._decode_locator(locator)
+        attributes = self.reader._native_media_attributes(payload)
+        self.assertEqual(self.reader._native_media_paths(payload, attributes)[0], (other, "standard"))
+        local = folder / (self.md5 + ".dat")
+        local.write_bytes(self.png)
+        self.assertEqual(self.reader._native_media_paths(payload, attributes)[0], (local, "standard"))
 
     def test_helper_standard_upgrades_thumbnail_but_keeps_original(self):
         folder, locator = self.packed_image()

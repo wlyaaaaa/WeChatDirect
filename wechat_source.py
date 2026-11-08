@@ -3320,10 +3320,11 @@ class DirectWeChatReader:
             except (ValueError, OverflowError, OSError):
                 pass
         result = {}
-        for candidate, quality in [*exact, *paths]:
-            path = candidate.resolve()
-            if path.is_relative_to(root) and path.is_relative_to(chat) and path.is_file():
-                result.setdefault(path, standard if path.name.lower().endswith(".dat") and not path.name.lower().endswith(("_h.dat", "_t.dat")) else quality)
+        for candidates, scope in ((exact, chat), (paths, root)):
+            for candidate, quality in candidates:
+                path = candidate.resolve()
+                if path.is_relative_to(root) and path.is_relative_to(scope) and path.is_file():
+                    result.setdefault(path, standard if path.name.lower().endswith(".dat") and not path.name.lower().endswith(("_h.dat", "_t.dat")) else quality)
         return sorted(result.items(), key=lambda item: {"original": 0, "standard": 1, "thumbnail": 2}[item[1]])
 
     def _helper_image_media(self, payload):

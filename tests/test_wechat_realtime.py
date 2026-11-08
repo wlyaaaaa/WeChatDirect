@@ -176,20 +176,24 @@ class RealtimeContextTests(unittest.TestCase):
                 message = {"serverId": "123", "type": "image", "content": None,
                            "media_manifest": [{"kind": "image", "locator": "visual"}]}
                 reader.fetch_message_by_server_id.side_effect = lambda *_args, **_kwargs: json.loads(json.dumps(message))
-                reader.open_locator.side_effect = [data.getvalue(), data.getvalue() if upgrade else OSError("temporarily unavailable")]
-                reader.resolve_locator.side_effect = [{"quality": "thumbnail"}, {"quality": "standard"}]
+                reader.open_locator.side_effect = [data.getvalue(), data.getvalue(), data.getvalue() if upgrade else OSError("temporarily unavailable")]
+                reader.resolve_locator.side_effect = [{"quality": "thumbnail"}, {"quality": "thumbnail"}, {"quality": "standard"}]
                 record = {"key": ("peer", "123"), "messages": [], "gaps": [], "diagnostics": [],
                           "futures": [], "phase": "preparing", "observed": (0, "synthetic"), "id": "test", "best": {}}
                 directory = session.settings["state_root"] / "materials"
                 directory.mkdir()
-                with mock.patch("wechat_realtime.time.sleep", side_effect=lambda _seconds: current.__setitem__(0, current[0] + 1)):
-                    wrapper._prepare_materials(record, directory, 2)
+                with mock.patch("wechat_realtime.time.sleep", side_effect=lambda _seconds: current.__setitem__(0, current[0] + 1)), \
+                        mock.patch.object(Path, "write_bytes", autospec=True, side_effect=Path.write_bytes) as writes, \
+                        mock.patch.object(Image.Image, "save", autospec=True, side_effect=Image.Image.save) as saves:
+                    wrapper._prepare_materials(record, directory, 3)
+                self.assertEqual(writes.call_count, 2 if upgrade else 1)
+                self.assertEqual(saves.call_count, 2 if upgrade else 1)
                 media = record["messages"][0]["media_manifest"][0]
                 self.assertEqual(media["quality"], "standard" if upgrade else "thumbnail")
                 self.assertEqual(Path(media["output"]).read_bytes(), data.getvalue())
                 self.assertTrue(Path(media["frames"][0]["path"]).is_file())
                 self.assertEqual(record["gaps"], [])
-                self.assertEqual(reader.open_locator.call_count, 2)
+                self.assertEqual(reader.open_locator.call_count, 3)
                 record["phase"] = "preparing"  # completion can race the deadline snapshot
                 current[0] = 15
                 if not upgrade:

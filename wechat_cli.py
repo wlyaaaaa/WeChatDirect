@@ -207,7 +207,7 @@ def _read_config(path: Path) -> dict[str, dict[str, str]]:
 
 def _account_config(config: Mapping[str, dict[str, str]], label: str) -> dict[str, str]:
     try:
-        return config[label]
+        return {**config[label], "label": label}
     except KeyError as exc:
         raise ProductError("wechat_account_not_configured") from exc
 
@@ -247,6 +247,7 @@ def _reader(account: Mapping[str, str], cutoff_s: int) -> DirectWeChatReader:
     if not hmac.compare_digest(actual, expected):
         reader.close()
         raise ProductError("wechat_account_identity_binding_mismatch")
+    reader._helper_image_provider = lambda payload: _helper_cached_image(account, payload)
     return reader
 
 
@@ -4894,6 +4895,17 @@ def _helper_emoji_cache_key(account: Mapping[str, str]) -> bytes:
         raise ProductError(str(exc), **exc.details) from exc
 
 
+def _helper_cached_image(account, payload):
+    import wechat_helper as helper
+
+    try:
+        return helper.read_cached_image(helper.load_settings(_helper_config_path()),
+            account=account.get("label"), account_sha256=account["expected_moments_author_sha256"],
+            chat_hash=str(payload.get("message_table", ""))[4:].lower(), server_id=payload.get("server_id"))
+    except (helper.HelperError, ProductError, OSError, ValueError):
+        return None
+
+
 def _helper_target(args, config, config_path):
     if getattr(args, "target", None):
         return args.target
@@ -5784,6 +5796,9 @@ def _failure_details(exc: Exception) -> dict[str, Any]:
         action = "check_selected_account_local_database"
     elif type(exc).__name__ == "SessionMessageDatabaseMissingError":
         action = "check_selected_chat_local_history"
+    elif reason == "image_not_stored_locally":
+        action = "open_this_chat_in_desktop_wechat_to_load_image_or_retry_later"
+        retryable = True
     elif isinstance(exc, WeChatDirectError):
         action = "check_configured_local_reader"
     elif isinstance(exc, ProductError) and reason.startswith("wechat_"):
@@ -5792,6 +5807,7 @@ def _failure_details(exc: Exception) -> dict[str, Any]:
         action = "inspect_error_before_retrying"
     result: dict[str, Any] = {"retryable": retryable, "nextAction": action}
     if isinstance(exc, WeChatDirectError) and reason in {
+        "image_not_stored_locally",
         "session_database_unavailable",
         "contact_database_unavailable",
         "message_identity_is_conflicting",

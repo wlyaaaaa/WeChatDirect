@@ -118,16 +118,25 @@ class RealtimeContextSession:
             with self.lock:
                 self.processes.discard(process)
 
-    def _media(self, reader, message, directory, deadline):
+    def _media(self, reader, message, directory, deadline, best=None):
         import wechat_cli as cli
         from PIL import Image
         gaps, audio = [], None
         for index, item in enumerate(message.get("media_manifest", [])):
+            key = (str(message["serverId"]), item["locator"])
+            previous = (best or {}).get(key)
             try:
                 if self.clock() >= deadline:
                     raise TimeoutError("media_deadline")
                 data = reader.open_locator(item["locator"], allow_remote=True)
-                path = directory / (str(message["serverId"]) + f"-{index}" + cli._media_extension(data, item["kind"]))
+                if item["kind"] == "image":
+                    details = reader.resolve_locator(item["locator"])
+                    ranks = {"thumbnail": 0, "standard": 1, "original": 2}
+                    if previous and ranks.get(previous.get("quality"), -1) > ranks.get(details.get("quality"), -1):
+                        item.update(previous)
+                        continue
+                    item.update(details)
+                path = directory / (str(message["serverId"]) + f"-{index}-{item.get('quality', 'media')}" + cli._media_extension(data, item["kind"]))
                 path.write_bytes(data)
                 item.update(output=str(path), sha256=hashlib.sha256(data).hexdigest(), materialized=True)
                 if item["kind"] == "voice" and not message.get("content"):
@@ -157,9 +166,14 @@ class RealtimeContextSession:
                             frames.append({"path": str(preview), "atMs": sum(durations[:frame])})
                         item.update(frames=frames, frameCount=count, durationMs=total,
                                     allFramesProvided=len(chosen) == count, visualRead=False)
+                if best is not None:
+                    best[key] = dict(item)
             except Exception as error:
-                gaps.append({"message": message.get("serverId"), "kind": "media_unavailable",
-                             "stage": "media_open", "type": type(error).__name__, "code": str(error)})
+                if previous:
+                    item.update(previous)
+                else:
+                    gaps.append({"message": message.get("serverId"), "kind": "media_unavailable",
+                                 "stage": "media_open", "type": type(error).__name__, "code": str(error)})
         return gaps, audio
 
     def _decode(self, audio, deadline):
@@ -204,7 +218,7 @@ class RealtimeContextSession:
             if result["status"] == "success":
                 record["best"].setdefault(result["nativeMessageId"], result)
         messages = []
-        if record["phase"] == "preparing":
+        if record["phase"] == "preparing" and not (record.get("upgrading") and self.clock() >= record["observed"][0] + 15):
             gaps.append({"kind": "materials_pending", "stage": "material_prepare", "code": "awaiting_bound_materials"})
         for original in originals:
             message = dict(original)
@@ -234,7 +248,7 @@ class RealtimeContextSession:
 
     def _prepare_materials(self, record, directory, deadline):
         import wechat_cli as cli
-        key, submitted = record["key"], set()
+        key, submitted, best = record["key"], set(), {}
         while True:
             messages, gaps, awaiting = [], [], False
             try:
@@ -249,10 +263,12 @@ class RealtimeContextSession:
                     for item in messages:
                         if item.get("contentGap"):
                             gaps.append({"kind": "message_content_gap", "message": item.get("serverId"), "code": item["contentGap"]})
-                        failures, audio = self._media(reader, item, directory, deadline)
+                        failures, audio = self._media(reader, item, directory, deadline, best)
                         gaps.extend(failures)
                         record["diagnostics"].extend(failures)
                         awaiting |= bool(failures)
+                        awaiting |= any(media.get("kind") == "image" and media.get("quality") == "thumbnail"
+                                        for media in item.get("media_manifest", []))
                         if item.get("type") == "voice" and not item.get("content"):
                             server = str(item["serverId"])
                             awaiting |= audio is None
@@ -262,14 +278,15 @@ class RealtimeContextSession:
                                     record["futures"].extend(self.pool.submit(self._candidate, route, key[0], item, decoded, deadline) for route in ("local", "cloud"))
                                 submitted.add(server)
                 with self.lock:
-                    record.update(messages=messages, gaps=gaps)
+                    record.update(messages=messages, gaps=gaps, upgrading=not gaps and awaiting)
                 if not awaiting:
                     break
             except Exception as error:
                 diagnostic = {"stage": "message_read", "type": type(error).__name__, "code": str(error)}
                 record["diagnostics"].append(diagnostic)
                 with self.lock:
-                    record.update(messages=messages, gaps=[{"kind": "message_pending", "diagnostic": diagnostic}])
+                    if not record.get("upgrading"):
+                        record.update(messages=messages, gaps=[{"kind": "message_pending", "diagnostic": diagnostic}])
                 if str(error) == "realtime_exact_message_identity_mismatch":
                     break
             if self.closed or self.clock() >= deadline:

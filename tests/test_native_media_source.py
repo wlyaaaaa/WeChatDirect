@@ -3,6 +3,7 @@ from __future__ import annotations
 import isolation  # noqa: F401
 
 import hashlib
+from datetime import datetime, timezone
 import io
 import json
 from pathlib import Path
@@ -42,7 +43,7 @@ class NativeMediaSourceTests(unittest.TestCase):
         self.messages.execute(f"CREATE TABLE {self.table}(local_id INTEGER, server_id INTEGER, local_type INTEGER, message_content TEXT)")
         self.hardlink = self.connections[self.paths["hardlink.db"]]
         self.hardlink.execute("CREATE TABLE dir2id(username TEXT)")
-        self.hardlink.executemany("INSERT INTO dir2id VALUES (?)", [("synthetic-directory",), ("2026-09",)])
+        self.hardlink.executemany("INSERT INTO dir2id VALUES (?)", [(self.table[4:],), ("2026-09",)])
         self.hardlink.execute("CREATE TABLE image_hardlink_info_v4(md5 TEXT,file_name TEXT,dir1 INTEGER,dir2 INTEGER,modify_time INTEGER)")
         self.emoticon = self.connections[self.paths["emoticon.db"]]
         self.emoticon.execute("CREATE TABLE kNonStoreEmoticonTable(md5 TEXT,aes_key TEXT,cdn_url TEXT)")
@@ -66,7 +67,7 @@ class NativeMediaSourceTests(unittest.TestCase):
     def add_image(self):
         self.messages.execute(f"INSERT INTO {self.table} VALUES (1,101,3,?)", (f'<msg><img md5="{self.md5}"/></msg>',))
         self.hardlink.execute("INSERT INTO image_hardlink_info_v4 VALUES (?,?,1,2,200)", (self.md5, self.md5 + ".dat"))
-        path = self.root / "msg" / "attach" / "synthetic-directory" / "2026-09" / "Img" / (self.md5 + ".dat")
+        path = self.root / "msg" / "attach" / self.table[4:] / "2026-09" / "Img" / (self.md5 + ".dat")
         path.parent.mkdir(parents=True)
         path.write_bytes(self.png)
 
@@ -94,7 +95,7 @@ class NativeMediaSourceTests(unittest.TestCase):
                 xml = (f'<appmsg><type>6</type><title>synthetic.bin</title><appattach><md5>{self.md5}</md5></appattach></appmsg>'
                        if kind == "file" else f'<videomsg md5="{self.md5}"/>')
                 self.messages.execute(f"INSERT INTO {self.table} VALUES (?,?,?,?)", (local_id, local_id + 100, local_type, f"<msg>{xml}</msg>"))
-                path = self.root / "msg" / kind / "synthetic-directory" / "2026-09" / "synthetic.bin"
+                path = self.root / "msg" / kind / self.table[4:] / "2026-09" / "synthetic.bin"
                 path.parent.mkdir(parents=True)
                 path.write_bytes(b"different bytes at the correct native path")
                 locator = self.locator(kind, local_id, local_id + 100)
@@ -208,6 +209,86 @@ class NativeMediaSourceTests(unittest.TestCase):
             self.assertEqual(0, xor)
             with self.assertRaises(DirectCredentialError):
                 wechat_source.load_direct_media_keys(path, "unused-state", "synthetic-other")
+
+    def packed_image(self):
+        self.messages.execute(f"ALTER TABLE {self.table} ADD COLUMN packed_info_data BLOB")
+        self.messages.execute(f"ALTER TABLE {self.table} ADD COLUMN create_time INTEGER")
+        stamp = int(datetime(2026, 10, 31, 17, 12, tzinfo=timezone.utc).timestamp())
+        packed = b"\x08\x02\x10\x0c\x1a\x22\x22\x20" + self.md5.encode()
+        self.messages.execute(f"INSERT INTO {self.table} VALUES (1,101,3,?,?,?)",
+            (f'<msg><img md5="{self.md5}" length="100" hdlength="200"/></msg>', packed, stamp))
+        folder = self.root / "msg/attach" / self.table[4:] / "2026-10/Img"
+        folder.mkdir(parents=True)
+        return folder, self.locator("image")
+
+    def test_image_protobuf_shapes_and_malformed_data(self):
+        stem = self.md5.encode()
+        for value in (b"\x08\x02\x10\x0c\x1a\x28\x08\xb4\x01\x10\xc0\x02\x22\x20" + stem,
+                      b"\x1a\x22\x22\x20" + stem + b"\x58\x00",
+                      b"\x08\x02\x10\x37\x1a\x22\x22\x20" + stem + b"\x58\x00"):
+            self.assertEqual(wechat_source._native_image_stem(value), self.md5)
+        for value in (None, b"\x08\x05\x10\x3e", b"\x1a\x22\x22\x20short", b"\x80" * 12,
+                      b"\x1a\x22\x22\x20" + b"../" + b"a" * 29,
+                      b"\x1a\x22\x22\x20" + stem + b"\x1a\x00"):
+            self.assertIsNone(wechat_source._native_image_stem(value))
+
+    def test_packed_image_quality_preference_and_context(self):
+        folder, locator = self.packed_image()
+        payload = self.reader._decode_locator(locator)
+        for suffix, expected in (("_t.dat", "thumbnail"), (".dat", "standard"), ("_h.dat", "original")):
+            (folder / (self.md5 + suffix)).write_bytes(self.png)
+            self.assertEqual(self.reader._describe_native_media(payload)["quality"], expected)
+            self.assertEqual(self.reader.open_locator(locator), self.png)
+            self.assertEqual(self.reader.resolve_locator(locator)["quality"], expected)
+        (folder / (self.md5 + "_h.dat")).unlink()
+        for hd in (' hdlength="100"', ""):
+            self.messages.execute(f"UPDATE {self.table} SET message_content=?",
+                (f'<img md5="{self.md5}" length="100"{hd}/>',))
+            self.reader.open_locator(locator)
+            self.assertEqual(self.reader.resolve_locator(locator)["quality"], "original")
+
+    def test_month_boundary_and_missing_image_recovery_hint(self):
+        from wechat_cli import _failure_details
+        folder, locator = self.packed_image()
+        path = folder / (self.md5 + "_t.dat")
+        november = folder.parent.parent / "2026-11/Img"
+        november.mkdir(parents=True)
+        (november / path.name).write_bytes(self.png)
+        self.assertEqual(self.reader.open_locator(locator), self.png)
+        (november / path.name).unlink()
+        payload = self.reader._decode_locator(locator)
+        self.assertEqual(self.reader._describe_native_media(payload)["resolution_gap"], "image_not_stored_locally")
+        with self.assertRaisesRegex(MediaNotOpenableError, "image_not_stored_locally") as caught:
+            self.reader.open_locator(locator)
+        self.assertTrue(_failure_details(caught.exception)["retryable"])
+        self.assertIn("open_this_chat", _failure_details(caught.exception)["nextAction"])
+
+    def test_image_paths_cannot_cross_chat_or_account(self):
+        folder, locator = self.packed_image()
+        outside = self.root.parent / "escape.dat"
+        outside.write_bytes(self.png)
+        with patch.object(self.reader, "_hardlink_media_paths", return_value=[(outside, "original")]):
+            with self.assertRaises(MediaNotOpenableError):
+                self.reader.open_locator(locator)
+        sibling = self.root / "msg/attach" / ("a" * 32) / "2026-10/Img/image.dat"
+        sibling.parent.mkdir(parents=True)
+        sibling.write_bytes(self.png)
+        with patch.object(self.reader, "_hardlink_media_paths", return_value=[(sibling, "original")]):
+            with self.assertRaises(MediaNotOpenableError):
+                self.reader.open_locator(locator)
+
+    def test_helper_standard_upgrades_thumbnail_but_keeps_original(self):
+        folder, locator = self.packed_image()
+        (folder / (self.md5 + "_t.dat")).write_bytes(self.png)
+        helper = LocalMedia(self.png, "helper.png", "image/png", "standard", "native_helper_download")
+        with patch.object(self.reader, "_helper_image_provider", create=True, return_value=helper):
+            metadata = self.reader._describe_native_media(self.reader._decode_locator(locator))
+            self.assertEqual(metadata["materializationSource"], "native_helper_download")
+            self.reader.open_locator(locator)
+            self.assertEqual(self.reader.resolve_locator(locator)["quality"], "standard")
+            (folder / (self.md5 + "_h.dat")).write_bytes(self.png)
+            self.reader.open_locator(locator)
+            self.assertEqual(self.reader.resolve_locator(locator)["quality"], "original")
 
 
 if __name__ == "__main__":

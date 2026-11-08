@@ -21,7 +21,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from PIL import Image
 
 
-MediaQuality = Literal["original", "thumbnail"]
+MediaQuality = Literal["original", "standard", "thumbnail"]
 BlobDecoder = Callable[[bytes, str | None], bytes | None]
 
 _MD5 = re.compile(r"[0-9a-f]{32}")

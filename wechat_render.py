@@ -156,6 +156,8 @@ def _media_type(kind: str) -> str:
 def _quality_html(media: Mapping[str, Any]) -> str:
     if media.get("quality") == "thumbnail":
         return '<span class="media-quality">预览质量：缩略图</span>'
+    if media.get("quality") == "standard":
+        return '<span class="media-quality">图片质量：正常图</span>'
     return ""
 
 

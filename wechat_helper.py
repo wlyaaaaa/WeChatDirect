@@ -193,6 +193,70 @@ def _identity_hash(value):
     return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _image_cache_paths(settings, account, account_sha256, chat_hash, server_id):
+    if (account not in ("primary", "secondary") or not re.fullmatch(r"sha256:[0-9a-f]{64}", account_sha256)
+            or not re.fullmatch(r"[0-9a-f]{32}", chat_hash) or not re.fullmatch(r"[1-9][0-9]{0,19}", str(server_id))):
+        raise ValueError("invalid_image_cache_identity")
+    root = (settings["state_root"] / account).resolve()
+    directory = "account-" + account_sha256.removeprefix("sha256:")
+    images, index = root / "images" / directory, root / "image-index" / directory
+    if images.resolve() != images or index.resolve() != index:
+        raise ValueError("image_cache_path_redirected")
+    return root, images, index / f"{chat_hash}-{server_id}.json"
+
+
+def read_cached_image(settings, *, account, account_sha256, chat_hash, server_id):
+    """Read a verified image already downloaded by this account's selected native session."""
+    from wechat_media import LocalMedia, _verify_pillow_visual
+
+    try:
+        root, images, index = _image_cache_paths(settings, account, account_sha256, chat_hash, server_id)
+        record = json.loads(index.read_text(encoding="utf-8"))
+        if (record["account_sha256"], record["chat_hash"], record["server_id"]) != (account_sha256, chat_hash, str(server_id)):
+            return None
+        path = (root / record["path"]).resolve()
+        if not path.is_relative_to(images) or not path.is_file():
+            return None
+        data = path.read_bytes()
+        if len(data) != record["size"] or hashlib.sha256(data).hexdigest() != record["sha256"]:
+            return None
+        visual = _verify_pillow_visual(data)
+        if visual:
+            return LocalMedia(data, path.name, visual[0], "standard", source="native_helper_download")
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        pass
+    return None
+
+
+def _cache_ready_image(session, data):
+    if data.get("wx_type") != 3 or data.get("image_status") != "ready" or data.get("image_quality") not in ("standard", "original"):
+        return
+    temporary = None
+    try:
+        chat_hash = hashlib.md5(data["chat_id"].encode(), usedforsecurity=False).hexdigest()
+        root, images, index = _image_cache_paths(session.settings, session.account, session.expected_sha256,
+                                                chat_hash, data["native_message_id"])
+        path = Path(data["image_path"]).resolve()
+        if not path.is_relative_to(images) or not path.is_file():
+            return
+        body = path.read_bytes()
+        record = {"account_sha256": session.expected_sha256, "chat_hash": chat_hash,
+                  "server_id": str(data["native_message_id"]), "path": str(path.relative_to(root)),
+                  "sha256": hashlib.sha256(body).hexdigest(), "size": len(body)}
+        index.parent.mkdir(parents=True, exist_ok=True)
+        temporary = index.with_suffix(f".{threading.get_ident()}.{time.time_ns()}.tmp")
+        temporary.write_text(json.dumps(record), encoding="utf-8")
+        os.replace(temporary, index)
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        pass
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def read_emoticon_cache_key(settings, *, expected_wxid, expected_sha256) -> bytes:
     """Read this logged-in account's cache key without constructing a service."""
     if not hmac.compare_digest(_identity_hash(expected_wxid), expected_sha256):
@@ -418,6 +482,7 @@ class HelperSession:
     def _on_message(self, _pid, _protocol, data, _service):
         if not isinstance(data, dict) or data.get("chat_id") not in self.event_targets:
             return
+        _cache_ready_image(self, data)
         # XML, CDN credentials and friend-request tickets are never forwarded.
         keys = ("chat_id", "sender_id", "native_sender", "native_receiver", "is_self", "sequence",
                 "native_message_id", "wx_type", "image_path", "image_status", "file_path", "file_status",

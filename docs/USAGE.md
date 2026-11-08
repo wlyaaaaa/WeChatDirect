@@ -177,7 +177,7 @@ wechat-direct export-context --account primary --contact "<contact-or-group>" --
 该命令与 `context` 使用相同的范围、锚点和分页参数，默认生成：
 
 - `conversation.json`：完整的本次消息页、发送者、引用、媒体清单、读取缺口和后续游标。消息数组是阅读顺序的依据。
-- `media/`：本次能够精确打开的媒体文件。媒体项中的 `exportedPath` 相对于阅读包目录，`sha256` 和 `bytes` 描述实际导出的字节；相同文件可以复用，每次消息中的出现位置仍保留。`materializationSource` 区分 `local` 与 `remote`，`quality` 标记原件/缩略图，`mimeType`、尺寸和 `frameCount` 说明实际可读格式。阅读包不需要源数据库 locator、私有 URL 或解密参数。
+- `media/`：本次能够精确打开的媒体文件。媒体项中的 `exportedPath` 相对于阅读包目录，`sha256` 和 `bytes` 描述实际导出的字节；相同文件可以复用，每次消息中的出现位置仍保留。`materializationSource` 区分 `local`、`native_helper_download` 与 `remote`，`quality` 标记 `original`（原图）、`standard`（正常图）、`thumbnail`（缩略图），`mimeType`、尺寸和 `frameCount` 说明实际可读格式。阅读包不需要源数据库 locator、私有 URL 或解密参数。
 - `ai-context.md`：按顺序阅读的入口摘要及媒体引用。摘要不是完整历史，完整本次结果在 `conversation.json`；图片和表情包需要实际交给视觉能力查看，不能由文件名或占位文本推断内容。
 
 输出目录必须是新目录；已有目录和同名 `.incomplete` 均会保留并返回错误。部分消息或媒体不可读取时仍交付可用内容，并报告 `partial` 与具体缺口。`coverage.hasMore` 表示还可继续读取；后续页应使用其游标保持同一账号、聊天和时间窗。
@@ -228,6 +228,8 @@ wechat-direct media-open --account primary --locator "<voice-locator>" --output 
 wechat-direct media-open --account primary --locator "<voice-locator>" --output "<output.wav>" --voice-wav
 wechat-direct media-open --account primary --locator "<media-locator>" --output "<output-file>" --local-only
 ```
+
+图片无需先点开：按同消息的确切文件主干寻找原图、正常图、缩略图，并按此顺序交付；`context` 同样报告实际质量。存在单独原图时，聊天显示的正常图标 `quality=standard`；没有单独原图时标 `original`。只收到缩略图时标 `thumbnail`。实时等待中的原生助手已下好的正常图也可跨进程复用，来源为 `native_helper_download`；`--local-only` 可读这些本机文件，不另开连接或下载。实时上下文会在 15 秒截止前继续尝试把缩略图升级成正常图。连缩略图都未落盘时，返回 `image_not_stored_locally`，可在电脑微信打开这个聊天让图加载，或稍后重试。
 
 目标输出必须不存在，包括发布前被另一进程创建的情况。图片会交付标准可读格式，表情保留静态或动画；语音普通调用保留 SILK，`--voice-wav` 使用上文的 Python 3.11 + `pilk` 派生 WAV。stdout 回执给出实际类型、质量、来源、字节数和 SHA-256。
 

@@ -165,6 +165,36 @@ class RealtimeContextTests(unittest.TestCase):
             wrapper.requests[result["request_id"]]["preparation"].result(timeout=2)
             candidate.assert_not_called()
 
+    def test_thumbnail_upgrades_before_deadline_or_survives_failed_retry(self):
+        from PIL import Image
+        for upgrade in (True, False):
+            with self.subTest(upgrade=upgrade):
+                current = [0.0]
+                wrapper, session, reader, _local = self.fixture(clock=lambda: current[0])
+                data = io.BytesIO()
+                Image.new("RGB", (2, 2)).save(data, "PNG")
+                message = {"serverId": "123", "type": "image", "content": None,
+                           "media_manifest": [{"kind": "image", "locator": "visual"}]}
+                reader.fetch_message_by_server_id.side_effect = lambda *_args, **_kwargs: json.loads(json.dumps(message))
+                reader.open_locator.side_effect = [data.getvalue(), data.getvalue() if upgrade else OSError("temporarily unavailable")]
+                reader.resolve_locator.side_effect = [{"quality": "thumbnail"}, {"quality": "standard"}]
+                record = {"key": ("peer", "123"), "messages": [], "gaps": [], "diagnostics": [],
+                          "futures": [], "phase": "preparing", "observed": (0, "synthetic"), "id": "test", "best": {}}
+                directory = session.settings["state_root"] / "materials"
+                directory.mkdir()
+                with mock.patch("wechat_realtime.time.sleep", side_effect=lambda _seconds: current.__setitem__(0, current[0] + 1)):
+                    wrapper._prepare_materials(record, directory, 2)
+                media = record["messages"][0]["media_manifest"][0]
+                self.assertEqual(media["quality"], "standard" if upgrade else "thumbnail")
+                self.assertEqual(Path(media["output"]).read_bytes(), data.getvalue())
+                self.assertTrue(Path(media["frames"][0]["path"]).is_file())
+                self.assertEqual(record["gaps"], [])
+                self.assertEqual(reader.open_locator.call_count, 2)
+                record["phase"] = "preparing"  # completion can race the deadline snapshot
+                current[0] = 15
+                if not upgrade:
+                    self.assertTrue(wrapper._snapshot(record)["materialComplete"])
+
     def test_main_and_quoted_content_gaps_prevent_complete(self):
         for location in ("main", "quote"):
             with self.subTest(location=location):

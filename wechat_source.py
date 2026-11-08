@@ -13,6 +13,7 @@ import base64
 import binascii
 import ctypes
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from functools import cached_property, lru_cache
 import hashlib
 import hmac
@@ -1477,6 +1478,22 @@ def _native_voice_transcript(value: object) -> str | None:
         return text if text and "\0" not in text else None
     except (ValueError, UnicodeError):
         return None
+
+
+def _native_image_stem(value: object) -> str | None:
+    if not isinstance(value, (bytes, bytearray, memoryview)):
+        return None
+    try:
+        images = [f for f in _protobuf_fields(bytes(value)) if f[0] == 3]
+        if len(images) != 1 or images[0][1] != 2:
+            return None
+        names = [f for f in _protobuf_fields(images[0][2]) if f[0] == 4]
+        if len(names) == 1 and names[0][1] == 2:
+            name = names[0][2].decode("ascii")
+            return name.lower() if re.fullmatch(r"[0-9a-fA-F]{32}", name) else None
+    except (ValueError, UnicodeError):
+        pass
+    return None
 
 
 def _message_content_projection(
@@ -3279,7 +3296,39 @@ class DirectWeChatReader:
                 candidates.append(attributes)
         if not candidates or len({item["md5"] for item in candidates}) != 1:
             return None
+        if kind == "image":
+            stem = _native_image_stem(row["packed_info_data"])
+            if stem and "create_time" in row.keys():
+                candidates[0].update(fileStem=stem, createTime=str(row["create_time"]))
         return candidates[0]
+
+    def _native_media_paths(self, payload, attributes):
+        kind = str(payload["kind"])
+        paths = self._hardlink_media_paths(attributes["md5"], kind)
+        if kind != "image":
+            return paths
+        root = self._storage.parent.resolve()
+        chat = root / "msg" / "attach" / str(payload["message_table"])[4:].lower()
+        standard = "standard" if attributes.get("hdlength") not in {None, "", "0", attributes.get("length")} else "original"
+        exact = []
+        if attributes.get("fileStem"):
+            try:
+                stamp = datetime.fromtimestamp(int(attributes["createTime"]), timezone.utc)
+                months = sorted({(stamp + timedelta(hours=h)).strftime("%Y-%m") for h in (-12, 14)})
+                for suffix, quality in (("_h.dat", "original"), (".dat", standard), ("_t.dat", "thumbnail")):
+                    exact.extend((chat / month / "Img" / (attributes["fileStem"] + suffix), quality) for month in months)
+            except (ValueError, OverflowError, OSError):
+                pass
+        result = {}
+        for candidate, quality in [*exact, *paths]:
+            path = candidate.resolve()
+            if path.is_relative_to(root) and path.is_relative_to(chat) and path.is_file():
+                result.setdefault(path, standard if path.name.lower().endswith(".dat") and not path.name.lower().endswith(("_h.dat", "_t.dat")) else quality)
+        return sorted(result.items(), key=lambda item: {"original": 0, "standard": 1, "thumbnail": 2}[item[1]])
+
+    def _helper_image_media(self, payload):
+        provider = getattr(self, "_helper_image_provider", None)
+        return provider(payload) if provider and payload.get("kind") == "image" else None
 
     def _hardlink_media_paths(self, md5: str, kind: str) -> list[tuple[Path, str]]:
         table = {
@@ -3433,7 +3482,12 @@ class DirectWeChatReader:
                 if declared and declared.isdigit()
                 else None,
             )
-        for path, quality in self._hardlink_media_paths(attributes["md5"], kind):
+        helper = None
+        for path, quality in self._native_media_paths(payload, attributes):
+            if kind == "image" and quality == "thumbnail":
+                helper = self._helper_image_media(payload)
+                if helper is not None:
+                    return helper
             try:
                 data = path.read_bytes()
             except OSError:
@@ -3468,7 +3522,7 @@ class DirectWeChatReader:
                 mimetypes.guess_type(name)[0] or "application/octet-stream",
                 quality,
             )
-        return None
+        return helper or self._helper_image_media(payload)
 
     def _describe_native_media(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         from wechat_media import _is_native_emoji_cdn_url
@@ -3480,9 +3534,12 @@ class DirectWeChatReader:
                 "video",
                 "file",
             }:
-                paths = self._hardlink_media_paths(
-                    attributes["md5"], str(payload["kind"])
-                )
+                paths = self._native_media_paths(payload, attributes)
+                helper = self._helper_image_media(payload) if not paths or paths[0][1] == "thumbnail" else None
+                if helper is not None:
+                    return {"openable": True, "open_status": "openable", "processing_state": "available",
+                            "fileName": helper.file_name, "mimeType": helper.mime_type, "quality": helper.quality,
+                            "size": len(helper.payload), "materializationSource": helper.source}
                 if paths:
                     path, quality = paths[0]
                     return {
@@ -3497,6 +3554,9 @@ class DirectWeChatReader:
                         "cachedBytes": path.stat().st_size,
                         "materializationSource": "local",
                     }
+                if payload.get("kind") == "image":
+                    return {"openable": False, "open_status": "not_openable", "processing_state": "unprocessed",
+                            "resolution_gap": "image_not_stored_locally"}
             media = self._open_native_media(payload)
             if media is not None:
                 return {
@@ -3756,6 +3816,9 @@ class DirectWeChatReader:
         if payload.get("record") == "native_media":
             media = self._open_native_media(payload, allow_remote=allow_remote, materialize=True)
             if media is None:
+                attributes = self._native_media_attributes(payload) if payload.get("kind") == "image" else None
+                if attributes is not None and not self._native_media_paths(payload, attributes):
+                    raise MediaNotOpenableError("image_not_stored_locally")
                 raise MediaNotOpenableError(
                     "bound native media is currently unavailable"
                 )

@@ -36,6 +36,7 @@ import wechat_paced as paced
 
 from wechat_source import (
     DirectWeChatReader,
+    MediaNotOpenableError,
     WeChatDirectError,
     load_direct_source_identity,
     moments_author_identity,
@@ -1988,6 +1989,7 @@ def command_moments(args: argparse.Namespace) -> int:
 
 
 def command_media_open(args: argparse.Namespace) -> int:
+    started = time.monotonic()
     output = Path(args.output)
     if output.exists():
         raise ProductError("media_output_already_exists")
@@ -2000,12 +2002,25 @@ def command_media_open(args: argparse.Namespace) -> int:
         resolved = reader.resolve_locator(args.locator)
         if args.voice_wav and resolved.get("kind") != "voice":
             raise ProductError("media_is_not_voice")
-        data = (
-            reader.open_locator(args.locator, allow_remote=True)
-            if resolved.get("materializable") and not getattr(args, "local_only", False)
-            else reader.open_locator(args.locator)
-        )
+        data, download, open_error = None, {}, None
+        try:
+            data = (
+                reader.open_locator(args.locator, allow_remote=True)
+                if resolved.get("materializable") and not getattr(args, "local_only", False)
+                else reader.open_locator(args.locator)
+            )
+        except MediaNotOpenableError as error:
+            if resolved.get("kind") != "image":
+                raise
+            open_error = error
         resolved = reader.resolve_locator(args.locator)
+        if resolved.get("kind") == "image" and (data is None or resolved.get("quality") == "thumbnail") and not getattr(args, "local_only", False):
+            media, download = _download_image_for_open(account, reader, args.locator)
+            if media is not None:
+                data = media.payload
+                resolved.update(quality=media.quality, mimeType=media.mime_type, materializationSource=media.source)
+        if data is None:
+            raise open_error or MediaNotOpenableError("image_not_stored_locally")
         visual = resolved.get("kind") in {"image", "emoji"}
         if visual:
             output = _output_matching_content(output, data, resolved.get("kind"))
@@ -2055,6 +2070,16 @@ def command_media_open(args: argparse.Namespace) -> int:
         }
         if visual:
             receipt.update(_media_view(output, data))
+        if download:
+            receipt["imageDownload"] = download
+            if download.get("cleanup", {}).get("status") not in {None, "success", "not_needed"}:
+                receipt["status"] = "partial"
+        if resolved.get("kind") == "image" and resolved.get("quality") == "thumbnail":
+            receipt.update(status="partial", reason=download.get("reason") or "standard_image_download_disabled_local_only",
+                warning="仅缩略图：未取得正常图，请在电脑微信打开这个聊天让图片加载。",
+                nextAction="open_this_chat_in_desktop_wechat_to_load_image")
+        if resolved.get("kind") == "image":
+            receipt["elapsedSeconds"] = round(time.monotonic() - started, 3)
     sys.stdout.buffer.write(_canonical_bytes(receipt))
     return 0
 
@@ -4904,6 +4929,20 @@ def _helper_cached_image(account, payload):
             chat_hash=str(payload.get("message_table", ""))[4:].lower(), server_id=payload.get("server_id"))
     except (helper.HelperError, ProductError, OSError, ValueError):
         return None
+
+
+def _download_image_for_open(account, reader, locator):
+    import wechat_helper as helper
+
+    started = time.monotonic()
+    try:
+        attributes, chat, server = reader.image_download_request(locator)
+        return helper.download_bound_image(helper.load_settings(_helper_config_path()), account=account["label"],
+            expected_wxid=reader.moments_self_native_id, expected_sha256=account["expected_moments_author_sha256"],
+            chat_id=chat, server_id=server, attributes=attributes)
+    except Exception as error:
+        code = str(error) if isinstance(error, (helper.HelperError, ProductError, WeChatDirectError)) else "native_image_download_unavailable"
+        return None, {"attempted": False, "reason": code, "downloadElapsedSeconds": round(time.monotonic() - started, 3)}
 
 
 def _helper_target(args, config, config_path):

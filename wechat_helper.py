@@ -18,9 +18,11 @@ from pathlib import Path
 import re
 import struct
 import sys
+import tempfile
 import threading
 import time
 from typing import Callable, Mapping
+import xml.etree.ElementTree as ET
 
 
 UPSTREAM_COMMIT = "0a0cf6e09650fd2838af2042c4d7472c071977ee"
@@ -257,6 +259,79 @@ def _cache_ready_image(session, data):
                 pass
 
 
+def download_bound_image(settings, *, account, expected_wxid, expected_sha256, chat_id, server_id, attributes):
+    """Explicitly download one source-bound image, using the pinned upstream's private downloader."""
+    from wechat_media import LocalMedia, _verify_pillow_visual
+
+    receipt = {"attempted": True, "downloadElapsedSeconds": 0.0, "reason": "native_image_download_failed"}
+    turn, session, result = None, None, None
+    queued = time.monotonic()
+    try:
+        chat_id = _target(chat_id)
+        chat_hash = hashlib.md5(chat_id.encode(), usedforsecurity=False).hexdigest()
+        _, images, _ = _image_cache_paths(settings, account, expected_sha256, chat_hash, server_id)
+        turn = take_send_turn(account)
+        session = HelperSession(settings, account=account, expected_wxid=expected_wxid,
+                                expected_sha256=expected_sha256, event_targets=(chat_id,), receive_images=False)
+        start_when_free(session)
+        receipt["waitElapsedSeconds"] = round(time.monotonic() - queued, 3)
+        metadata_module = importlib.import_module("wxbot_framework.image_metadata")
+        receiver_module = importlib.import_module("wxbot_framework.image_receiver")
+        for module, filename in ((metadata_module, "image_metadata.py"), (receiver_module, "image_receiver.py")):
+            if Path(module.__file__).resolve() != settings["runtime_path"].resolve() / "wxbot_framework" / filename:
+                raise HelperError("helper_runtime_module_conflict")
+        root = ET.Element("msg")
+        ET.SubElement(root, "img", dict(attributes))
+        metadata = metadata_module.parse_image_metadata(ET.tostring(root, encoding="unicode"))
+        if not metadata.aeskey or not (metadata.cdnmidimgurl or metadata.filekey or metadata.cdnbigimgurl):
+            receipt["reason"] = "native_image_metadata_unavailable"
+            raise HelperError("helper_image_metadata_unavailable")
+        store = metadata_module.ImageStore(images.parent, expected_wxid)
+        images.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".bound-image-", dir=images) as workspace:
+            destination = Path(workspace) / "image.bin"
+            session._verify_identity()
+            started = time.monotonic()
+            try:
+                if session.service._download_image(metadata, destination) is not True:
+                    raise HelperError("helper_image_download_failed")
+                # Private upstream 0a0cf6e interface: bounded, non-linked ordinary file only.
+                body = receiver_module.ImageReceiver._read_download(destination)
+            finally:
+                receipt["downloadElapsedSeconds"] = round(time.monotonic() - started, 3)
+            session._verify_identity()
+            if _verify_pillow_visual(body) is None:
+                raise HelperError("helper_image_verification_failed")
+            path = store.save(body)
+        _cache_ready_image(session, {"chat_id": chat_id, "native_message_id": server_id, "wx_type": 3,
+                                    "image_status": "ready", "image_quality": "standard", "image_path": str(path)})
+        media = read_cached_image(settings, account=account, account_sha256=expected_sha256,
+                                  chat_hash=chat_hash, server_id=server_id)
+        if media is None:
+            raise HelperError("helper_image_verification_failed")
+        result = LocalMedia(media.payload, media.file_name, media.mime_type, "standard", source="native_helper_on_demand")
+        receipt["reason"] = None
+    except Exception as exc:
+        receipt.update(_diagnostics(exc, "download_bound_image"))
+        if isinstance(exc, HelperError):
+            receipt.update({key: value for key, value in exc.details.items() if key in ("diagnosticCode", "requiredAction")})
+        if receipt.get("diagnosticCode") not in {None, "native_exception"}:
+            receipt["reason"] = receipt["diagnosticCode"]
+        elif isinstance(exc, HelperError) and str(exc) in {
+                "helper_environment_unavailable", "helper_state_root_unavailable", "helper_runtime_module_conflict",
+                "helper_account_identity_mismatch", "helper_image_metadata_unavailable", "helper_image_verification_failed"}:
+            receipt["reason"] = str(exc)
+    finally:
+        try:
+            receipt["cleanup"] = session.close() if session is not None else {"status": "not_needed", "dllUnloaded": True}
+        except Exception:
+            receipt["cleanup"] = {"status": "incomplete", "error": "helper_cleanup_incomplete"}
+        finally:
+            if turn is not None:
+                turn.close()
+    return result, receipt
+
+
 def read_emoticon_cache_key(settings, *, expected_wxid, expected_sha256) -> bytes:
     """Read this logged-in account's cache key without constructing a service."""
     if not hmac.compare_digest(_identity_hash(expected_wxid), expected_sha256):
@@ -392,7 +467,7 @@ def _diagnostics(exc, stage):
 
 class HelperSession:
     def __init__(self, settings, *, account, expected_wxid, expected_sha256,
-                 event_targets=("filehelper",), module=None, voice_reader=None):
+                 event_targets=("filehelper",), module=None, voice_reader=None, receive_images=True):
         if account not in ("primary", "secondary"):
             raise HelperError("helper_explicit_account_required")
         if not hmac.compare_digest(_identity_hash(expected_wxid), expected_sha256):
@@ -403,6 +478,7 @@ class HelperSession:
         self.settings, self.account = settings, account
         self.expected_wxid, self.expected_sha256 = expected_wxid, expected_sha256
         self.module, self.service = module, None
+        self.receive_images = receive_images
         self.voice_reader = voice_reader
         self.started = False
         self.poisoned = False
@@ -463,7 +539,8 @@ class HelperSession:
             root = (self.settings["state_root"] / self.account).resolve()
             stage = "construct_service"
             self.service = self.module.NativeTextService(
-                pid=pid, account=self.expected_wxid, image_allowlist=list(self.event_targets),
+                # Upstream treats [] as all chats; an impossible empty ID disables its media queues.
+                pid=pid, account=self.expected_wxid, image_allowlist=list(self.event_targets) if self.receive_images else [""],
                 media_directory=root / "images", file_directory=root / "files",
                 voice_directory=root / "voices", emoticon_directory=root / "emoticons",
                 wechat_data_directory=None, preserve_reports=False)

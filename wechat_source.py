@@ -3331,6 +3331,16 @@ class DirectWeChatReader:
         provider = getattr(self, "_helper_image_provider", None)
         return provider(payload) if provider and payload.get("kind") == "image" else None
 
+    def image_download_request(self, locator):
+        payload = self._decode_locator(locator)
+        attributes = self._native_media_attributes(payload) if payload.get("record") == "native_media" and payload.get("kind") == "image" else None
+        chat_hash, server = str(payload.get("message_table", ""))[4:].lower(), payload.get("server_id")
+        chats = [item["id"] for item in self.list_sessions()
+                 if hashlib.md5(item["id"].encode(), usedforsecurity=False).hexdigest() == chat_hash]
+        if attributes is None or len(chats) != 1 or not re.fullmatch(r"[1-9][0-9]{0,19}", str(server)):
+            raise DirectSchemaError("image_download_message_binding_unavailable")
+        return attributes, chats[0], server
+
     def _hardlink_media_paths(self, md5: str, kind: str) -> list[tuple[Path, str]]:
         table = {
             "image": "image_hardlink_info_v4",
@@ -3554,6 +3564,9 @@ class DirectWeChatReader:
                         "quality": quality,
                         "cachedBytes": path.stat().st_size,
                         "materializationSource": "local",
+                        **({"resolution_gap": "only_thumbnail_local",
+                            "standardDownload": {"command": "media-open", "requiresLogin": True, "requiresNetwork": True}}
+                           if payload.get("kind") == "image" and quality == "thumbnail" else {}),
                     }
                 if payload.get("kind") == "image":
                     return {"openable": False, "open_status": "not_openable", "processing_state": "unprocessed",

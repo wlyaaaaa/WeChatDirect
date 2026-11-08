@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -97,6 +98,8 @@ def _kernel32():
     kernel.OpenMutexW.restype = wintypes.HANDLE
     kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
     kernel.ReleaseMutex.argtypes = [wintypes.HANDLE]
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
     return kernel
@@ -259,7 +262,7 @@ def _cache_ready_image(session, data):
                 pass
 
 
-def download_bound_image(settings, *, account, expected_wxid, expected_sha256, chat_id, server_id, attributes):
+def download_bound_image(settings, *, account, expected_wxid, expected_sha256, chat_id, server_id, attributes, deadline=None):
     """Explicitly download one source-bound image, using the pinned upstream's private downloader."""
     from wechat_media import LocalMedia, _verify_pillow_visual
 
@@ -270,10 +273,12 @@ def download_bound_image(settings, *, account, expected_wxid, expected_sha256, c
         chat_id = _target(chat_id)
         chat_hash = hashlib.md5(chat_id.encode(), usedforsecurity=False).hexdigest()
         _, images, _ = _image_cache_paths(settings, account, expected_sha256, chat_hash, server_id)
-        turn = take_send_turn(account)
         session = HelperSession(settings, account=account, expected_wxid=expected_wxid,
                                 expected_sha256=expected_sha256, event_targets=(chat_id,), receive_images=False)
-        start_when_free(session)
+        session.module = native_module(settings)
+        session.module.find_account_process(expected_wxid)  # Fail before waiting for a send turn when logged out.
+        turn = take_send_turn(account, seconds=max(0, deadline - time.monotonic()) if deadline else BRIDGE_WAIT_SECONDS)
+        start_when_free(session, seconds=max(0, deadline - time.monotonic()) if deadline else BRIDGE_WAIT_SECONDS)
         receipt["waitElapsedSeconds"] = round(time.monotonic() - queued, 3)
         metadata_module = importlib.import_module("wxbot_framework.image_metadata")
         receiver_module = importlib.import_module("wxbot_framework.image_receiver")
@@ -292,6 +297,7 @@ def download_bound_image(settings, *, account, expected_wxid, expected_sha256, c
             destination = Path(workspace) / "image.bin"
             session._verify_identity()
             started = time.monotonic()
+            receipt["downloadStarted"] = True
             try:
                 if session.service._download_image(metadata, destination) is not True:
                     raise HelperError("helper_image_download_failed")
@@ -330,6 +336,107 @@ def download_bound_image(settings, *, account, expected_wxid, expected_sha256, c
             if turn is not None:
                 turn.close()
     return result, receipt
+
+
+def _image_worker_alive(pid):
+    if type(pid) is not int or pid <= 0:
+        return False
+    kernel = _kernel32()
+    handle = kernel.OpenProcess(0x100000, False, pid)
+    if not handle:
+        return False
+    try:
+        return kernel.WaitForSingleObject(handle, 0) == 0x102
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _image_download_worker():
+    request = json.load(sys.stdin)
+    settings = {key: Path(value) for key, value in request.pop("settings").items()}
+    result, deadline = Path(request.pop("result")), request.pop("deadline")
+    receipt = {"attempted": True, "reason": "native_image_download_unavailable"}
+    try:
+        for attempt in (1, 2):
+            media, receipt = download_bound_image(settings, deadline=deadline, **request)
+            receipt["attempts"] = attempt
+            if (media is not None or not receipt.get("downloadStarted")
+                    or receipt.get("reason") not in {"native_image_download_failed", "native_timeout"}
+                    or receipt.get("cleanup", {}).get("status") == "incomplete"
+                    or time.monotonic() >= deadline - 3.5):
+                break
+    except Exception:
+        pass  # Never persist a native exception, XML, CDN URL or key.
+    temporary = result.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"pending": False, "receipt": receipt}), encoding="utf-8")
+    os.replace(temporary, result)
+
+
+def download_image_for_open(settings, *, deadline, **request):
+    """Wait within the command budget; the detached child alone owns native cleanup."""
+    from wechat_media import LocalMedia
+
+    if not settings["state_root"].is_dir():
+        raise HelperError("helper_state_root_unavailable")
+    chat_hash = hashlib.md5(request["chat_id"].encode(), usedforsecurity=False).hexdigest()
+    cache = dict(account=request["account"], account_sha256=request["expected_sha256"],
+                 chat_hash=chat_hash, server_id=request["server_id"])
+    media = read_cached_image(settings, **cache)
+    if media is not None:
+        return media, {"attempted": False, "reason": None, "cacheHit": True}
+    _, _, index = _image_cache_paths(settings, **cache)
+    result = index.with_suffix(".download.json")
+    def record():
+        try:
+            value = json.loads(result.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            return {}
+    lock = NamedLock("Local\\WeChatDirect.Image." + hashlib.sha256(str(index).encode()).hexdigest())
+    try:
+        # A timed-out launcher lock cannot make an older completion record current.
+        if time.monotonic() >= deadline:
+            return None, {"attempted": False, "reason": "native_image_download_timeout", "backgroundPending": False}
+        if lock.acquire(max(0, deadline - time.monotonic())):
+            media = read_cached_image(settings, **cache)
+            if media is not None:
+                return media, {"attempted": False, "reason": None, "cacheHit": True}
+            previous = record()
+            if not previous.get("pending") or not _image_worker_alive(previous.get("pid")):
+                if time.monotonic() >= deadline:
+                    return None, {"attempted": False, "reason": "native_image_download_timeout", "backgroundPending": False}
+                index.parent.mkdir(parents=True, exist_ok=True)
+                child = subprocess.Popen([sys.executable, "-c", "import wechat_helper; wechat_helper._image_download_worker()"],
+                    cwd=Path(__file__).resolve().parent, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0))
+                result.write_text(json.dumps({"pending": True, "pid": child.pid}), encoding="utf-8")
+                child.stdin.write(json.dumps(request | {"settings": {key: str(value) for key, value in settings.items()},
+                    "result": str(result), "deadline": deadline}).encode("utf-8"))
+                child.stdin.close()
+        else:
+            return None, {"attempted": True, "reason": "native_image_download_timeout", "backgroundPending": True}
+    finally:
+        lock.close()
+    while True:
+        state = record()
+        if state.get("pending") is False:
+            media = read_cached_image(settings, **cache)
+            if media is not None:
+                media = LocalMedia(media.payload, media.file_name, media.mime_type, "standard", source="native_helper_on_demand")
+            return media, state["receipt"]
+        if state.get("pending") and not _image_worker_alive(state.get("pid")):
+            if record().get("pending") is False:  # Completion can race the process liveness check.
+                continue
+            return None, {"attempted": True, "reason": "native_image_worker_exited", "backgroundPending": False}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            media = read_cached_image(settings, **cache)
+            if media is not None:  # Download finished; only the safe disconnect is still pending.
+                media = LocalMedia(media.payload, media.file_name, media.mime_type, "standard", source="native_helper_on_demand")
+                return media, {"attempted": True, "reason": None, "backgroundPending": True, "cleanup": {"status": "pending"}}
+            return None, {"attempted": True, "reason": "native_image_download_timeout", "backgroundPending": True,
+                          "nextAction": "read_this_image_again_after_background_download"}
+        time.sleep(min(0.05, remaining))
 
 
 def read_emoticon_cache_key(settings, *, expected_wxid, expected_sha256) -> bytes:

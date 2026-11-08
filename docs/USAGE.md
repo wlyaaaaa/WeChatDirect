@@ -229,9 +229,11 @@ wechat-direct media-open --account primary --locator "<voice-locator>" --output 
 wechat-direct media-open --account primary --locator "<media-locator>" --output "<output-file>" --local-only
 ```
 
-图片无需先点开：依次交付本机原图、本机正常图、助手索引中已有的正常图；显式 `media-open` 还会临时连接所选账号，按这条消息下载正常图，最后才退回缩略图。存在单独原图时，本机 `.dat` 标 `quality=standard`；没有单独原图时标 `original`。已有助手图来源为 `native_helper_download`，临时下载为 `native_helper_on_demand`，下载耗时见 `imageDownload.downloadElapsedSeconds`。临时下载需要该账号在电脑上登录，先占用发送轮次让等待会话让路，关闭后归还；不发消息。没有其他连接占用时目标 15 秒内完成，等待让路沿用既有上限；原生下载故障的收尾可能超过目标，回执报告实际耗时。
+图片无需先点开：依次交付本机原图、本机正常图、助手索引中已有的正常图；显式 `media-open` 还会临时连接所选账号，按这条消息下载正常图，最后才退回缩略图。存在单独原图时，本机 `.dat` 标 `quality=standard`；没有单独原图时标 `original`。已有助手图来源为 `native_helper_download`，临时下载为 `native_helper_on_demand`，完成回执中的下载耗时见 `imageDownload.downloadElapsedSeconds`。临时下载需要该账号在电脑上登录，由隐藏的短命子进程占用发送轮次、连接、下载、写索引、关闭连接并归还轮次；不发消息。前台从命令开始只等到约 13.5 秒，留出写文件和输出的余量，15 秒内交回。第一次下载明确失败或报错、收尾完成且尚未到第 10 秒时，自动重试一次；未登录或助手不可用立即退回。
 
-`--local-only` 只读本机和已有助手索引，不触发临时下载。`context`、导出及实时会话 reader 也不触发这次下载：只有缩略图时，`context` 标 `only_thumbnail_local` 并给出需要登录的 `standardDownload` 提示；实时会话继续用自己的连接下载。最终只能交缩略图时，`media-open` 回执为 `status=partial`、`quality=thumbnail`，附醒目警示、失败原因和打开电脑微信中该聊天的操作提示。连缩略图都未取得时保留 `image_not_stored_locally`。
+到截止仍未下载完时，`imageDownload.reason=native_image_download_timeout`、`backgroundPending=true`，先交缩略图；原生任务留在子进程内按上游保护完成或放弃，不强行掐断或卸载。同账号、同聊天、同消息已有后台下载时共用它，不重复下载。后台完成后正常图写入现有索引，稍后再读这张图直接命中；后台失败则下次显式读取可重新尝试。正常图已写入、只是连接收尾还在进行时，仍交正常图，附 `cleanup.status=pending`。子进程无常驻服务、端口或队列，正常收尾后自行退出；上游原生调用或收尾异常卡住时，前台仍按截止返回。
+
+`--local-only` 只读本机和已有助手索引，不触发临时下载。`context`、导出及实时会话 reader 也不触发这次下载：只有缩略图时，`context` 标 `only_thumbnail_local` 并给出需要登录的 `standardDownload` 提示；实时会话继续用自己的连接下载。最终只能交缩略图时，`media-open` 回执为 `status=partial`、`quality=thumbnail`，说明只能看出大致内容、看不清小字和细节；`nextAction=use_thumbnail_for_gist_and_tell_owner` 要求 AI 用缩略图判断大意，并在回复中告诉本人这次看的是缩略图。后台仍在下载时，警示另说明“下完后再读这张图就是正常图”，`imageDownload.nextAction` 提示稍后再读。连缩略图都未取得时保留 `image_not_stored_locally`。
 
 目标输出必须不存在，包括发布前被另一进程创建的情况。图片会交付标准可读格式，表情保留静态或动画；语音普通调用保留 SILK，`--voice-wav` 使用上文的 Python 3.11 + `pilk` 派生 WAV。stdout 回执给出实际类型、质量、来源、字节数和 SHA-256。
 

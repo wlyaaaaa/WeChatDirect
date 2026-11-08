@@ -2015,7 +2015,7 @@ def command_media_open(args: argparse.Namespace) -> int:
             open_error = error
         resolved = reader.resolve_locator(args.locator)
         if resolved.get("kind") == "image" and (data is None or resolved.get("quality") == "thumbnail") and not getattr(args, "local_only", False):
-            media, download = _download_image_for_open(account, reader, args.locator)
+            media, download = _download_image_for_open(account, reader, args.locator, deadline=started + 13.5)
             if media is not None:
                 data = media.payload
                 resolved.update(quality=media.quality, mimeType=media.mime_type, materializationSource=media.source)
@@ -2076,8 +2076,10 @@ def command_media_open(args: argparse.Namespace) -> int:
                 receipt["status"] = "partial"
         if resolved.get("kind") == "image" and resolved.get("quality") == "thumbnail":
             receipt.update(status="partial", reason=download.get("reason") or "standard_image_download_disabled_local_only",
-                warning="仅缩略图：未取得正常图，请在电脑微信打开这个聊天让图片加载。",
-                nextAction="open_this_chat_in_desktop_wechat_to_load_image")
+                warning="只有缩略图，能看出大致内容，看不清小字和细节；AI 回复时要告诉本人这次看的是缩略图。",
+                nextAction="use_thumbnail_for_gist_and_tell_owner")
+            if download.get("backgroundPending"):
+                receipt["warning"] += "正常图还在后台下载，下完后再读这张图就是正常图。"
         if resolved.get("kind") == "image":
             receipt["elapsedSeconds"] = round(time.monotonic() - started, 3)
     sys.stdout.buffer.write(_canonical_bytes(receipt))
@@ -4931,13 +4933,13 @@ def _helper_cached_image(account, payload):
         return None
 
 
-def _download_image_for_open(account, reader, locator):
+def _download_image_for_open(account, reader, locator, *, deadline):
     import wechat_helper as helper
 
     started = time.monotonic()
     try:
         attributes, chat, server = reader.image_download_request(locator)
-        return helper.download_bound_image(helper.load_settings(_helper_config_path()), account=account["label"],
+        return helper.download_image_for_open(helper.load_settings(_helper_config_path()), deadline=deadline, account=account["label"],
             expected_wxid=reader.moments_self_native_id, expected_sha256=account["expected_moments_author_sha256"],
             chat_id=chat, server_id=server, attributes=attributes)
     except Exception as error:

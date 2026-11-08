@@ -99,7 +99,7 @@ class CachedImageTests(unittest.TestCase):
                     self.assertEqual(module.service.options["image_allowlist"], [""])
                     self.assertEqual(module.service.stop_calls, 1)
                 close.assert_called_once()
-                turn.close.assert_called_once_with()
+                self.assertEqual(turn.close.call_count, 0 if outcome == "startup" else 1)
                 self.assertTrue(receipt["attempted"])
                 self.assertGreaterEqual(receipt["downloadElapsedSeconds"], 0)
                 self.assertNotIn("synthetic", json.dumps(receipt))

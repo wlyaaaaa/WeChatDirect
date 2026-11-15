@@ -45,7 +45,7 @@ class LocalASR:
         self.ready = receipt.get("event") == "ready" and receipt.get("state") == "ready"
         if not self.ready:
             self.close()
-            raise RuntimeError("realtime_local_asr_not_ready")
+            raise RuntimeError("realtime_local_asr_not_ready: " + json.dumps(receipt, ensure_ascii=False))
         return receipt
 
     def transcribe(self, path, deadline):

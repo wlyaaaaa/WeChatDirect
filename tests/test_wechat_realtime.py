@@ -15,10 +15,25 @@ from unittest import mock
 
 import wechat_cli as cli
 import wechat_helper as helper
-from wechat_realtime import RealtimeContextSession
+from wechat_realtime import LocalASR, RealtimeContextSession
 
 
 class RealtimeContextTests(unittest.TestCase):
+    def test_local_prepare_preserves_failure_receipt_and_closes(self):
+        receipt = {"event": "error", "state": "not_ready", "error_type": "RuntimeError",
+                   "message": "模型加载失败：缺少依赖"}
+        process = mock.Mock(stdout=io.StringIO(json.dumps(receipt) + "\n"))
+        local = LocalASR(isolation.ROOT)
+        with mock.patch("wechat_realtime.subprocess.Popen", return_value=process), \
+                mock.patch.object(local, "close") as close:
+            with self.assertRaises(RuntimeError) as raised:
+                local.prepare()
+        prefix, detail = str(raised.exception).split(": ", 1)
+        self.assertEqual(prefix, "realtime_local_asr_not_ready")
+        self.assertEqual(json.loads(detail), receipt)
+        self.assertFalse(local.ready)
+        close.assert_called_once_with()
+
     def test_background_child_does_not_wait_for_or_consume_session_input(self):
         code = (
             "import sys, threading; from wechat_realtime import RealtimeContextSession; "

@@ -363,6 +363,10 @@ wechat-direct helper session --account secondary --event-target filehelper --rea
 
 `observedAt` 从原生事件首次观测起计时，`elapsed`、`onTime`、`late` 如实记录；15 秒完整上下文仍须真实链路验收，接口接线与模拟测试不代表已达标。图片和动图的 `materialComplete=true`、`ready_for_vision` 只表示材料齐备可供阅读；`visualRead=false` 时不得声明 `complete` 或 `onTime=true`，AI 必须实际打开内容看过，再判断图意与完整上下文是否按时获得。
 
+2026-11-15 在基线 `ae1d4ac`、微信 `.13` 上实际启动实时会话，本地识别就绪且连接核对成功。仅副号在线时，本机向自己的文件传输助手发送测试文字，已从源库读回，但未观察到该条的实时接收事件；发送回执也曾返回未知，不能据此重发。发送时间和入库时间不能代替 `observedAt`，这次没有形成文字、语音、图片、引用四类的 15 秒通过记录。继续验收需要能产生实际接收事件的自用来源，例如本机两个已登录自用账号互发；先确认来源可用，再开始计时。
+
+本地识别准备失败时，CLI 的 `realtime_local_prepare_failed` 回执保留 `diagnostic`，其中包含识别进程返回的失败类型和原因，便于定位依赖故障。
+
 只处理显式目标，不做全账号同步或自动回复，不开服务端口；`close` 或 stdin EOF 清理本任务启动的识别及辅助进程。
 
 好友申请仅来自当前活连接，不补历史、不自动同意。申请票据只留上游内存，不写 JSON 回执、日志或普通配置；用公开 `request_id` 在同一会话显式 `accept-friend`。当前目录已标记 accepted 的申请再次提交时返回 `outcome=previously_accepted`、`nativeInvoked=false`；`wechatAccepted=null` 表示本次没有新的原生完成回执，之前通过的证据来自当前活连接目录，会话仍可继续。close、EOF 或连接结束会清空申请窗口；退出后不能靠旧 ID 恢复票据。按次 CLI 的 `friend-requests`/`accept-friend` 在读取配置或加载原生模块前直接返回 `helper_live_session_required`；应通过 session 内的同名 JSON 动作完成，不能跨进程复用申请 ID。

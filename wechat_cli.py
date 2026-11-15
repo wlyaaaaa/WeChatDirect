@@ -5036,7 +5036,7 @@ def command_helper(args: argparse.Namespace) -> int:
                         ready = session.prepare()
                     except Exception as exc:
                         session.close()
-                        raise ProductError("realtime_local_prepare_failed") from exc
+                        raise ProductError("realtime_local_prepare_failed", diagnostic=str(exc)) from exc
                     helper._emit(_HelperJsonOutput(), ready)
                 # JSONL input is always UTF-8, independent of the Windows console code page.
                 source = (line.decode("utf-8") for line in sys.stdin.buffer)

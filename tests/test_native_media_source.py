@@ -88,13 +88,15 @@ class NativeMediaSourceTests(unittest.TestCase):
             self.reader.open_locator(locator.replace("a" * 64, "b" * 64))
 
     def test_file_and_video_bytes_must_match_the_bound_native_md5(self):
+        from compression import zstd
         for local_id, kind, local_type in ((4, "file", 49), (5, "video", 43)):
             with self.subTest(kind=kind):
                 self.hardlink.execute(f"CREATE TABLE {kind}_hardlink_info_v4(md5 TEXT,file_name TEXT,dir1 INTEGER,dir2 INTEGER,modify_time INTEGER)")
                 self.hardlink.execute(f"INSERT INTO {kind}_hardlink_info_v4 VALUES (?,?,1,2,200)", (self.md5, "synthetic.bin"))
-                xml = (f'<appmsg><type>6</type><title>synthetic.bin</title><appattach><md5>{self.md5}</md5></appattach></appmsg>'
+                xml = (f'<appmsg><type>6</type>\x00<title>synthetic.bin</title><appattach><md5>{self.md5}</md5></appattach></appmsg>'
                        if kind == "file" else f'<videomsg md5="{self.md5}"/>')
-                self.messages.execute(f"INSERT INTO {self.table} VALUES (?,?,?,?)", (local_id, local_id + 100, local_type, f"<msg>{xml}</msg>"))
+                xml = zstd.compress(f"<msg>{xml}</msg>".encode()) if kind == "file" else f"<msg>{xml}</msg>"
+                self.messages.execute(f"INSERT INTO {self.table} VALUES (?,?,?,?)", (local_id, local_id + 100, local_type, xml))
                 path = self.root / "msg" / kind / self.table[4:] / "2026-09" / "synthetic.bin"
                 path.parent.mkdir(parents=True)
                 path.write_bytes(b"different bytes at the correct native path")
@@ -103,6 +105,7 @@ class NativeMediaSourceTests(unittest.TestCase):
                     self.reader.open_locator(locator)
                 path.write_bytes(self.png)
                 self.assertEqual(self.png, self.reader.open_locator(locator))
+                self.assertEqual(kind, self.reader._media_entries({"local_id": local_id, "server_id": local_id + 100, "local_type": local_type}, self.session, self.paths["message_0.db"], self.table, [zstd.decompress(xml).decode() if kind == "file" else xml])[0]["kind"])
 
     def test_app_emoji_uses_bound_md5_and_keeps_missing_media_gap(self):
         xml = f'<msg><appmsg><type>8</type><appattach><emoticonmd5>{self.md5}</emoticonmd5><totallen>{len(self.png)}</totallen></appattach></appmsg></msg>'
@@ -234,6 +237,7 @@ class NativeMediaSourceTests(unittest.TestCase):
 
     def test_packed_image_quality_preference_and_context(self):
         folder, locator = self.packed_image()
+        self.messages.execute(f"UPDATE {self.table} SET message_content='<img md5=\"\" length=\"100\" hdlength=\"200\"/>'")
         payload = self.reader._decode_locator(locator)
         for suffix, expected in (("_t.dat", "thumbnail"), (".dat", "standard"), ("_h.dat", "original")):
             (folder / (self.md5 + suffix)).write_bytes(self.png)

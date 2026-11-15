@@ -849,7 +849,7 @@ class WeChatCliTests(unittest.TestCase):
             self.assertIn("[08:01:50] 我：回复内容", context)
             self.assertIn("↳ 回复：[被引用消息不在当前本地范围]", context)
             self.assertIn("[语音（可播放，按需转写）](media/", context)
-            self.assertIn("[图片当前不可打开", context)
+            self.assertIn("[图片未保存：", context)
             ai_context = (destination / "ai-context.md").read_text(encoding="utf-8")
             self.assertIn("最近小上下文", ai_context)
             first_receipt = json.loads(

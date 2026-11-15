@@ -28,8 +28,8 @@ def decode_wechat_dat(
 ) -> bytes | None:
     """Decode one local WeChat image payload when its format is provable.
 
-    V1 uses its documented public, format-specific AES-128 key if no key is
-    supplied.  V2 deliberately requires the caller to supply its exact
+    V1 uses its documented public, format-specific AES-128 key.  A supplied
+    key applies to V2, which requires the caller to supply its exact
     16-byte AES key.  For an old headerless XOR payload, a caller can supply
     the XOR byte or the decoder can derive it only from a complete leading
     visual signature.  An undecodable, malformed, or non-visual payload
@@ -91,8 +91,10 @@ def _decode_modern_dat(
 
 
 def _effective_aes_key(magic: bytes, supplied: bytes | None) -> bytes | None:
+    if magic == DAT_V1_MAGIC:
+        return V1_PUBLIC_AES_KEY
     if supplied is None:
-        return V1_PUBLIC_AES_KEY if magic == DAT_V1_MAGIC else None
+        return None
     if not isinstance(supplied, (bytes, bytearray, memoryview)):
         return None
     key = bytes(supplied)

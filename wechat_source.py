@@ -3295,7 +3295,7 @@ class DirectWeChatReader:
             if start < 0:
                 continue
             try:
-                root = ET.fromstring(body[start:])
+                root = ET.fromstring(body[start:].replace("\x00", ""))
             except ET.ParseError:
                 continue
             node = root if root.tag == tag else root.find(tag)
@@ -3316,8 +3316,10 @@ class DirectWeChatReader:
                     node.findtext("appattach/md5") or node.findtext("md5") or ""
                 )
                 attributes["fileName"] = node.findtext("title") or ""
-            if re.fullmatch(r"[0-9a-fA-F]{32}", attributes.get("md5", "")):
-                attributes["md5"] = attributes["md5"].lower()
+            if re.fullmatch(r"[0-9a-fA-F]{32}", attributes.get("md5", "")) or (
+                kind == "image" and _native_image_stem(row["packed_info_data"])
+            ):
+                attributes["md5"] = attributes.get("md5", "").lower()
                 candidates.append(attributes)
         if not candidates or len({item["md5"] for item in candidates}) != 1:
             return None
@@ -3329,7 +3331,7 @@ class DirectWeChatReader:
 
     def _native_media_paths(self, payload, attributes):
         kind = str(payload["kind"])
-        paths = self._hardlink_media_paths(attributes["md5"], kind)
+        paths = self._hardlink_media_paths(attributes["md5"], kind) if re.fullmatch(r"[0-9a-f]{32}", attributes["md5"]) else []
         if kind != "image":
             return paths
         root = self._storage.parent.resolve()
@@ -3362,7 +3364,7 @@ class DirectWeChatReader:
         chat_hash, server = str(payload.get("message_table", ""))[4:].lower(), payload.get("server_id")
         chats = [item["id"] for item in self.list_sessions()
                  if hashlib.md5(item["id"].encode(), usedforsecurity=False).hexdigest() == chat_hash]
-        if attributes is None or len(chats) != 1 or not re.fullmatch(r"[1-9][0-9]{0,19}", str(server)):
+        if attributes is None or not re.fullmatch(r"[0-9a-f]{32}", attributes["md5"]) or len(chats) != 1 or not re.fullmatch(r"[1-9][0-9]{0,19}", str(server)):
             raise DirectSchemaError("image_download_message_binding_unavailable")
         return attributes, chats[0], server
 
@@ -3542,7 +3544,7 @@ class DirectWeChatReader:
                     continue
                 mime_type, extension = visual
                 return LocalMedia(
-                    data, attributes["md5"] + "." + extension, mime_type, quality
+                    data, (attributes["md5"] or attributes["fileStem"]) + "." + extension, mime_type, quality
                 )
             import mimetypes
 
@@ -3691,6 +3693,16 @@ class DirectWeChatReader:
         if not source.is_file():
             raise DirectSchemaError("media locator database is unavailable")
         return source
+
+    def refresh_media_locator(self, locator: str) -> dict[str, Any]:
+        """Recheck one archived attachment using its original message binding."""
+        payload = self._decode_locator(locator)
+        if payload.get("record") == "message" and payload.get("kind") in {
+            "image", "emoji", "video", "file",
+        }:
+            payload["record"] = "native_media"
+            locator = self._make_locator(payload)
+        return {"locator": locator, **self.resolve_locator(locator)}
 
     def resolve_locator(self, locator: str) -> dict[str, Any]:
         """Resolve one locator without returning message bodies or native IDs."""
@@ -3907,7 +3919,7 @@ class DirectWeChatReader:
                 if start < 0:
                     continue
                 try:
-                    root = ET.fromstring(text[start:])
+                    root = ET.fromstring(text[start:].replace("\x00", ""))
                 except ET.ParseError:
                     continue
                 app = root if root.tag == "appmsg" else root.find("appmsg")

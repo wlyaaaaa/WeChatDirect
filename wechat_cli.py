@@ -9,6 +9,7 @@ readers or create a one-off preservation bundle.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from contextlib import redirect_stdout
 from functools import wraps
 from types import SimpleNamespace
@@ -2460,6 +2461,7 @@ def _contained_export_path(root: Path, value: object) -> Path | None:
     ):
         return None
     try:
+        root = root.resolve()
         resolved = root.joinpath(*relative.parts).resolve(strict=False)
         resolved.relative_to(root)
     except OSError, RuntimeError, ValueError:
@@ -3103,6 +3105,21 @@ def _quote_context_line(
     return f"  ↳ 回复 {speaker}：{content}"
 
 
+def _media_gap_reason(media: Mapping[str, Any]) -> str | None:
+    if media.get("exportStatus") == "available_local":
+        return "only_thumbnail_local" if media.get("quality") == "thumbnail" else None
+    if media.get("exportGap"):
+        return str(media["exportGap"])
+    if media.get("requiresNetwork"):
+        return "remote_not_requested"
+    return str(media.get("resolution_gap") or "local_media_unavailable")
+
+
+def _media_failure_reason(exc: Exception) -> str:
+    reason = str(exc)
+    return reason if len(reason) < 100 and reason.isascii() and reason.replace("_", "").isalnum() else type(exc).__name__
+
+
 def _media_context_lines(
     message: Mapping[str, Any], *, limit: int | None = None
 ) -> list[str]:
@@ -3135,8 +3152,16 @@ def _media_context_lines(
                 lines.append(f"  [语音（可播放，按需转写）]({normalized})")
             else:
                 lines.append(f"  [{label}]({normalized})")
+            if media.get("quality") == "thumbnail":
+                lines.append("  [仅保留缩略图，正常图片尚未保留；细节不完整。]")
         else:
-            lines.append(f"  [{label}当前不可打开]")
+            reason = _media_gap_reason(media)
+            detail = {
+                "remote_not_requested": "本机无可用副本，未请求远端；不代表服务器已过期",
+                "image_not_stored_locally": "本机未找到图片；不能区分未下载与已清理",
+                "local_wxgf_conversion_unavailable": "本机已有缓存，当前程序尚不能完整解码",
+            }.get(reason, "本机缺失或暂不可读，具体原因见媒体清单")
+            lines.append(f"  [{label}未保存：{detail}]")
     if limit is not None and len(media_items) > len(visible_items):
         lines.append(
             f"  [本条另有 {len(media_items) - len(visible_items)} 个媒体项；"
@@ -3413,7 +3438,7 @@ def _sync_message_media(
         except Exception as exc:
             counters["mediaUnavailable"] += 1
             media["exportStatus"] = "open_failed"
-            media["exportGap"] = type(exc).__name__
+            media["exportGap"] = _media_failure_reason(exc)
             projected_media.append(media)
             continue
         digest = hashlib.sha256(payload).hexdigest()
@@ -4832,6 +4857,18 @@ def command_repair_media(args: argparse.Namespace) -> int:
                     )
                 else:
                     local_reader = reader
+                    if pending.get("locator"):
+                        try:
+                            current = reader.refresh_media_locator(pending["locator"])
+                        except Exception as exc:
+                            pending.update(openable=False, materializable=False,
+                                           exportStatus="open_failed", exportGap=_media_failure_reason(exc))
+                        else:
+                            for field in ("openable", "materializable", "requiresNetwork", "requiresLiveAccount",
+                                          "open_status", "processing_state", "resolution_gap", "exact_lookup_unavailable",
+                                          "exportStatus", "exportGap"):
+                                pending.pop(field, None)
+                            pending.update(current)
                 if not wav_valid:
                     pending.pop("derivedVoiceWav", None)
                 projected, counts = _sync_message_media(
@@ -4863,12 +4900,16 @@ def command_repair_media(args: argparse.Namespace) -> int:
             for row in rows
             for m in row.get("media_manifest", [])
         ),
+        mediaGapCounts=dict(Counter(
+            reason for row in rows for m in row.get("media_manifest", [])
+            if (reason := _media_gap_reason(m))
+        )),
     )
     manifest.pop("manifestSha256", None)
     manifest["manifestSha256"] = _sha256(_canonical_bytes(manifest))
     _write_json_atomic(output / "manifest.json", manifest)
     gaps = sum(
-        bool(m.get("voiceWavGap")) or m.get("exportStatus") != "available_local"
+        bool(m.get("voiceWavGap")) or _media_gap_reason(m) is not None
         for row in rows
         for m in row.get("media_manifest", [])
     )
@@ -4877,6 +4918,8 @@ def command_repair_media(args: argparse.Namespace) -> int:
         "mode": "media_repair",
         "attemptedMedia": attempted,
         "remainingGaps": gaps,
+        "mediaGapCounts": manifest["mediaGapCounts"],
+        "completenessScope": "local_media_only; missing_local_does_not_prove_remote_expiry",
         "historyRescanned": False,
         "networkUsed": False,
         "output": str(output),

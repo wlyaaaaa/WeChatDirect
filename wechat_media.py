@@ -214,7 +214,7 @@ def open_cached_emoji_media(
     *, account_root: Path | str, emoji_md5: str, cache_key: bytes,
     declared_size: int | None = None,
 ) -> LocalMedia | None:
-    """Decrypt one native monthly cache item and verify its message-bound hash."""
+    """Read one message-bound cache asset, including derived WXGF copies."""
     from cryptography.hazmat.primitives import padding
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -222,7 +222,8 @@ def open_cached_emoji_media(
     limit = _remote_size_limit(declared_size)
     if md5 is None or limit is None or not isinstance(cache_key, bytes) or len(cache_key) != 16:
         return None
-    cipher_limit = (limit // 16 + 1) * 16
+    cipher_limit = (MAX_REMOTE_EMOJI_BYTES // 16 + 1) * 16
+    wxgf_unavailable = False
     for candidate in emoji_cache_paths(account_root, md5):
         try:
             if not 0 < candidate.stat().st_size <= cipher_limit:
@@ -237,6 +238,15 @@ def open_cached_emoji_media(
             payload = unpadder.update(padded) + unpadder.finalize()
         except (OSError, ValueError):
             continue
+        if payload.startswith(b"wxgf"):
+            from wechat_wxgf import wxgf_to_image
+
+            decoded = wxgf_to_image(payload)
+            media = _as_local_media(decoded, quality="standard", aes_key=None, decode_blob=None) if decoded else None
+            if media is not None:
+                return LocalMedia(media.payload, media.file_name, media.mime_type, "standard", "local_wxgf_cache")
+            wxgf_unavailable = True
+            continue
         if (not 0 < len(payload) <= limit
                 or declared_size is not None and len(payload) != declared_size
                 or hashlib.md5(payload, usedforsecurity=False).hexdigest() != md5):
@@ -244,6 +254,8 @@ def open_cached_emoji_media(
         media = _as_local_media(payload, quality="original", aes_key=None, decode_blob=None)
         if media is not None:
             return media
+    if wxgf_unavailable:
+        raise ValueError("local_wxgf_conversion_unavailable")
     return None
 
 

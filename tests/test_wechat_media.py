@@ -104,6 +104,12 @@ class EmojiMediaTests(unittest.TestCase):
             encryptor = Cipher(algorithms.AES(key), modes.CBC(key)).encryptor()
             bad.write_bytes(encryptor.update(padder.update(invalid) + padder.finalize()) + encryptor.finalize())
             self.assertIsNone(open_cached_emoji_media(account_root=root, emoji_md5=bad_md5, cache_key=key))
+            padder = padding.PKCS7(128).padder()
+            encryptor = Cipher(algorithms.AES(key), modes.CBC(key)).encryptor()
+            source.write_bytes(encryptor.update(padder.update(b"wxgf" + PNG) + padder.finalize()) + encryptor.finalize())
+            media = open_cached_emoji_media(account_root=root, emoji_md5=md5, cache_key=key, declared_size=1)
+            self.assertEqual(media.payload, PNG)
+            self.assertEqual((media.quality, media.source), ("standard", "local_wxgf_cache"))
 
     def test_monthly_cache_never_reads_another_account_or_invalid_md5(self):
         with tempfile.TemporaryDirectory() as temporary:

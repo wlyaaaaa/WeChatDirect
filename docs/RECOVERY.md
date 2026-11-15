@@ -30,9 +30,11 @@ wechat-direct repair-media --account primary --contact "<contact-or-group>" --ou
 wechat-direct repair-media --account primary --contact "<contact-or-group>" --output "<archive-directory>" --message-id "<native-id>" --kind voice
 ```
 
-它不重扫聊天历史、不访问远端 CDN，不改变已读游标；可复用已验证的 SILK 派生 WAV。没有可用来源时保留缺口，错误不会伪装成已补齐。语音解码超时、解释器失效、非法 WAV 均转为可解释缺口；原 SILK 与其他消息继续保留。
+它按原消息绑定重新定位旧媒体，不沿用旧的“不可打开”结论，不重扫聊天历史、不访问远端 CDN，不改变已读游标；可复用已验证的 SILK 派生 WAV。回执和清单的 `mediaGapCounts` 区分未请求远端、本机缺失或读取失败，缩略图仍计入不完整。语音解码超时、解释器失效、非法 WAV 均转为可解释缺口；原 SILK 与其他消息继续保留。
 
-档案中的附件缺口取决于设备当前仍可读取的本机缓存。文字档案和 `verify-export` 通过都不表示缺失附件已经保存；本人后来在微信中下载并使附件重新进入本机缓存后，才可对点名档案运行 `repair-media` 或 `--full-reconcile` 重试，仍读不到时继续报告缺口，不承诺追回。
+文字档案和 `verify-export` 通过只证明现有包完整，不表示附件已全部保存。旧清单也可能尚未用当前程序定位，应先对点名档案运行 `repair-media`。重试后本机仍缺失，只能说明当前无可用副本，不能区分从未下载、已清理或服务器已过期；有原生远端地址但未请求的表情会单独说明，不冒充取不回。
+
+月缓存的 WXGF 表情按同账号、同消息的原生 MD5 文件名绑定，解密后沿现有转换器读取；结果标 `materializationSource=local_wxgf_cache`、`quality=standard`，其输出哈希属于转换后的文件，不冒充消息声明的原始 GIF/PNG 字节。无法完整转换的多分区缓存保留 `local_wxgf_conversion_unavailable` 缺口，不取首帧代替完整动画。
 
 ### 按字节分页与长文本
 

@@ -223,7 +223,13 @@ class TargetedMediaTests(unittest.TestCase):
             output = Path(td) / "archive"
             PendingReader.fail = True
             try:
-                self.sync(self.args(output), PendingReader)
+                stale = PendingReader().fetch_messages("wxid-synthetic", since_sort_seq=None)
+                stale["messages"][0]["media_manifest"][0].update(
+                    locator="obsolete", openable=False, materializable=False,
+                )
+                with patch.object(PendingReader, "fetch_messages", return_value=stale):
+                    self.sync(self.args(output), PendingReader)
+                state = (output / "state.json").read_bytes()
                 PendingReader.fail = False
                 args = cli.parser().parse_args(
                     [
@@ -253,6 +259,9 @@ class TargetedMediaTests(unittest.TestCase):
                 self.assertFalse(result["historyRescanned"])
                 self.assertEqual(result["attemptedMedia"], 1)
                 self.assertEqual(result["remainingGaps"], 0)
+                self.assertEqual((output / "state.json").read_bytes(), state)
+                media = cli._read_jsonl(output / "messages.jsonl")[0]["media_manifest"][0]
+                self.assertEqual(media["locator"], "synthetic")
                 self.assertEqual(cli._verify_export_result(output)["status"], "success")
             finally:
                 PendingReader.fail = True

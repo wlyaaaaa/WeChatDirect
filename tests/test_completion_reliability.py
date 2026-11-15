@@ -37,6 +37,13 @@ class PendingReader(SyntheticContactReader):
             raise OSError("synthetic unavailable")
         return b"synthetic media bytes"
 
+    def refresh_media_locator(self, locator):
+        assert locator in {"synthetic", "obsolete"}
+        return {
+            "kind": "file", "mediaId": "one", "locator": "synthetic",
+            "openable": None, "materializable": True, "requiresNetwork": False,
+        }
+
 
 class CompletionReliabilityTests(unittest.TestCase):
     def args(self, output, full=False):

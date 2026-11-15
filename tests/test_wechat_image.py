@@ -69,6 +69,7 @@ class DecodeWechatDatTests(unittest.TestCase):
         self.assertEqual(
             decode_wechat_dat(payload), JPEG_PREFIX + b"middle" + JPEG_TAIL
         )
+        self.assertEqual(decode_wechat_dat(payload, aes_key=b"x" * 16), JPEG_PREFIX + b"middle" + JPEG_TAIL)
 
     def test_v2_requires_exact_caller_key(self):
         key = b"0123456789abcdef"

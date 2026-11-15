@@ -608,6 +608,16 @@ class ReaderCacheTests(unittest.TestCase):
             self.publish(checkpoint="TRUNCATE")
             self.read_cached()
             self.assertEqual(checked.call_count, 2)
+            self.publish(inserts=1, checkpoint="TRUNCATE")
+            reader = self.reader()
+            reader._read_deadline = time.monotonic() + 2
+            reader._prepare(self.source.path)
+            reader.close()
+            self.assertEqual(checked.call_count, 2)
+            self.assertTrue(self.metadata()["checkPending"])
+            self.read_cached()
+            self.assertEqual(checked.call_count, 3)
+            self.assertFalse(self.metadata()["checkPending"])
 
     def test_failed_quick_check_falls_back_and_leaves_entry_dirty(self):
         with mock.patch.object(PlaintextCacheEntry, "quick_check", return_value=False):

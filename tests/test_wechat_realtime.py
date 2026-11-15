@@ -165,7 +165,7 @@ class RealtimeContextTests(unittest.TestCase):
         wrapper, session, _reader, _local = self.fixture()
         self.observe(session)
         key = ("peer", "123")
-        wrapper.observed[key] = (time.monotonic() - 14.96, wrapper.observed[key][1])
+        wrapper.observed[key] = (time.monotonic() - 12.96, wrapper.observed[key][1])
         release, finished = threading.Event(), threading.Event()
         def slow(*_args):
             release.wait(2)
@@ -212,7 +212,25 @@ class RealtimeContextTests(unittest.TestCase):
                 record["phase"] = "preparing"  # completion can race the deadline snapshot
                 current[0] = 15
                 if not upgrade:
-                    self.assertTrue(wrapper._snapshot(record)["materialComplete"])
+                    result = wrapper._snapshot(record)
+                    self.assertFalse(result["materialComplete"])
+                    self.assertIn("image_thumbnail_only", [gap["kind"] for gap in result["gaps"]])
+                    self.assertTrue(Path(result["messages"][0]["media_manifest"][0]["frames"][0]["path"]).is_file())
+
+    def test_live_cache_unavailable_never_decrypts_scratch_and_codec_stops_at_deadline(self):
+        from wechat_source import DirectWeChatReader, EncryptedPageCodec
+        reader = object.__new__(DirectWeChatReader)
+        reader._prepared, reader._read_deadline = {}, time.monotonic() + 1
+        with mock.patch.object(reader, "_prepare_cached", return_value=None), \
+                mock.patch.object(reader, "_prepare_scratch_snapshot", return_value=Path("scratch")) as scratch:
+            with self.assertRaisesRegex(TimeoutError, "cache_unavailable"):
+                reader._prepare(Path("synthetic.db"))
+            scratch.assert_not_called()
+            del reader._read_deadline
+            self.assertEqual(reader._prepare(Path("synthetic.db")), Path("scratch"))
+        codec = EncryptedPageCodec(master_hex="4b" * 32, salt=b"S" * 16, deadline=time.monotonic() - 1)
+        with self.assertRaisesRegex(TimeoutError, "snapshot_deadline"):
+            codec.decrypt_pages([1], [bytes(4096)])
 
     def test_main_and_quoted_content_gaps_prevent_complete(self):
         for location in ("main", "quote"):
@@ -250,7 +268,7 @@ class RealtimeContextTests(unittest.TestCase):
         self.assertTrue(args.realtime)
 
     def test_delivery_timing_includes_final_identity_and_is_stable_on_later_queries(self):
-        for ready_at, identity_delay, on_time in ((7.882, 0, True), (14.9, 0.2, False)):
+        for ready_at, identity_delay, on_time in ((7.882, 0, True), (12.9, 2.2, False)):
             with self.subTest(ready_at=ready_at):
                 current, checks = [0.0], [0]
                 wrapper, session, _reader, _local = self.fixture(cached=True, clock=lambda: current[0])

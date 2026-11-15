@@ -333,6 +333,11 @@ class EncryptedPageCodec:
     plaintext_header: bool | None = None
     iv_offset: int = 0
     tag_offset: int = AES_BLOCK_SIZE
+    deadline: float | None = None
+
+    def _check_deadline(self) -> None:
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise TimeoutError("realtime_snapshot_deadline")
 
     def __post_init__(self) -> None:
         if self.page_size <= 0 or self.page_size % AES_BLOCK_SIZE:
@@ -399,6 +404,7 @@ class EncryptedPageCodec:
     def decrypt_page(self, page_number: int, page: bytes) -> bytes:
         """Return one normal SQLite page; reserve bytes are cleared."""
 
+        self._check_deadline()
         if page_number <= 0:
             raise EncryptedPageError("page number must be positive")
         if len(page) != self.page_size:
@@ -508,6 +514,7 @@ class EncryptedPageCodec:
         result: list[bytes] = []
         # Small batches keep the ECB/XOR buffers in cache.
         for begin in range(0, len(pages), 16):
+            self._check_deadline()
             batch_numbers = numbers[begin : begin + 16]
             batch = pages[begin : begin + 16]
             ciphertexts, previous_blocks = [], []
@@ -1668,11 +1675,16 @@ class DirectWeChatReader:
         return _file_signature(path)
 
     def _prepare(self, source: Path) -> Path:
+        deadline = getattr(self, "_read_deadline", None)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("realtime_snapshot_deadline")
         cached = self._prepared.get(source)
         if cached is not None:
             return cached
         prepared = self._prepare_cached(source)
         if prepared is None:
+            if deadline is not None:
+                raise TimeoutError("realtime_snapshot_cache_unavailable")
             prepared = self._prepare_scratch_snapshot(source)
         self._prepared[source] = prepared
         return prepared
@@ -1706,6 +1718,8 @@ class DirectWeChatReader:
             source.relative_to(self._storage).as_posix(),
         )
         budget = getattr(self, "_cache_lock_wait_s", wechat_plaincache.LOCK_TIMEOUT_S)
+        if getattr(self, "_read_deadline", None) is not None:
+            budget = 0  # Retry the prepared cache instead of blocking or decrypting a cold copy.
         started = time.monotonic()
         try:
             acquired = entry.acquire(timeout=budget)
@@ -1736,6 +1750,9 @@ class DirectWeChatReader:
         wal = source.with_name(source.name + "-wal")
         codec: EncryptedPageCodec | None = None
         for _attempt in range(3):
+            deadline = getattr(self, "_read_deadline", None)
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("realtime_snapshot_deadline")
             before = (self._signature(source), self._signature(wal))
             try:
                 with open_source_read(source) as stream:
@@ -1750,16 +1767,22 @@ class DirectWeChatReader:
                         salt=first_page[:16],
                         hmac_mode="sqlcipher",
                         plaintext_header=False,
+                        deadline=deadline,
                     )
-                outcome = entry.refresh(codec, source, wal, before[0])
+                outcome = entry.refresh(codec, source, wal, before[0], **({"deadline": deadline} if deadline is not None else {}))
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("realtime_snapshot_deadline")
                 if before != (self._signature(source), self._signature(wal)):
                     # Each page still matches its recorded reserve, so the
                     # next attempt continues incrementally from here.
                     entry.commit(outcome, check_pending=outcome.needs_check)
                     continue
-                if outcome.needs_check and not entry.quick_check():
+                # Keep whole-database scans off warm live reads; the next
+                # ordinary read still performs the pending integrity check.
+                deferred = deadline is not None and outcome.needs_check and not outcome.rebuilt
+                if outcome.needs_check and not deferred and not entry.quick_check():
                     return None
-                entry.commit(outcome, check_pending=False)
+                entry.commit(outcome, check_pending=deferred)
                 return entry.plain
             except (
                 OSError,
@@ -1767,7 +1790,9 @@ class DirectWeChatReader:
                 sqlite3.DatabaseError,
                 PlaintextCacheError,
                 ValueError,
-            ):
+            ) as exc:
+                if isinstance(exc, TimeoutError):
+                    raise
                 if before != (self._signature(source), self._signature(wal)):
                     continue
                 return None

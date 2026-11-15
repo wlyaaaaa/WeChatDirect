@@ -652,6 +652,7 @@ class HelperSession:
                 voice_directory=root / "voices", emoticon_directory=root / "emoticons",
                 wechat_data_directory=None, preserve_reports=False)
             self._verify_identity()
+            self.service.monitor_handler = lambda data: self._on_message(self.service.pid, 11046, data, self.service)
             self.service.register_msg_handler(self._on_message)
             stage = "start_native_service"
             self.service.start()

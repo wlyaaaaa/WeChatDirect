@@ -385,6 +385,7 @@ class PlaintextCacheEntry:
         source: Path,
         wal: Path,
         main_signature: Sequence[int] | None,
+        *, deadline: float | None = None,
     ) -> RefreshOutcome:
         """Bring the snapshot up to the current main database plus its WAL.
 
@@ -394,6 +395,8 @@ class PlaintextCacheEntry:
         """
 
         self._require_lock()
+        self._deadline = deadline
+        self._check_deadline()
         salt = bytes(codec.salt).hex()
         key = codec.key_fingerprint
         state = self._usable_state(
@@ -542,6 +545,7 @@ class PlaintextCacheEntry:
         )
         changed = False
         for first, count in _runs(targets, RESTORE_RUN_PAGES):
+            self._check_deadline()
             stream.seek((first - 1) * page_size)
             data = stream.read(count * page_size)
             if len(data) != count * page_size:
@@ -582,6 +586,7 @@ class PlaintextCacheEntry:
         decrypted = 0
         stream.seek(0)
         for first in range(1, pages + 1, COMPARE_CHUNK_PAGES):
+            self._check_deadline()
             count = min(COMPARE_CHUNK_PAGES, pages - first + 1)
             last = first + count - 1
             data = stream.read(count * page_size)
@@ -643,6 +648,17 @@ class PlaintextCacheEntry:
             uri=True,
         )
         try:
+            if getattr(self, "_deadline", None) is not None:
+                connection.set_progress_handler(lambda: time.monotonic() >= self._deadline, 1000)
+            self._check_deadline()
             return str(connection.execute("PRAGMA quick_check").fetchone()[0]) == "ok"
+        except sqlite3.DatabaseError:
+            self._check_deadline()
+            raise
         finally:
+            connection.set_progress_handler(None, 0)
             connection.close()
+
+    def _check_deadline(self) -> None:
+        if getattr(self, "_deadline", None) is not None and time.monotonic() >= self._deadline:
+            raise TimeoutError("realtime_snapshot_deadline")

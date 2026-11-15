@@ -98,6 +98,7 @@ class RealtimeContextSession:
         session._on_message = observe
 
     def prepare(self):
+        import av  # noqa: F401 - load native image decoders before receiving messages
         return {"action": "realtime-ready", "status": "success", "localASR": self.local.prepare()}
 
     def start(self):
@@ -218,7 +219,7 @@ class RealtimeContextSession:
             if result["status"] == "success":
                 record["best"].setdefault(result["nativeMessageId"], result)
         messages = []
-        if record["phase"] == "preparing" and not (record.get("upgrading") and self.clock() >= record["observed"][0] + 15):
+        if record["phase"] == "preparing" and not (record.get("upgrading") and self.clock() >= record["observed"][0] + 13):
             gaps.append({"kind": "materials_pending", "stage": "material_prepare", "code": "awaiting_bound_materials"})
         for original in originals:
             message = dict(original)
@@ -230,11 +231,13 @@ class RealtimeContextSession:
                 else:
                     gaps.append({"kind": "voice_transcript_unavailable", "message": message["serverId"]})
             messages.append(message)
+            if any(media.get("kind") == "image" and media.get("quality") == "thumbnail" for media in message.get("media_manifest", [])):
+                gaps.append({"kind": "image_thumbnail_only", "message": message["serverId"], "code": "standard_image_not_ready"})
         query_elapsed = self.clock() - record["observed"][0]
         material_elapsed = record.get("materialDeliveryElapsed")
         complete_elapsed = record.get("completeDeliveryElapsed")
         elapsed = complete_elapsed if complete_elapsed is not None else material_elapsed if material_elapsed is not None else query_elapsed
-        material_complete = not gaps
+        material_complete = bool(messages) and not gaps
         vision = any(media.get("kind") in {"image", "emoji"} and not media.get("visualRead") for message in messages for media in message.get("media_manifest", []))
         complete = material_complete and not vision
         return {"action": "read-context", "request_id": record["id"], "status": "success" if complete and elapsed <= 15 else "late" if elapsed > 15 else "ready_for_vision" if material_complete and vision else "partial",
@@ -249,10 +252,11 @@ class RealtimeContextSession:
     def _prepare_materials(self, record, directory, deadline):
         import wechat_cli as cli
         key, submitted, best = record["key"], set(), {}
-        while True:
+        while not self.closed and self.clock() < deadline:
             messages, gaps, awaiting = [], [], False
             try:
                 with self.reader_factory() as reader:
+                    reader._read_deadline = deadline
                     message = reader.fetch_message_by_server_id(*key, exact_media_lookup=True)
                     if message is None:
                         raise RuntimeError("realtime_exact_message_pending")
@@ -291,7 +295,9 @@ class RealtimeContextSession:
                     break
             if self.closed or self.clock() >= deadline:
                 break
-            time.sleep(min(0.15, deadline - self.clock()))
+            time.sleep(max(0, min(0.15, deadline - self.clock())))
+        if not record["messages"] and not record["gaps"]:
+            record["gaps"] = [{"kind": "message_pending", "code": "material_deadline"}]
         record["phase"] = "ready"
 
     def read_context(self, request):
@@ -308,7 +314,7 @@ class RealtimeContextSession:
             if finished is None:
                 raise ValueError("realtime_request_capacity")
             self.requests.pop(finished)
-        identifier, deadline = uuid.uuid4().hex, observed[0] + 15
+        identifier, deadline = uuid.uuid4().hex, observed[0] + 13
         directory = (self.session.settings["state_root"] / self.session.account / "realtime" / identifier).resolve()
         directory.mkdir(parents=True)
         record = {"id": identifier, "key": key, "observed": observed, "messages": [], "gaps": [],

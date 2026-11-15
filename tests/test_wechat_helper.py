@@ -378,6 +378,26 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(second["events"], [])
         self.session.close()
 
+    def test_early_image_and_quote_monitor_share_filtered_callback_without_xml(self):
+        self.session.start()
+        self.addCleanup(self.session.close)
+        service = self.module.service
+        self.session._on_message = mock.Mock(wraps=self.session._on_message)
+        image = {"chat_id": "filehelper", "wx_type": 3, "native_message_id": "123", "image_status": "pending"}
+        service.monitor_handler(image)
+        service.monitor_handler({**image, "chat_id": "outside"})
+        service.monitor_handler({"chat_id": "filehelper", "wx_type": 49, "app_type": 57,
+                                 "native_message_id": "456", "content": "<refermsg>private-xml</refermsg>"})
+        service.handler(123, 11046, {**image, "image_status": "ready"}, service)
+        events = self.session.execute({"action": "receive", "seconds": 0, "limit": 10})["events"]
+        self.assertEqual([event["native_message_id"] for event in events], ["123", "456", "123"])
+        self.assertEqual([event["wx_type"] for event in events], [3, 49, 3])
+        self.assertEqual(events[0]["image_status"], "pending")
+        self.assertEqual(events[1]["app_type"], 57)
+        self.assertEqual(events[2]["image_status"], "ready")
+        self.assertEqual(self.session._on_message.call_count, 3)
+        self.assertNotIn("private-xml", json.dumps(events))
+
     def test_receive_limit_leaves_remaining_events_for_next_call(self):
         self.session.start()
         for sequence in range(3):

@@ -108,7 +108,7 @@ def write_snapshot(root, *, verify=False, public_copy=None, companion=None, owne
         rows.append(row)
         if check.get("result", {}).get("status") == "success":
             local_artifacts.append(dict(at=row["at"], kind="archive", title=f"{row['text']}：{row['messages']} 条，新到 {row['latest']}，留住媒体 {row['saved']}/{row['media']}，{row['state_text']}",
-                status="completed", public="owner", open=dict(source="wechat.archive." + key[:12])))
+                status="completed", public="owner", open=dict(source="wechat.contacts", path=(directory.relative_to(root / "contacts") / "context.md").as_posix())))
         owner_rows.append(dict(row, text=m.get("contact", {}).get("displayName") or m.get("contact", {}).get("nickname") or "未命名档案",
             account=m.get("account")))
     complete = all(checks) and len(checks) == len(rows)

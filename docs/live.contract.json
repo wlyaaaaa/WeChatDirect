@@ -193,7 +193,7 @@
       "mode": "live",
       "unit": "条",
       "public": "same",
-      "note": "旧档未登记该字段时保留未知，不当成零或身份认错。", "unknown_text": "旧档未登记该字段。"
+      "note": "旧档未登记该字段时保留未知，不当成零或身份认错。", "unknown_text": "旧记录里没有这一项。"
     },
     {
       "id": "checked_media",

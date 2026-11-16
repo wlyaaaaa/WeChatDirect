@@ -160,9 +160,9 @@ class ImageWorkerTests(unittest.TestCase):
                 (self.root / "trace").unlink(missing_ok=True)
                 self.case.index.unlink(missing_ok=True)
                 started = time.monotonic()
-                media, receipt = self.run_download()
+                media, receipt = self.run_download(10)  # Leave the worker's 3.5 s retry reserve after real process startup.
                 self.finish()
-                self.assertLess(time.monotonic() - started, 5)
+                self.assertLess(time.monotonic() - started, 10)
                 self.assertEqual(receipt["attempts"], attempts)
                 self.assertEqual((self.root / "trace").read_text().splitlines() if (self.root / "trace").exists() else [], trace)
                 self.assertNotIn("private", json.dumps(receipt))

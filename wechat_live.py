@@ -84,7 +84,9 @@ def write_snapshot(root, *, verify=False, public_copy=None, companion=None, owne
         checks.append(check)
         totals.update(messages=m["messageCount"], media=len(media), saved=sum(bool(x.get("exportedPath")) for x in media),
             wav=sum(bool(x.get("derivedVoiceWav")) for x in media), archive_bytes=m.get("archiveBytes", 0), ai_bytes=m.get("aiDefaultBytes", 0))
-        times.append(path.stat().st_mtime)
+        completed_at = m.get("completedAt")
+        if completed_at:
+            times.append(completed_at)
         receipt = directory / "last-run.json"
         if receipt.is_file():
             receipts.append(receipt.stat().st_mtime)
@@ -104,7 +106,7 @@ def write_snapshot(root, *, verify=False, public_copy=None, companion=None, owne
         row = dict(text=f"档案 {len(rows)+1}", messages=m["messageCount"], latest=stamp(last)[:10] if last else None,
             media=len(media), saved=sum(bool(x.get("exportedPath")) for x in media), state_text=state,
             senderIdentityVersion=version, senderIdentityUnrecheckedRetainedCount=m.get("senderIdentityUnrecheckedRetainedCount"),
-            mediaGapCounts=m.get("mediaGapCounts"), at=stamp(path.stat().st_mtime))
+            mediaGapCounts=m.get("mediaGapCounts"), at=completed_at)
         rows.append(row)
         if check.get("result", {}).get("status") == "success":
             local_artifacts.append(dict(at=row["at"], kind="archive", title=f"{row['text']}：{row['messages']} 条，新到 {row['latest']}，留住媒体 {row['saved']}/{row['media']}，{row['state_text']}",
@@ -130,7 +132,7 @@ def write_snapshot(root, *, verify=False, public_copy=None, companion=None, owne
         unknown_senders=totals["unknown_senders"] if totals["unknown_known"] == len(rows) else None)
     metrics["messages_summary"] = dict(text=f"{totals['messages']:,} 条（{len(rows)} 份）", messages=totals["messages"], archives=len(rows))
     metrics["saved_summary"] = dict(text=f"{totals['saved']:,} 项（{totals['saved']/totals['media']:.1%}）" if totals["media"] else "0 项", saved=totals["saved"], total=totals["media"])
-    data = dict(base, at=stamp(max(times)) if times else stamp(root.stat().st_mtime),
+    data = dict(base, at=max(times, key=datetime.fromisoformat) if times else None,
         scope="仅默认导出根的完成联系人档案；不是全部微信；不补拉媒体",
         metrics=dict(base["metrics"], **metrics), verification_at=max((c["at"] for c in checks if c), default=None),
         verification_note=None if complete else "档案尚未检查或检查后文件已变；按需运行 live-snapshot --verify",

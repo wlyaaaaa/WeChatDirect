@@ -1,5 +1,7 @@
 import isolation  # noqa: F401
+from datetime import datetime, timedelta
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,6 +11,33 @@ from test_archive_reliability import SyntheticContactReader
 import wechat_live as live
 import wechat_cli as cli
 class LiveSnapshotTests(unittest.TestCase):
+    def test_archive_completion_time_ignores_manifest_mtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            archive = root / "contacts" / "primary" / "contact-synthetic"
+            case = fixture.CompletionReliabilityTests()
+            case.sync(case.args(archive), SyntheticContactReader)
+            manifest = live.load(archive / "manifest.json")
+            completed = manifest["completedAt"]
+            self.assertEqual(datetime.fromisoformat(completed).utcoffset(), timedelta(hours=8))
+            messages = (archive / "messages.jsonl").read_bytes()
+            for expected in (completed, None):
+                if expected is None:
+                    manifest.pop("completedAt")
+                    manifest.pop("manifestSha256")
+                    manifest["manifestSha256"] = cli._sha256(cli._canonical_bytes(manifest))
+                    cli._write_json_atomic(archive / "manifest.json", manifest)
+                os.utime(archive / "manifest.json", (1, 1))
+                live.write_snapshot(root, verify=True)
+                snapshot = live.load(root / "live.snapshot.json")
+                owner = live.load(root / "live.owner.json")
+                self.assertEqual(snapshot["at"], expected)
+                self.assertEqual(snapshot["metrics"]["archive_records"][0]["at"], expected)
+                self.assertEqual(owner["metrics"]["archives"][0]["at"], expected)
+                self.assertEqual(next(a for a in owner["artifacts"] if a["kind"] == "archive")["at"], expected)
+                self.assertEqual(snapshot["metrics"]["latest"], live.stamp(manifest["lastCreateTimeS"])[:10])
+            self.assertEqual((archive / "messages.jsonl").read_bytes(), messages)
+
     def test_counts_scope_cached_verification_and_mutation(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

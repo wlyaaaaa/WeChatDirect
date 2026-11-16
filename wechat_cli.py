@@ -4040,6 +4040,7 @@ def command_sync_contact(args: argparse.Namespace) -> int:
         ai_context_bytes = ai_context_path.read_bytes()
         manifest = {
             "format": "wechat-direct-contact-export.v1",
+            "completedAt": datetime.now(LOCAL_TIMEZONE).isoformat(),
             "senderIdentityVersion": SENDER_IDENTITY_VERSION,
             "senderIdentityUnrecheckedRetainedCount": unrechecked_senders,
             "account": label,
@@ -4895,6 +4896,7 @@ def command_repair_media(args: argparse.Namespace) -> int:
     _write_text_atomic(output / "context.md", full)
     _write_text_atomic(output / "ai-context.md", ai)
     manifest.update(
+        completedAt=datetime.now(LOCAL_TIMEZONE).isoformat(),
         messagesSha256=_sha256((output / "messages.jsonl").read_bytes()),
         archiveSha256=_sha256(full.encode("utf-8")),
         archiveBytes=len(full.encode("utf-8")),

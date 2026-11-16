@@ -1,0 +1,434 @@
+{
+  "v": 1,
+  "id": "wechatdirect",
+  "name": "微信收发室",
+  "about": "AI 读电脑微信、按授权替本人收发，并把点名的聊天存成档案。",
+  "headline": "messages",
+  "tasks": [],
+  "skills": [
+    "wechat-direct"
+  ],
+  "bindings_complete": true,
+  "metrics": [
+    {
+      "id": "archives",
+      "label": "存档的聊天（按对象）",
+      "source": "wechat.live",
+      "pointer": "/metrics/archives",
+      "time": "/at",
+      "mode": "live",
+      "unit": "份",
+      "public": "same",
+      "note": "替我留下了几段聊天"
+    },
+    {
+      "id": "messages",
+      "label": "已存档聊天",
+      "source": "wechat.live",
+      "pointer": "/metrics/messages_summary",
+      "time": "/at",
+      "mode": "live",
+      "unit": "条",
+      "public": "same",
+      "note": "一共留了多少；仅默认导出根"
+    },
+    {
+      "id": "latest",
+      "label": "档案里最新一条消息",
+      "source": "wechat.live",
+      "pointer": "/metrics/latest",
+      "time": "/at",
+      "mode": "live",
+      "unit": "",
+      "public": "same",
+      "note": "存档新到哪天；只写日期"
+    },
+    {
+      "id": "integrity",
+      "label": "档案文件都完好",
+      "source": "wechat.live",
+      "pointer": "/metrics/integrity",
+      "time": "/verification_at",
+      "mode": "static",
+      "unit": "",
+      "public": "same",
+      "note": "留下的东西还打得开吗；文件变动后旧检查失效；null 表示尚未检查或档案已变",
+      "scope": "/verification_scope"
+    },
+    {
+      "id": "media",
+      "label": "档案里出现过的图片、语音等",
+      "source": "wechat.live",
+      "pointer": "/metrics/media",
+      "time": "/at",
+      "mode": "live",
+      "unit": "项",
+      "public": "same",
+      "note": "聊天里的图和语音存下来了吗；按出现次数"
+    },
+    {
+      "id": "saved",
+      "label": "其中真存下来的",
+      "source": "wechat.live",
+      "pointer": "/metrics/saved_summary",
+      "time": "/at",
+      "mode": "live",
+      "unit": "项",
+      "public": "same",
+      "note": "按记录声明的导出路径计数，文件完好另看检查；包含已保存缩略图，不是原图齐全率"
+    },
+    {
+      "id": "text",
+      "label": "文字",
+      "source": "wechat.static",
+      "pointer": "/performance/text",
+      "time": "/performance/text/at",
+      "mode": "static",
+      "unit": "",
+      "public": "same",
+      "note": "新消息来了程序多快备好材料；不是 AI 看完用时",
+      "scope": "/performance_scope"
+    },
+    {
+      "id": "image",
+      "label": "图片",
+      "source": "wechat.static",
+      "pointer": "/performance/image",
+      "time": "/performance/image/at",
+      "mode": "static",
+      "unit": "",
+      "public": "same",
+      "note": "新消息来了程序多快备好材料；不是 AI 看完用时",
+      "scope": "/performance_scope"
+    },
+    {
+      "id": "quote",
+      "label": "引用",
+      "source": "wechat.static",
+      "pointer": "/performance/quote",
+      "time": "/performance/quote/at",
+      "mode": "static",
+      "unit": "",
+      "public": "same",
+      "note": "新消息来了程序多快备好材料；不是 AI 看完用时",
+      "scope": "/performance_scope"
+    },
+    {
+      "id": "voice",
+      "label": "语音",
+      "source": "wechat.static",
+      "pointer": "/performance/voice",
+      "time": "/performance/voice/at",
+      "mode": "static",
+      "unit": "",
+      "public": "same",
+      "note": "新消息来了程序多快备好材料；不是 AI 看完用时",
+      "scope": "/performance_scope"
+    },
+    {
+      "id": "missing",
+      "label": "档案里没能留住的媒体",
+      "source": "wechat.live",
+      "pointer": "/metrics/missing",
+      "time": "/at",
+      "mode": "live",
+      "unit": "项",
+      "public": "same",
+      "note": "好奇；未导出文件的出现次数，不推断远端是否还在"
+    },
+    {
+      "id": "receipt_date",
+      "label": "最近一次档案回执更新",
+      "source": "wechat.owner",
+      "pointer": "/metrics/receipt_time",
+      "time": "/receipt_at",
+      "mode": "live",
+      "unit": "",
+      "public": "rewrite",
+      "note": "本人给精确回执时刻，公开只到日期；源时刻公开按日，零点仅表示该日",
+      "scope": "/scope",
+      "public_pointer": "/metrics/receipt_date",
+      "public_time": "/receipt_public_at",
+      "public_scope": "/public_scope"
+    },
+    {
+      "id": "wav",
+      "label": "已派生的语音 WAV",
+      "source": "wechat.live",
+      "pointer": "/metrics/wav",
+      "time": "/at",
+      "mode": "live",
+      "unit": "份",
+      "public": "same",
+      "note": "好奇；不重复算作原媒体"
+    },
+    {
+      "id": "archive_bytes",
+      "label": "长档正文合计",
+      "source": "wechat.live",
+      "pointer": "/metrics/archive_bytes",
+      "time": "/at",
+      "mode": "live",
+      "unit": "字节",
+      "public": "same",
+      "note": "好奇；不是聊天源库体积"
+    },
+    {
+      "id": "ai_bytes",
+      "label": "AI 小上下文合计",
+      "source": "wechat.live",
+      "pointer": "/metrics/ai_bytes",
+      "time": "/at",
+      "mode": "live",
+      "unit": "字节",
+      "public": "same",
+      "note": "好奇；不是所有正文"
+    },
+    {
+      "id": "unrechecked",
+      "label": "未重核保留数",
+      "source": "wechat.live",
+      "pointer": "/metrics/unrechecked",
+      "time": "/at",
+      "mode": "live",
+      "unit": "条",
+      "public": "same",
+      "note": "缺字段时总数 null；未登记新版不表示身份认错"
+    },
+    {
+      "id": "checked_media",
+      "label": "完整性检查核过的媒体文件",
+      "source": "wechat.live",
+      "pointer": "/metrics/checked_media",
+      "time": "/verification_at",
+      "mode": "static",
+      "unit": "项",
+      "public": "same",
+      "note": "好奇；包含派生 WAV；档案变化后失效",
+      "scope": "/verification_scope"
+    },
+    {
+      "id": "check_errors",
+      "label": "完整性检查错误",
+      "source": "wechat.live",
+      "pointer": "/metrics/check_errors",
+      "time": "/verification_at",
+      "mode": "static",
+      "unit": "项",
+      "public": "same",
+      "note": "好奇；包含派生 WAV；档案变化后失效",
+      "scope": "/verification_scope"
+    },
+    {
+      "id": "gap_reasons",
+      "label": "媒体缺口原因",
+      "source": "wechat.live",
+      "pointer": "/metrics/gap_reasons",
+      "time": "/at",
+      "mode": "live",
+      "unit": "",
+      "public": "same",
+      "note": "缺的是原图、没取远端还是格式解不开；缩略图是质量缺口，不能加到未留住总数",
+      "shape": "table"
+    },
+    {
+      "id": "identity_versions",
+      "label": "说话人身份版本",
+      "source": "wechat.live",
+      "pointer": "/metrics/identity_versions",
+      "time": "/at",
+      "mode": "live",
+      "unit": "",
+      "public": "same",
+      "note": "是否按新版重核；没有字段写未登记新版",
+      "shape": "table"
+    },
+    {
+      "id": "archive_records",
+      "label": "逐份档案完成记录",
+      "source": "wechat.live",
+      "pointer": "/metrics/archive_records",
+      "time": "/at",
+      "mode": "live",
+      "unit": "",
+      "public": "same",
+      "note": "好奇；不写是谁，不放任何聊天；检查通过只证明已声明文件完好",
+      "shape": "table"
+    },
+    {
+      "id": "identity_coverage",
+      "label": "身份保留数的登记范围",
+      "source": "wechat.live",
+      "pointer": "/metrics/identity_coverage",
+      "time": "/at",
+      "mode": "live",
+      "unit": "",
+      "public": "same",
+      "note": "缺字段不按零算；已登记部分与总数分开"
+    },
+    {
+      "id": "measurements",
+      "label": "真机验收逐次记录",
+      "source": "wechat.static",
+      "pointer": "/metrics/measurements",
+      "time": "/performance_at",
+      "mode": "static",
+      "unit": "",
+      "public": "same",
+      "note": "好奇；AI 确认是保守上界，引用的晚读不是程序交付耗时",
+      "shape": "table",
+      "scope": "/performance_scope"
+    },
+    {
+      "id": "environment",
+      "label": "本机依赖检查",
+      "source": "wechat.static",
+      "pointer": "/metrics/environment_result",
+      "time": "/environment_at",
+      "mode": "static",
+      "unit": "",
+      "public": "same",
+      "note": "好奇；只证明依赖，不证明账号在线或收发成功",
+      "shape": "table",
+      "records": "/metrics/environment",
+      "scope": "/environment_scope"
+    },
+    {
+      "id": "code_chars",
+      "label": "自有代码非空白字符",
+      "source": "wechat.static",
+      "pointer": "/size/code_chars",
+      "time": "/size/at",
+      "mode": "static",
+      "unit": "字",
+      "public": "same",
+      "note": "好奇；排除第三方与生成物，文档含已映射私有配套一次",
+      "scope": "/size_scope"
+    },
+    {
+      "id": "docs_units",
+      "label": "文档汉字与 ASCII 词串",
+      "source": "wechat.static",
+      "pointer": "/size/docs_units",
+      "time": "/size/at",
+      "mode": "static",
+      "unit": "单位",
+      "public": "same",
+      "note": "好奇；排除第三方与生成物，文档含已映射私有配套一次",
+      "scope": "/size_scope"
+    },
+    {
+      "id": "docs_files",
+      "label": "计入规模的文档",
+      "source": "wechat.static",
+      "pointer": "/size/docs_files",
+      "time": "/size/at",
+      "mode": "static",
+      "unit": "份",
+      "public": "same",
+      "note": "好奇；排除第三方与生成物，文档含已映射私有配套一次",
+      "scope": "/size_scope"
+    },
+    {
+      "id": "code_files",
+      "label": "计入规模的自有代码",
+      "source": "wechat.static",
+      "pointer": "/size/code_files",
+      "time": "/size/at",
+      "mode": "static",
+      "unit": "个",
+      "public": "same",
+      "note": "好奇；排除第三方与生成物，文档含已映射私有配套一次",
+      "scope": "/size_scope"
+    },
+    {
+      "id": "unknown_senders",
+      "label": "档案中未确定说话人的消息",
+      "source": "wechat.live",
+      "pointer": "/metrics/unknown_senders",
+      "time": "/at",
+      "mode": "live",
+      "unit": "条",
+      "public": "same",
+      "note": "好奇；为零不表示全部旧档案已按新版重核"
+    }
+  ],
+  "sections": [
+    {
+      "id": "archives",
+      "label": "存了多少、新到哪天",
+      "metrics": [
+        "archives",
+        "messages",
+        "latest",
+        "integrity"
+      ],
+      "about": "留下多少聊天，新到哪天，文件还能打开吗？",
+      "note": "档案是点名才同步的，不跟着微信自动走；档案最新日期不是微信此刻的最新消息。"
+    },
+    {
+      "id": "media",
+      "label": "图片、语音留住了多少",
+      "metrics": [
+        "media",
+        "saved"
+      ],
+      "about": "聊天里的媒体存下来了吗？",
+      "note": "没留住的原因见更多数据；不直接认定程序坏了，也不保证补得回。保存的缩略图仍有质量缺口。"
+    },
+    {
+      "id": "realtime",
+      "label": "收到新消息，程序多快把材料备好",
+      "metrics": [
+        "text",
+        "image",
+        "quote",
+        "voice"
+      ],
+      "about": "11-15 真机验收：四类都通过",
+      "note": "是程序备好材料的用时，不是 AI 看完的用时，也不是平均速度；语音为前一轮实测。"
+    },
+    {
+      "id": "more-data",
+      "label": "更多数据",
+      "metrics": [
+        "missing",
+        "receipt_date",
+        "wav",
+        "archive_bytes",
+        "ai_bytes",
+        "unrechecked",
+        "checked_media",
+        "check_errors",
+        "gap_reasons",
+        "identity_versions",
+        "archive_records",
+        "identity_coverage",
+        "measurements",
+        "environment",
+        "code_chars",
+        "docs_units",
+        "docs_files",
+        "code_files",
+        "unknown_senders"
+      ],
+      "about": "好奇：媒体、档案检查、身份版本和最近实测的明细。",
+      "note": "只读现存导出和已有实测，不为统计打开微信或补拉媒体。"
+    }
+  ],
+  "artifacts": {
+    "source": "wechat.static",
+    "pointer": "/artifacts"
+  },
+  "size": {
+    "source": "wechat.static",
+    "pointer": "/size"
+  },
+  "links": [
+    {
+      "id": "intro",
+      "label": "项目介绍",
+      "href": "https://github.com/wlyaaaaa/WeChatDirect#readme"
+    }
+  ]
+}

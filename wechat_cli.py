@@ -2998,6 +2998,10 @@ def _transactional_archive(function):
                     if existing_archive_reused:
                         receipt["existingArchiveReused"] = True
                     _write_json_atomic(stage / "last-run.json", receipt)
+            from wechat_live import refresh
+            live = refresh(_default_export_root())
+            if live["status"] != "not_enabled":
+                receipt["liveSnapshot"] = live
             sys.stdout.buffer.write(_canonical_bytes(receipt))
             return 0
         except StorageError as exc:
@@ -4081,6 +4085,8 @@ def command_sync_contact(args: argparse.Namespace) -> int:
             "unknownSenderCount": unknown_senders,
             "unlabeledGroupMemberCount": unlabeled_group_members,
             "unavailableMediaCount": unavailable_media,
+            "mediaGapCounts": dict(Counter(reason for item in ordered for media in item.get("media_manifest", [])
+                if (reason := _media_gap_reason(media)))),
             "sourceFingerprint": source_fingerprint.get("sha256"),
             "sourceFingerprintFiles": source_fingerprint.get("fileCount"),
         }
@@ -5663,6 +5669,15 @@ def parser() -> argparse.ArgumentParser:
     )
     verify_export.add_argument("--output", required=True)
     verify_export.set_defaults(handler=command_verify_export)
+
+    live = commands.add_parser("live-snapshot", help="summarize existing offline archives without opening WeChat")
+    live.add_argument("--exports", required=True)
+    live.add_argument("--verify", action="store_true")
+    live.add_argument("--public-copy")
+    live.add_argument("--companion-doc")
+    live.add_argument("--owner-output")
+    from wechat_live import command as live_command
+    live.set_defaults(handler=live_command)
 
     moments = commands.add_parser(
         "moments", help="read a bounded view of Moments cached on this device"

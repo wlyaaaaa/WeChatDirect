@@ -257,6 +257,14 @@ wechat-direct preserve --account primary --contact "<contact-or-group>" --lookba
 
 该命令生成一个自包含保全目录，复制点名窗口内当前本机能精确打开的媒体。原始语音保留 SILK，可用时派生 WAV；其他媒体保留可读格式及与消息的关系。保全不会自动请求远端表情；无法打开的内容仍保留明确缺口。
 
+### 实况项目结果（离线、按需）
+
+`docs/live.contract.json` 是项目页接入单，`docs/live.snapshot.json` 只保存按需更新的规模、依赖检查和历史实测；内容相同不改文件。初次接入时运行 `wechat-direct live-snapshot --exports "<默认导出根>" --verify --owner-output "<私有配套目录>/runtime/live.owner.json" --companion-doc "<已映射的私有配套文档>" --public-copy docs/live.snapshot.json`；不打开微信、不补拉媒体、不新增计划任务。本人份的完整接入单留在私有配套目录，实时快照在该目录被 Git 忽略的 runtime 内，来源登记只放在 PCConfig。
+
+命令在导出根生成可公开的小结果 `live.snapshot.json`，并建立 `live.owner.json` 到私人快照的符号链接；重写时跟随链接，不把私人文件搬回导出根。初始化后，原有 `sync-contact`／`repair-media` 的事务完成出口会更新默认导出根的汇总，回执的 `liveSnapshot` 单独报告结果；未初始化时不启用。显式输出到其他根的档案不计入。外部手改文件后需按需重取，`--verify` 才重新检查完整性；未重查或文件变动的档案不沿用旧的“全过”，也不因此改动档案原件。仅文件完好不代表缺失媒体齐全；缩略图质量缺口不与未保存总数相加。
+
+新真机验收后更新快照 `performance`／`metrics.measurements` 的实际结果和源时刻；现有文字、图片、引用和前轮语音均取自本节后面的 11-15 表，不把维护时间当实测时间。规模随按需重取并传入同一私有配套文档更新；私有文档只计一次，第三方及生成物不计。没有累计读发使用账本，不从这些档案推算读发次数、在线状态或日常成功率。
+
 ### `doctor` 与 `verify-export`
 
 这两个命令用于安装后的环境/配置检查和导出完整性检查。典型调用为：

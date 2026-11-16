@@ -12,7 +12,7 @@ class LiveSnapshotTests(unittest.TestCase):
     def test_counts_scope_cached_verification_and_mutation(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            archive = root / "contacts" / "synthetic"
+            archive = root / "contacts" / "primary" / "contact-synthetic"
             case = fixture.CompletionReliabilityTests()
             case.sync(case.args(archive), SyntheticContactReader)
             stage = root / "other.wechat-transaction" / "staged"
@@ -20,6 +20,10 @@ class LiveSnapshotTests(unittest.TestCase):
             (stage / "manifest.json").write_bytes((archive / "manifest.json").read_bytes())
             live.write_snapshot(root, verify=True)
             first = live.load(root / "live.snapshot.json")
+            artifact = next(a for a in live.load(root / "live.owner.json")["artifacts"] if a["kind"] == "archive")
+            self.assertEqual(artifact["open"], dict(source="wechat.contacts", path="primary/contact-synthetic/context.md"))
+            self.assertEqual(artifact["public"], "owner")
+            self.assertNotIn("contact-synthetic", json.dumps(first))
             m = first["metrics"]
             self.assertEqual((m["archives"], m["integrity"]), (1, "1/1 份"))
             self.assertEqual(m["saved"] + m["missing"], m["media"])
@@ -38,3 +42,8 @@ class LiveSnapshotTests(unittest.TestCase):
             live.write_snapshot(root)
             self.assertIsNone(live.load(root / "live.snapshot.json")["metrics"]["integrity"])
             self.assertIsNone(live.load(root / "live.snapshot.json")["verification_at"])
+            new_archive = root / "contacts" / "secondary" / "contact-next"
+            case.sync(case.args(new_archive), SyntheticContactReader)
+            live.write_snapshot(root, verify=True)
+            opens = [a["open"] for a in live.load(root / "live.owner.json")["artifacts"] if a["kind"] == "archive"]
+            self.assertEqual(opens, [dict(source="wechat.contacts", path="secondary/contact-next/context.md")])

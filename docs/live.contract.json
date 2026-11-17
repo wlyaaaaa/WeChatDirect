@@ -52,7 +52,7 @@
       "mode": "static",
       "unit": "",
       "public": "same",
-      "note": "留下的东西还打得开吗；文件变动后旧检查失效；null 表示尚未检查或档案已变",
+      "note": "检查归档文件是否仍能打开",
       "scope": "/verification_scope"
     },
     {
@@ -193,7 +193,7 @@
       "mode": "live",
       "unit": "条",
       "public": "same",
-      "note": "旧档未登记该字段时保留未知，不当成零或身份认错。", "unknown_text": "旧记录里没有这一项。"
+      "note": "尚未记录核对结果", "unknown_text": "旧记录里没有这一项。"
     },
     {
       "id": "checked_media",
@@ -240,7 +240,7 @@
       "mode": "live",
       "unit": "",
       "public": "same",
-      "note": "是否按新版重核；没有字段写未登记新版",
+      "note": "最近一次复核结果",
       "shape": "table"
     },
     {
@@ -264,7 +264,7 @@
       "mode": "live",
       "unit": "",
       "public": "same",
-      "note": "缺字段不按零算；已登记部分与总数分开"
+      "note": "分别统计已登记项和总数"
     },
     {
       "id": "measurements",

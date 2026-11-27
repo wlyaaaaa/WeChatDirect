@@ -1,10 +1,11 @@
-"""Small offline project results; never opens WeChat or materializes media."""
+"""Small offline project results from archives and local read-only snapshots."""
 from collections import Counter
 from datetime import datetime
 from contextlib import redirect_stdout
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -18,6 +19,44 @@ def load(path):
 def stamp(value):
     from wechat_cli import LOCAL_TIMEZONE
     return datetime.fromtimestamp(value, LOCAL_TIMEZONE).isoformat()
+
+
+def write_local_message_count(output, path_for_read=Path):
+    """Count both bound accounts for the existing night's isolated subprocess."""
+    from wechat_cli import (ACCOUNT_LABELS, LOCAL_TIMEZONE, ProductError,
+        _account_config, _check_personal_access, _read_config, _reader,
+        _resolve_config_path, _write_json_atomic)
+    from wechat_source import _quote_identifier
+
+    if os.environ.get("AGENTS_BACKGROUND_AUTOMATION") != "1":
+        _check_personal_access()
+    # The night check runs in its own process and does not keep decrypted copies.
+    os.environ["WECHAT_DIRECT_CACHE"] = "0"
+    config = _read_config(path_for_read(_resolve_config_path(None)))
+    cutoff = int(datetime.now(LOCAL_TIMEZONE).timestamp())
+    counts = {}
+    for label in ACCOUNT_LABELS:
+        with _reader(_account_config(config, label), cutoff) as reader:
+            chat = reader._message_database_sources()
+            if not chat:
+                raise ProductError("wechat_local_message_shards_missing")
+            business = [path for path in reader._database_files() if path.parent.name.casefold() == "message"
+                        and re.fullmatch(r"biz_message_\d+\.db", path.name, re.I)]
+            rows = tables = 0
+            for shard in (*chat, *business):
+                db = reader._open(shard)
+                for (name,) in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'Msg_*'"):
+                    if re.fullmatch(r"Msg_[0-9a-f]{32}", name):
+                        rows += db.execute(f"SELECT COUNT(*) FROM {_quote_identifier(name)}").fetchone()[0]
+                        tables += 1
+            if not tables:
+                raise ProductError("wechat_local_message_tables_missing")
+            counts[label] = rows
+    # This output has one writer under the night runner lock. An interrupted
+    # previous attempt may have left the atomic writer's disposable staging file.
+    output.with_name(output.name + ".incomplete").unlink(missing_ok=True)
+    _write_json_atomic(output, dict(v=1, at=datetime.now(LOCAL_TIMEZONE).isoformat(),
+        messages=dict(counts, total=sum(counts.values()))))
 
 
 def fingerprint(root):

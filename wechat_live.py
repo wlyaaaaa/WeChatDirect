@@ -123,12 +123,13 @@ def write_snapshot(root, *, verify=False, public_copy=None, companion=None, owne
         checks.append(check)
         totals.update(messages=m["messageCount"], media=len(media), saved=sum(bool(x.get("exportedPath")) for x in media),
             wav=sum(bool(x.get("derivedVoiceWav")) for x in media), archive_bytes=m.get("archiveBytes", 0), ai_bytes=m.get("aiDefaultBytes", 0))
-        completed_at = m.get("completedAt")
+        receipt = directory / "last-run.json"
+        receipt_time = receipt.stat().st_mtime if receipt.is_file() else None
+        if receipt_time is not None:
+            receipts.append(receipt_time)
+        completed_at = m.get("completedAt") or (stamp(receipt_time) if receipt_time is not None else None)
         if completed_at:
             times.append(completed_at)
-        receipt = directory / "last-run.json"
-        if receipt.is_file():
-            receipts.append(receipt.stat().st_mtime)
         gaps.update(m.get("mediaGapCounts", {}))
         totals["gap_registered"] += isinstance(m.get("mediaGapCounts"), dict)
         version = m.get("senderIdentityVersion") or "未登记新版"
@@ -169,10 +170,14 @@ def write_snapshot(root, *, verify=False, public_copy=None, companion=None, owne
         identity_versions=[dict(text=k, count=v, state_text="已登记新版" if k != "未登记新版" else k) for k, v in sorted(versions.items())],
         unrechecked=totals["retained"] if totals["retained_known"] == len(rows) else None,
         unknown_senders=totals["unknown_senders"] if totals["unknown_known"] == len(rows) else None)
+    if 0 < totals["retained_known"] < len(rows):
+        known, retained = totals["retained_known"], totals["retained"]
+        metrics["unrechecked"] = dict(known_archives=known, archives=len(rows), known_retained=retained,
+            text=f"已登记的 {known}/{len(rows)} 份档案共 {retained} 条，其余旧档未登记")
     metrics["messages_summary"] = dict(text=f"{totals['messages']:,} 条（{len(rows)} 份）", messages=totals["messages"], archives=len(rows))
     metrics["saved_summary"] = dict(text=f"{totals['saved']:,} 项（{totals['saved']/totals['media']:.1%}）" if totals["media"] else "0 项", saved=totals["saved"], total=totals["media"])
     data = dict(base, at=max(times, key=datetime.fromisoformat) if times else None,
-        scope="仅默认导出根的完成联系人档案；不是全部微信；不补拉媒体",
+        scope="仅默认导出根的完成联系人档案；旧档缺完成时间时沿最近档案回执；不补拉媒体",
         metrics=dict(base["metrics"], **metrics), verification_at=max((c["at"] for c in checks if c), default=None),
         verification_note=None if complete else "档案尚未检查或检查后文件已变；按需运行 live-snapshot --verify",
         artifacts=[a for a in base.get("artifacts", []) if a["kind"] != "archive"])

@@ -129,13 +129,13 @@
   "performance_scope": "11-15 小样本真机验收：程序备好材料的用时，不是日常平均速度或 AI 理解用时",
   "scope": "按需更新的规模、依赖检查和历史实测",
   "size": {
-    "at": "2026-11-23T20:34:05.375826+00:00",
+    "at": "2026-11-27T23:26:26.372207+00:00",
     "docs_files": 5,
     "code_files": 51,
-    "docs_units": 25309,
-    "docs_chars": 45968,
-    "code_lines": 26900,
-    "code_chars": 835854
+    "docs_units": 25339,
+    "docs_chars": 45957,
+    "code_lines": 26944,
+    "code_chars": 837874
   },
   "size_scope": "自有代码与文档；不计第三方与生成物，已映射私有配套文档计一次",
   "v": 1,

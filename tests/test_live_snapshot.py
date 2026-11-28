@@ -35,6 +35,10 @@ class LiveSnapshotTests(unittest.TestCase):
                 self.assertEqual(snapshot["metrics"]["archive_records"][0]["at"], expected)
                 self.assertEqual(owner["metrics"]["archives"][0]["at"], expected)
                 self.assertEqual(next(a for a in owner["artifacts"] if a["kind"] == "archive")["at"], expected or snapshot["verification_at"])
+                checked = datetime.fromisoformat(snapshot["verification_at"])
+                for row in (snapshot["metrics"]["archive_records"][0], owner["metrics"]["archives"][0]):
+                    self.assertEqual(row.get("checked_at"), snapshot["verification_at"] if expected is None else None)
+                    self.assertEqual(row.get("at_gap"), f"{checked.month}月{checked.day}日 {checked:%H:%M} 核对" if expected is None else None)
                 self.assertEqual(snapshot["metrics"]["latest"], live.stamp(manifest["lastCreateTimeS"])[:10])
             self.assertEqual((archive / "messages.jsonl").read_bytes(), messages)
 

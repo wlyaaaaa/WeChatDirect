@@ -147,15 +147,15 @@ def write_snapshot(root, *, verify=False, public_copy=None, companion=None, owne
             media=len(media), saved=sum(bool(x.get("exportedPath")) for x in media), state_text=state,
             senderIdentityVersion=version, senderIdentityUnrecheckedRetainedCount=m.get("senderIdentityUnrecheckedRetainedCount"),
             mediaGapCounts=m.get("mediaGapCounts"), at=completed_at)
-        if completed_at is None:
-            row["at_gap"] = "当时没记"
         rows.append(row)
         if check.get("result", {}).get("status") == "success":
             artifact = dict(at=completed_at or check["at"], kind="archive",
                 title=f"{row['text']}：{row['messages']} 条，新到 {row['latest']}，留住媒体 {row['saved']}/{row['media']}，{row['state_text']}",
                 status="completed", public="owner", open=dict(source="wechat.contacts", path=(directory.relative_to(root / "contacts") / "context.md").as_posix()))
             if completed_at is None:
-                artifact.update(recent_title=f"{row['text']}（核对时间）", recent_detail="产物日期为档案核对时间，存档时没记完成时间。")
+                checked = datetime.fromisoformat(check["at"])
+                row.update(checked_at=check["at"], at_gap=f"{checked.month}月{checked.day}日 {checked:%H:%M} 核对")
+                artifact.update(recent_title=f"{row['text']}（核对时间）", recent_detail="完成时间从11月16日起才有记录")
             local_artifacts.append(artifact)
         owner_rows.append(dict(row, text=m.get("contact", {}).get("displayName") or m.get("contact", {}).get("nickname") or "未命名档案",
             account=m.get("account")))

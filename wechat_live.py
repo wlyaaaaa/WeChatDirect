@@ -127,7 +127,7 @@ def write_snapshot(root, *, verify=False, public_copy=None, companion=None, owne
         receipt_time = receipt.stat().st_mtime if receipt.is_file() else None
         if receipt_time is not None:
             receipts.append(receipt_time)
-        completed_at = m.get("completedAt") or (stamp(receipt_time) if receipt_time is not None else None)
+        completed_at = m.get("completedAt") or None
         if completed_at:
             times.append(completed_at)
         gaps.update(m.get("mediaGapCounts", {}))
@@ -179,7 +179,7 @@ def write_snapshot(root, *, verify=False, public_copy=None, companion=None, owne
         short_text=short_text, explanation_text=f"来自 {len(rows)} 份已完成的联系人聊天档案")
     metrics["saved_summary"] = dict(text=f"{totals['saved']:,} 项（{totals['saved']/totals['media']:.1%}）" if totals["media"] else "0 项", saved=totals["saved"], total=totals["media"])
     data = dict(base, at=max(times, key=datetime.fromisoformat) if times else None,
-        scope="仅默认导出根的完成联系人档案；旧档缺完成时间时沿最近档案回执；不补拉媒体",
+        scope="仅默认导出根的完成联系人档案；完成时间取档案清单，缺记录的留空；不补拉媒体",
         metrics=dict(base["metrics"], **metrics), verification_at=max((c["at"] for c in checks if c), default=None),
         verification_note=None if complete else "档案尚未检查或检查后文件已变；按需运行 live-snapshot --verify",
         artifacts=[a for a in base.get("artifacts", []) if a["kind"] != "archive"])

@@ -147,6 +147,8 @@ def write_snapshot(root, *, verify=False, public_copy=None, companion=None, owne
             media=len(media), saved=sum(bool(x.get("exportedPath")) for x in media), state_text=state,
             senderIdentityVersion=version, senderIdentityUnrecheckedRetainedCount=m.get("senderIdentityUnrecheckedRetainedCount"),
             mediaGapCounts=m.get("mediaGapCounts"), at=completed_at)
+        if completed_at is None:
+            row["at_gap"] = "当时没记"
         rows.append(row)
         if check.get("result", {}).get("status") == "success":
             local_artifacts.append(dict(at=row["at"], kind="archive", title=f"{row['text']}：{row['messages']} 条，新到 {row['latest']}，留住媒体 {row['saved']}/{row['media']}，{row['state_text']}",

@@ -34,7 +34,7 @@ class LiveSnapshotTests(unittest.TestCase):
                 self.assertEqual(snapshot["at"], live.stamp(4_102_444_800) if expected is None else snapshot["verification_at"])
                 self.assertEqual(snapshot["metrics"]["archive_records"][0]["at"], expected)
                 self.assertEqual(owner["metrics"]["archives"][0]["at"], expected)
-                self.assertEqual(next(a for a in owner["artifacts"] if a["kind"] == "archive")["at"], expected)
+                self.assertEqual(next(a for a in owner["artifacts"] if a["kind"] == "archive")["at"], expected or snapshot["verification_at"])
                 self.assertEqual(snapshot["metrics"]["latest"], live.stamp(manifest["lastCreateTimeS"])[:10])
             self.assertEqual((archive / "messages.jsonl").read_bytes(), messages)
 

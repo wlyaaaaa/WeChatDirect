@@ -174,7 +174,9 @@ def write_snapshot(root, *, verify=False, public_copy=None, companion=None, owne
         known, retained = totals["retained_known"], totals["retained"]
         metrics["unrechecked"] = dict(known_archives=known, archives=len(rows), known_retained=retained,
             text=f"已登记的 {known}/{len(rows)} 份档案共 {retained} 条，其余旧档未登记")
-    metrics["messages_summary"] = dict(text=f"{totals['messages']:,} 条（{len(rows)} 份）", messages=totals["messages"], archives=len(rows))
+    short_text = f"{totals['messages']:,} 条"
+    metrics["messages_summary"] = dict(text=f"{short_text}（{len(rows)} 份）", messages=totals["messages"], archives=len(rows),
+        short_text=short_text, explanation_text=f"来自 {len(rows)} 份已完成的联系人聊天档案")
     metrics["saved_summary"] = dict(text=f"{totals['saved']:,} 项（{totals['saved']/totals['media']:.1%}）" if totals["media"] else "0 项", saved=totals["saved"], total=totals["media"])
     data = dict(base, at=max(times, key=datetime.fromisoformat) if times else None,
         scope="仅默认导出根的完成联系人档案；旧档缺完成时间时沿最近档案回执；不补拉媒体",

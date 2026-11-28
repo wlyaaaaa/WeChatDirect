@@ -11,27 +11,27 @@ from test_archive_reliability import SyntheticContactReader
 import wechat_live as live
 import wechat_cli as cli
 class LiveSnapshotTests(unittest.TestCase):
-    def test_archive_completion_time_ignores_manifest_mtime(self):
+    def test_archive_completion_time_is_separate_from_snapshot_time(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             archive = root / "contacts" / "primary" / "contact-synthetic"
             case = fixture.CompletionReliabilityTests()
             case.sync(case.args(archive), SyntheticContactReader)
             manifest = live.load(archive / "manifest.json")
-            completed = manifest["completedAt"]
-            self.assertEqual(datetime.fromisoformat(completed).utcoffset(), timedelta(hours=8))
+            self.assertEqual(datetime.fromisoformat(manifest["completedAt"]).utcoffset(), timedelta(hours=8))
             messages = (archive / "messages.jsonl").read_bytes()
-            for expected in (completed, None):
+            for expected in (manifest["completedAt"], None):
                 if expected is None:
                     manifest.pop("completedAt")
                     manifest.pop("manifestSha256")
                     manifest["manifestSha256"] = cli._sha256(cli._canonical_bytes(manifest))
                     cli._write_json_atomic(archive / "manifest.json", manifest)
+                    os.utime(archive / "last-run.json", (4_102_444_800,) * 2)  # Sync later than the check.
                 os.utime(archive / "manifest.json", (1, 1))
                 live.write_snapshot(root, verify=True)
                 snapshot = live.load(root / "live.snapshot.json")
                 owner = live.load(root / "live.owner.json")
-                self.assertEqual(snapshot["at"], expected)
+                self.assertEqual(snapshot["at"], live.stamp(4_102_444_800) if expected is None else snapshot["verification_at"])
                 self.assertEqual(snapshot["metrics"]["archive_records"][0]["at"], expected)
                 self.assertEqual(owner["metrics"]["archives"][0]["at"], expected)
                 self.assertEqual(next(a for a in owner["artifacts"] if a["kind"] == "archive")["at"], expected)

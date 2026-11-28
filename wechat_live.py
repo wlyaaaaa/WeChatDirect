@@ -127,7 +127,7 @@ def write_snapshot(root, *, verify=False, public_copy=None, companion=None, owne
         receipt_time = receipt.stat().st_mtime if receipt.is_file() else None
         if receipt_time is not None:
             receipts.append(receipt_time)
-        completed_at = m.get("completedAt") or (stamp(receipt_time) if receipt_time is not None else None)
+        completed_at = m.get("completedAt") or None
         if completed_at:
             times.append(completed_at)
         gaps.update(m.get("mediaGapCounts", {}))
@@ -158,13 +158,17 @@ def write_snapshot(root, *, verify=False, public_copy=None, companion=None, owne
     gap_labels = dict(only_thumbnail_local="只有缩略图", remote_not_requested="没取远端",
         local_wxgf_conversion_unavailable="格式转换不了", image_not_stored_locally="图没存本地",
         native_media_missing_or_unreadable="原生媒体缺失或不可读")
+    receipt_at = stamp(max(receipts)) if receipts else None
+    verification_at = max((c["at"] for c in checks if c), default=None)
+    snapshot_at = max((at for at in [*times, receipt_at, verification_at] if at),
+        key=datetime.fromisoformat, default=None)
     metrics.update(archives=len(rows), messages=totals["messages"], latest=stamp(totals["latest"])[:10] if totals["latest"] else None,
         media=totals["media"], saved=totals["saved"], missing=totals["media"]-totals["saved"], wav=totals["wav"],
         archive_bytes=totals["archive_bytes"], ai_bytes=totals["ai_bytes"], archive_records=rows,
         integrity=f"{passed}/{len(rows)} 份" if complete else None,
         checked_media=sum(c["result"]["mediaFilesChecked"] for c in checks) if complete else None,
         check_errors=sum(len(c["result"]["errors"]) for c in checks) if complete else None,
-        receipt_date=stamp(max(receipts))[:10] if receipts else None,
+        receipt_date=receipt_at[:10] if receipt_at else None,
         gap_reasons=[dict(text=gap_labels.get(k, k), count=gaps[k] if totals["gap_registered"] == len(rows) else None,
             state_text=f"{totals['gap_registered']}/{len(rows)} 份有原因字段") for k in sorted(gaps.keys() | gap_labels.keys())],
         identity_versions=[dict(text=k, count=v, state_text="已登记新版" if k != "未登记新版" else k) for k, v in sorted(versions.items())],
@@ -178,9 +182,9 @@ def write_snapshot(root, *, verify=False, public_copy=None, companion=None, owne
     metrics["messages_summary"] = dict(text=f"{short_text}（{len(rows)} 份）", messages=totals["messages"], archives=len(rows),
         short_text=short_text, explanation_text=f"来自 {len(rows)} 份已完成的联系人聊天档案")
     metrics["saved_summary"] = dict(text=f"{totals['saved']:,} 项（{totals['saved']/totals['media']:.1%}）" if totals["media"] else "0 项", saved=totals["saved"], total=totals["media"])
-    data = dict(base, at=max(times, key=datetime.fromisoformat) if times else None,
-        scope="仅默认导出根的完成联系人档案；旧档缺完成时间时沿最近档案回执；不补拉媒体",
-        metrics=dict(base["metrics"], **metrics), verification_at=max((c["at"] for c in checks if c), default=None),
+    data = dict(base, at=snapshot_at,
+        scope="仅默认导出根的完成联系人档案；快照截至最近同步或核对，单份档案缺完成记录时留空；不补拉媒体",
+        metrics=dict(base["metrics"], **metrics), verification_at=verification_at,
         verification_note=None if complete else "档案尚未检查或检查后文件已变；按需运行 live-snapshot --verify",
         artifacts=[a for a in base.get("artifacts", []) if a["kind"] != "archive"])
     data.pop("receipt_at", None)
@@ -198,7 +202,6 @@ def write_snapshot(root, *, verify=False, public_copy=None, companion=None, owne
             status=doctor["status"], errors=len(doctor["errors"]), warnings=len(doctor["warnings"]))
         labels = dict(images="图片", offlineVerification="离线验证", text="文字", voiceWav="语音 WAV", wxgf="WXGF 图像")
         data["metrics"]["environment"] = [dict(text=labels[k], state_text="可用" if v == "available" else "未就绪") for k, v in doctor["capabilities"].items()]
-    receipt_at = stamp(max(receipts)) if receipts else None
     owner = dict(v=1, at=data["at"], receipt_at=receipt_at, scope=data["scope"],
         receipt_public_at=receipt_at[:10] + "T00:00:00+08:00" if receipt_at else None,
         public_scope="仅默认导出根档案；回执源时刻公开精度为日期，零点仅表示该日",
